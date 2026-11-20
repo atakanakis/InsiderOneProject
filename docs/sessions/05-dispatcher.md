@@ -149,3 +149,10 @@ four jobs succeeded; guards `176 guards, 176 real, 0 failed`; the measurement st
 race detector: I1 peak 100 per channel, A4 max 7.92 ms, A5 94.1 to 95.2 sends/s with the
 longest wait 1.054 s and no refusal; the compose job delivered 1,500 rows with two workers, the
 mock provider's peak 100 per channel (`gh run view 44752552222 --log`).
+
+CI on `a67daed`, the session's last code and document commit, run 44763754286: lint, test,
+guards and compose all succeeded. The guards job printed `179 guards, 179 real, 0 failed`; the
+measurement step: I1 peak 100 per channel, A4 max 4.14 ms, A5 93.9 to 95.2 sends/s with the
+longest wait 1.044 s and no refusal, and the fault test's three scenarios at peak 40, the limit
+(`gh run watch 44763754286 --exit-status`, and `--log` of the guards and test jobs). The commit
+that adds this paragraph changes only this file.
