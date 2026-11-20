@@ -477,4 +477,86 @@ var guards = []Guard{
 		Old: "bounded(r.Outcome, MaxErrorBytes)", New: "r.Outcome",
 		Package: "./internal/store", Test: "TestFinishStoresTextAtItsBound",
 	},
+
+	// Session 3: the rate limiter of architecture §7.
+	{
+		Name: "ratelimit: at most the limit per window (A6)", File: "internal/ratelimit/ratelimit.go",
+		Old: "if redis.call('ZCARD', key) < limit then", New: "if redis.call('ZCARD', key) <= limit then",
+		Package: "./internal/ratelimit", Test: "TestNoWindowHoldsMoreThanTheLimit",
+	},
+	{
+		Name: "ratelimit: a permit is refused at the limit", File: "internal/ratelimit/ratelimit.go",
+		Old: "if redis.call('ZCARD', key) < limit then", New: "if redis.call('ZCARD', key) <= limit then",
+		Package: "./internal/ratelimit", Test: "TestAPermitIsRefusedAtTheLimit",
+	},
+	{
+		Name: "ratelimit: a permit counts for the whole window", File: "internal/ratelimit/ratelimit.go",
+		Old: "now - window))\n", New: "now - window + 100000))\n",
+		Package: "./internal/ratelimit", Test: "TestNoWindowHoldsMoreThanTheLimit",
+	},
+	{
+		Name: "ratelimit: permits past the window are removed", File: "internal/ratelimit/ratelimit.go",
+		Old: "redis.call('ZREMRANGEBYSCORE', key, '-inf', string.format('%d', now - window))\n", New: "",
+		Package: "./internal/ratelimit", Test: "TestWaitReturnsWhenTheOldestPermitLeavesTheWindow",
+	},
+	{
+		Name: "ratelimit: the window is one second plus the margin", File: "internal/ratelimit/ratelimit.go",
+		Old: "window: time.Second + margin}", New: "window: time.Second}",
+		Package: "./internal/ratelimit", Test: "TestAPermitCountsForOneSecondPlusTheMargin",
+	},
+	{
+		Name: "ratelimit: a script error is not a permit", File: "internal/ratelimit/ratelimit.go",
+		Old: "return 0, err // fail closed", New: "return 0, nil // fail closed",
+		Package: "./internal/ratelimit", Test: "TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails",
+	},
+	{
+		Name: "ratelimit: an unreachable Redis is not a permit", File: "internal/ratelimit/ratelimit.go",
+		Old: "return 0, err // fail closed", New: "return 0, nil // fail closed",
+		Package: "./internal/ratelimit", Test: "TestAnUnreachableRedisIsAnErrorNotAPermit",
+	},
+	{
+		Name: "ratelimit: Wait stops when its context ends", File: "internal/ratelimit/ratelimit.go",
+		Old: "\t\tcase <-ctx.Done():\n\t\t\ttimer.Stop()\n\t\t\treturn 0, fmt.Errorf(\"rate limit wait: %w\", ctx.Err())\n", New: "",
+		Package: "./internal/ratelimit", Test: "TestWaitStopsWhenItsContextEnds",
+	},
+	{
+		Name: "ratelimit: Available only reads", File: "internal/ratelimit/ratelimit.go",
+		Old: "#!lua flags=no-writes\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
+		Package: "./internal/ratelimit", Test: "TestAvailableChangesNothing",
+	},
+	{
+		Name: "ratelimit: Available works when only writes fail", File: "internal/ratelimit/ratelimit.go",
+		Old: "#!lua flags=no-writes\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
+		Package: "./internal/ratelimit", Test: "TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails",
+	},
+	{
+		Name: "ratelimit: a refused call adds nothing", File: "internal/ratelimit/ratelimit.go",
+		Old: "local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')", New: "redis.call('ZADD', key, string.format('%d', now), ARGV[3])\nlocal oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')",
+		Package: "./internal/ratelimit", Test: "TestTheWindowHoldsAtMostTheLimitAndExpires",
+	},
+	{
+		Name: "ratelimit: the window expires after its last permit", File: "internal/ratelimit/ratelimit.go",
+		Old: "  redis.call('PEXPIRE', key, math.floor(window / 1000) + 1)\n", New: "",
+		Package: "./internal/ratelimit", Test: "TestTheWindowHoldsAtMostTheLimitAndExpires",
+	},
+	{
+		Name: "ratelimit: one window per channel", File: "internal/ratelimit/ratelimit.go",
+		Old: "return \"ratelimit:\" + string(ch) }", New: "return \"ratelimit:\" }",
+		Package: "./internal/ratelimit", Test: "TestChannelsHaveSeparateWindows",
+	},
+	{
+		Name: "ratelimit: no worker time is sent to Redis (I12)", File: "internal/ratelimit/ratelimit.go",
+		Old: "l.limit, l.window.Microseconds(), uuid.NewString()).Int64Slice()", New: "l.limit, l.window.Microseconds(), uuid.NewString(), time.Now().UnixMicro()).Int64Slice()",
+		Package: "./internal/ratelimit", Test: "TestTheLimiterSendsRedisNoClockTime",
+	},
+	{
+		Name: "ratelimit: the limit is at least 1", File: "internal/ratelimit/ratelimit.go",
+		Old: "if limit < 1 {", New: "if false && limit < 1 {",
+		Package: "./internal/ratelimit", Test: "TestNewRefusesALimitBelowOneAndANegativeMargin",
+	},
+	{
+		Name: "ratelimit: the margin is not negative", File: "internal/ratelimit/ratelimit.go",
+		Old: "if margin < 0 {", New: "if false && margin < 0 {",
+		Package: "./internal/ratelimit", Test: "TestNewRefusesALimitBelowOneAndANegativeMargin",
+	},
 }
