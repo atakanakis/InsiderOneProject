@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -83,7 +86,7 @@ func TestWorkerStartsAndStopsCleanly(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan int, 1)
 	go func() {
-		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL}), &out)
+		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL, "METRICS_ADDR": "127.0.0.1:0"}), &out)
 	}()
 	waitFor(t, &out, "worker started")
 	stop()
@@ -106,7 +109,7 @@ func TestWorkerBinaryExitsZeroOnSIGTERM(t *testing.T) {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
 	cmd := exec.Command(bin)
-	cmd.Env = []string{"DATABASE_URL=" + e.DatabaseURL, "REDIS_URL=" + e.RedisURL}
+	cmd.Env = []string{"DATABASE_URL=" + e.DatabaseURL, "REDIS_URL=" + e.RedisURL, "METRICS_ADDR=127.0.0.1:0"}
 	// A writer, not StdoutPipe: Wait closes a pipe as soon as the process exits, and the last
 	// lines could be lost (CI run 44750111098); with a writer, Wait returns after the copy.
 	var out syncBuffer
@@ -187,7 +190,7 @@ func TestTheWorkerDeliversEveryChannel(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan int, 1)
 	go func() {
-		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL,
+		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL, "METRICS_ADDR": "127.0.0.1:0",
 			"PROVIDER_URL": srv.URL + "/send"}), &out)
 	}()
 	if !allSent(t, e, ids, 20*time.Second) {
@@ -227,7 +230,7 @@ func TestAKilledWorkersRowComesBackThroughTheReaper(t *testing.T) {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
 	cmd := exec.Command(bin)
-	cmd.Env = []string{"DATABASE_URL=" + e.DatabaseURL, "REDIS_URL=" + e.RedisURL, "PROVIDER_URL=" + srv.URL + "/send"}
+	cmd.Env = []string{"DATABASE_URL=" + e.DatabaseURL, "REDIS_URL=" + e.RedisURL, "METRICS_ADDR=127.0.0.1:0", "PROVIDER_URL=" + srv.URL + "/send"}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +260,7 @@ func TestAKilledWorkersRowComesBackThroughTheReaper(t *testing.T) {
 	defer stop()
 	done := make(chan int, 1)
 	go func() {
-		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL,
+		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL, "METRICS_ADDR": "127.0.0.1:0",
 			"PROVIDER_URL": srv.URL + "/send", "REAPER_TICK": "100ms"}), &out)
 	}()
 	var all []uuid.UUID
@@ -318,7 +321,7 @@ func TestTheWorkerLogsOnlyTheProvidersHost(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan int, 1)
 	go func() {
-		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL,
+		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL, "METRICS_ADDR": "127.0.0.1:0",
 			"PROVIDER_URL": "http://user:hunter2@127.0.0.1:1/b8a1f00d-secret-path"}), &out)
 	}()
 	waitFor(t, &out, "worker started")
@@ -331,6 +334,47 @@ func TestTheWorkerLogsOnlyTheProvidersHost(t *testing.T) {
 	for _, secret := range []string{"hunter2", "b8a1f00d", "user"} {
 		if strings.Contains(log, secret) {
 			t.Errorf("the log contains %q from the provider URL:\n%s", secret, log)
+		}
+	}
+}
+
+// Architecture §10: the worker serves its metrics on METRICS_ADDR, every series of a fixed
+// set present from the start.
+func TestTheWorkerServesItsMetrics(t *testing.T) {
+	e := testkit.Setup(t)
+	var out syncBuffer
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL, "METRICS_ADDR": "127.0.0.1:0"}), &out)
+	}()
+	t.Cleanup(func() { stop(); <-done })
+	waitFor(t, &out, "worker started")
+	var started struct{ Metrics string }
+	for _, l := range strings.Split(out.String(), "\n") {
+		if strings.Contains(l, "worker started") {
+			if err := json.Unmarshal([]byte(l), &started); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	resp, err := http.Get("http://" + started.Metrics + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	for _, want := range []string{
+		`notifications_breaker_state{channel="sms"} 0`,
+		`notifications_sends_in_flight{channel="push"} 0`,
+		`notifications_attempts_total{channel="email",outcome="no_permit_in_time"} 0`,
+		`notifications_finished_total{channel="sms",status="not_stored"} 0`,
+		`notifications_worker_errors_total{operation="result_write"} 0`,
+		`notifications_reaped_total{status="failed"} 0`,
+		`notifications_events_dropped_total{reason="buffer_full"} 0`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics has no %s", want)
 		}
 	}
 }

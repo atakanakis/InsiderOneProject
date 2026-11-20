@@ -73,13 +73,21 @@ func (e Event) Encode() []byte {
 // ErrMalformed is the error of an event that is too large or not an event.
 var ErrMalformed = errors.New("events: malformed event")
 
-// Decode reads an event published by Encode.
+// Decode reads an event published by Encode. A message larger than MaxEventBytes is refused
+// unread; so is one without a notification id or with a status that does not exist.
 func Decode(p []byte) (Event, error) {
+	if len(p) > MaxEventBytes {
+		return Event{}, fmt.Errorf("%w: %d bytes, more than %d", ErrMalformed, len(p), MaxEventBytes)
+	}
 	var w wire
 	if err := json.Unmarshal(p, &w); err != nil {
 		return Event{}, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
-	e := Event{ID: w.ID, Status: domain.Status(w.Status)}
+	status, err := domain.ParseStatus(w.Status)
+	if err != nil || w.ID == uuid.Nil {
+		return Event{}, fmt.Errorf("%w: no notification id or no known status", ErrMalformed)
+	}
+	e := Event{ID: w.ID, Status: status}
 	if w.BatchID != nil {
 		e.BatchID = *w.BatchID
 	}

@@ -39,6 +39,9 @@ type Config struct {
 	// MaxAttempts (MAX_ATTEMPTS): a new row's max_attempts and the budget of /retry. The API
 	// reads it, so it is a shared setting, not part of the worker's timing budget.
 	MaxAttempts int
+	// MetricsAddr (METRICS_ADDR): where the worker serves /metrics (architecture §10). The
+	// API serves it on API_ADDR.
+	MetricsAddr string
 }
 
 // Worker is the timing budget of architecture §13. The comment on each field is its
@@ -77,6 +80,7 @@ func Load(getenv func(string) string) (Config, error) {
 		LogLevel:    p.oneOf("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
 		APIKeys:     p.list("API_KEYS"),
 		MaxAttempts: p.integer("MAX_ATTEMPTS", 6),
+		MetricsAddr: p.str("METRICS_ADDR", ":9100"),
 	}
 	for i, k := range c.APIKeys {
 		if len(k) < MinAPIKeyLen {

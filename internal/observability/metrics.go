@@ -1,10 +1,13 @@
 package observability
 
 import (
+	"net/http"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 )
@@ -167,5 +170,26 @@ func (w *watched) Collect(ch chan<- prometheus.Metric) {
 	for c, f := range w.funcs {
 		ch <- prometheus.MustNewConstMetric(w.breaker, prometheus.GaugeValue, float64(f.breaker()), string(c))
 		ch <- prometheus.MustNewConstMetric(w.inFlight, prometheus.GaugeValue, float64(f.inFlight()), string(c))
+	}
+}
+
+// MetricsHandler serves the registry in Prometheus's text format.
+func MetricsHandler(g prometheus.Gatherer) http.Handler {
+	return promhttp.HandlerFor(g, promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError})
+}
+
+// NewMetricsServer returns the worker's server of /metrics, with the header and time bounds
+// of the API's server (architecture §8).
+func NewMetricsServer(addr string, g prometheus.Gatherer) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", MetricsHandler(g))
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    60 << 10,
 	}
 }

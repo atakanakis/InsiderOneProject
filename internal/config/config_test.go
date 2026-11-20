@@ -169,12 +169,13 @@ func TestLoadReadsEverySettingFromTheEnvironment(t *testing.T) {
 	c, err := Load(env(map[string]string{
 		"DATABASE_URL": "postgres://db", "REDIS_URL": "redis://r", "PROVIDER_URL": "http://p/send",
 		"API_ADDR": ":1", "LOG_LEVEL": "debug", "API_KEYS": " key-one-0123456789, ,key-two-0123456789 ", "MAX_ATTEMPTS": "16",
+		"METRICS_ADDR": ":2",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := (Config{DatabaseURL: "postgres://db", RedisURL: "redis://r", ProviderURL: "http://p/send", APIAddr: ":1", LogLevel: "debug",
-		APIKeys: []string{"key-one-0123456789", "key-two-0123456789"}, MaxAttempts: 16}); !reflect.DeepEqual(c, want) {
+		APIKeys: []string{"key-one-0123456789", "key-two-0123456789"}, MaxAttempts: 16, MetricsAddr: ":2"}); !reflect.DeepEqual(c, want) {
 		t.Fatalf("Load\n got %+v\nwant %+v", c, want)
 	}
 	w, err := LoadWorker(env(map[string]string{

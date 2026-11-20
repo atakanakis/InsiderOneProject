@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,6 +68,9 @@ type Dispatcher struct {
 	slots    chan struct{} // one token per send in flight
 	waiting  atomic.Int64  // rows claimed and not yet back from the gate
 	inflight sync.WaitGroup
+
+	// A failing dependency is logged at most once per 10 s per operation (architecture §10).
+	claims, limits, writes *observability.Every
 }
 
 // New returns a dispatcher for o.Channel, with its own provider client built from o.Provider.
@@ -94,9 +98,15 @@ func New(o Options, q Queue, l Limiter) (*Dispatcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dispatch: %w", err)
 	}
-	return &Dispatcher{o: o, queue: q, limiter: l, provider: c, breaker: NewBreaker(o.BreakerOpen, time.Now),
-		slots: make(chan struct{}, o.Slots)}, nil
+	d := &Dispatcher{o: o, queue: q, limiter: l, provider: c, breaker: NewBreaker(o.BreakerOpen, time.Now),
+		slots: make(chan struct{}, o.Slots), claims: observability.NewEvery(logPeriod),
+		limits: observability.NewEvery(logPeriod), writes: observability.NewEvery(logPeriod)}
+	o.Metrics.Watch(o.Channel, func() int { return int(d.breaker.State()) }, func() int { return len(d.slots) })
+	return d, nil
 }
+
+// logPeriod is how often a failing dependency is logged (architecture §10).
+const logPeriod = 10 * time.Second
 
 // Run claims and sends until ctx ends, then waits for the rows in flight; their sends and
 // result writes are not cancelled (architecture §6, shutdown). This is the loop of §6.
@@ -113,7 +123,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 		for _, p := range domain.Priorities { // high, normal, low (I9)
 			rows, err := d.queue.Claim(ctx, d.o.Channel, p, n-claimed, d.o.Lease)
 			if err != nil {
-				d.o.Log.ErrorContext(ctx, "claim", "channel", d.o.Channel, "error", err)
+				d.failed(ctx, "claim", d.claims, "claim failed", err)
 				break
 			}
 			for _, row := range rows {
@@ -144,7 +154,7 @@ func (d *Dispatcher) room(ctx context.Context) int {
 		free, err := d.limiter.Available(ctx, d.o.Channel)
 		if err != nil {
 			if ctx.Err() == nil {
-				d.o.Log.WarnContext(ctx, "rate limit unavailable; claiming nothing", "channel", d.o.Channel, "error", err)
+				d.failed(ctx, "rate_limit", d.limits, "rate limit unavailable; claiming nothing", err)
 			}
 			return 0
 		}
@@ -163,21 +173,58 @@ func (d *Dispatcher) start(ctx context.Context, row store.Claimed) {
 	go d.handle(context.WithoutCancel(ctx), row, probe, wait)
 }
 
+// failed counts a failed call to a dependency and logs it at most once per period.
+func (d *Dispatcher) failed(ctx context.Context, op string, every *observability.Every, msg string, err error) {
+	d.o.Metrics.Errors.WithLabelValues(op).Inc()
+	every.Log(ctx, d.o.Log, slog.LevelWarn, msg, "channel", d.o.Channel, "error", err)
+}
+
 // handle is the single exit of a claimed row: it ends in Finish (CLAUDE.md, rule 5).
 func (d *Dispatcher) handle(ctx context.Context, row store.Claimed, probe bool, wait *mark) {
 	defer d.inflight.Done()
 	defer func() { <-d.slots }()
 	defer wait.leave()
 	ctx = observability.WithCorrelationID(ctx, row.CorrelationID)
+	// Publish never waits (architecture §9).
+	d.o.Events.Publish(ctx, events.Event{ID: row.ID, BatchID: row.BatchID, Status: domain.Processing})
+	var gate gateTimes // set by the gate, on this goroutine (architecture §7, property 1)
 	result := d.provider.Send(ctx, messageOf(row), func(gateCtx context.Context) error {
+		gate.began = time.Now()
 		err := d.limiter.Wait(gateCtx, d.o.Channel) // the send gate (architecture §7)
+		gate.ended, gate.permitted = time.Now(), err == nil
 		wait.leave()
 		return err
 	})
 	verdict := Classify(result)
+	d.measure(gate, verdict)
 	d.breaker.Report(probe, verdict.Lesson)
 	d.finish(ctx, row, result, verdict)
 }
+
+// gateTimes are what one send's gate observed: when it began and ended, and whether it gave a
+// permit. A send whose connection failed first never reached the gate.
+type gateTimes struct {
+	began, ended time.Time
+	permitted    bool
+}
+
+// measure records one attempt (architecture §10): its outcome, its wait at the gate, and the
+// provider's latency from the permit to the end of the send. Each is a counter or a histogram
+// in memory; nothing here can wait or fail.
+func (d *Dispatcher) measure(gate gateTimes, v Verdict) {
+	ch := string(d.o.Channel)
+	d.o.Metrics.Attempts.WithLabelValues(ch, outcomeLabel(v.Outcome)).Inc()
+	if gate.began.IsZero() {
+		return
+	}
+	d.o.Metrics.GateWait.WithLabelValues(ch).Observe(gate.ended.Sub(gate.began).Seconds())
+	if gate.permitted {
+		d.o.Metrics.ProviderLatency.WithLabelValues(ch).Observe(time.Since(gate.ended).Seconds())
+	}
+}
+
+// outcomeLabel is a verdict's outcome as a label value: "error response" is "error_response".
+func outcomeLabel(outcome string) string { return strings.ReplaceAll(outcome, " ", "_") }
 
 // finish stores the result, retrying until the database answers: either the result is
 // stored or the row is no longer this attempt's (stale). It gives up one lease length after
@@ -189,13 +236,18 @@ func (d *Dispatcher) finish(ctx context.Context, row store.Claimed, r provider.R
 		res.StatusCode = r.StatusCode
 	}
 	log := d.o.Log.With("notification_id", row.ID, "channel", row.Channel, "attempt", row.Attempt, "outcome", v.Outcome)
+	ch := string(d.o.Channel)
 	giveUp := time.Now().Add(d.o.Lease)
 	for delay := 100 * time.Millisecond; ; delay = min(2*delay, 5*time.Second) {
 		status, changed, err := d.queue.Finish(ctx, row.ID, row.Attempt, res)
 		if err == nil {
+			finished := string(status)
 			if changed {
 				d.o.Events.Publish(ctx, events.Event{ID: row.ID, BatchID: row.BatchID, Status: status})
+			} else {
+				finished = "stale"
 			}
+			d.o.Metrics.Finished.WithLabelValues(ch, finished).Inc()
 			level := slog.LevelInfo
 			if v.Status == domain.Sent {
 				level = slog.LevelDebug
@@ -204,11 +256,19 @@ func (d *Dispatcher) finish(ctx context.Context, row store.Claimed, r provider.R
 				"duration_ms", r.Duration.Milliseconds(), "error", res.Error)
 			return
 		}
+		// Counted, and logged at most once per period: a Postgres that refuses writes made a
+		// line per retry, thousands a minute (session 5's review). The row's own lines are
+		// debug lines, with its correlation id.
+		d.o.Metrics.Errors.WithLabelValues("result_write").Inc()
 		if time.Now().Add(delay).After(giveUp) {
-			log.ErrorContext(ctx, "result not stored; the reaper will return the row", "error", err)
+			d.o.Metrics.Finished.WithLabelValues(ch, "not_stored").Inc()
+			log.DebugContext(ctx, "result not stored; the reaper will return the row", "error", err)
+			d.writes.Log(context.Background(), d.o.Log, slog.LevelError, "result writes failing; a result was not stored, the reaper will return its row",
+				"channel", ch, "error", err)
 			return
 		}
-		log.WarnContext(ctx, "result write failed; retrying", "error", err, "retry_in", delay)
+		log.DebugContext(ctx, "result write failed; retrying", "error", err, "retry_in", delay)
+		d.writes.Log(context.Background(), d.o.Log, slog.LevelWarn, "result writes failing; retrying", "channel", ch, "error", err)
 		time.Sleep(delay)
 	}
 }

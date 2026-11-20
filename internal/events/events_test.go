@@ -66,7 +66,15 @@ func subscribe(t testing.TB, c *redis.Client, wait time.Duration) *subscription 
 		defer close(done)
 		Subscribe(ctx, c, func(e Event) { s.got <- e }, SubscribeOptions{Metrics: s.metrics, Wait: wait})
 	}()
-	t.Cleanup(func() { cancel(); <-done })
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second): // a read waiting for its 10 s must not hold up a shutdown
+			t.Error("Subscribe did not return within 2 s of its context's end")
+			<-done
+		}
+	})
 	return s
 }
 

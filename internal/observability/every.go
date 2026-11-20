@@ -26,5 +26,18 @@ func NewEvery(period time.Duration) *Every {
 
 // Log writes the line, unless a line was written less than one period ago.
 func (e *Every) Log(ctx context.Context, log *slog.Logger, level slog.Level, msg string, args ...any) {
+	e.mu.Lock()
+	now := e.now()
+	if !e.last.IsZero() && now.Sub(e.last) < e.period {
+		e.skipped++
+		e.mu.Unlock()
+		return
+	}
+	skipped := e.skipped
+	e.last, e.skipped = now, 0
+	e.mu.Unlock()
+	if skipped > 0 {
+		args = append(args[:len(args):len(args)], "suppressed", skipped)
+	}
 	log.Log(ctx, level, msg, args...)
 }

@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -83,7 +84,25 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		IdleConns: budget.IdleConns, IdleConnTimeout: budget.IdleConnTimeout,
 	}
 	queue := store.NewQueue(pool)
-	publisher := events.Discard{} // the Redis publisher comes in session 7
+	reg := observability.NewRegistry()
+	metrics := observability.NewWorkerMetrics(reg)
+	// The publisher has its own Redis client: a publish never holds a connection the rate
+	// limiter needs (architecture §9).
+	eventsClient, err := redisclient.New(cfg.RedisURL)
+	if err != nil {
+		log.Error("redis url", "error", err)
+		return 2
+	}
+	defer func() { _ = eventsClient.Close() }()
+	publisher := events.NewRedis(eventsClient, events.Options{Log: log, Metrics: observability.NewPublishMetrics(reg)})
+	metricsListener, err := net.Listen("tcp", cfg.MetricsAddr)
+	if err != nil {
+		log.Error("metrics listen", "addr", cfg.MetricsAddr, "error", err)
+		return 1
+	}
+	metricsServer := observability.NewMetricsServer(cfg.MetricsAddr, reg)
+	go func() { _ = metricsServer.Serve(metricsListener) }()
+	defer func() { _ = metricsServer.Close() }()
 
 	var running sync.WaitGroup
 	for _, ch := range domain.Channels {
@@ -91,7 +110,7 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 			Channel: ch, Slots: budget.Slots, ClaimBatch: budget.ClaimBatch, Lease: budget.Lease,
 			PauseBusy: budget.PauseBusy, PauseIdle: budget.PauseIdle, BreakerOpen: budget.BreakerOpen,
 			Retry:    dispatch.RetryPolicy{Base: budget.BackoffBase, Cap: budget.BackoffCap, Soon: time.Second},
-			Provider: providerOptions, Log: log, Events: publisher,
+			Provider: providerOptions, Log: log, Events: publisher, Metrics: metrics,
 		}, queue, limiter)
 		if err != nil {
 			log.Error("dispatcher", "channel", ch, "error", err)
@@ -99,14 +118,15 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		}
 		running.Go(func() { d.Run(ctx) })
 	}
-	reaper := dispatch.Reaper{Queue: queue, Tick: budget.ReaperTick, Log: log, Events: publisher}
+	reaper := dispatch.Reaper{Queue: queue, Tick: budget.ReaperTick, Log: log, Events: publisher, Metrics: metrics}
 	running.Go(func() { reaper.Run(ctx) })
 
-	log.Info("worker started", "provider", providerHost(cfg.ProviderURL),
+	log.Info("worker started", "provider", providerHost(cfg.ProviderURL), "metrics", metricsListener.Addr().String(),
 		"lease", budget.Lease.String(), "send_timeout", budget.SendTimeout.String(),
 		"shutdown_timeout", budget.ShutdownTimeout.String())
 	<-ctx.Done()
 	log.Info("stopping: no more claims; waiting for the sends in flight")
+	deadline := time.Now().Add(budget.ShutdownTimeout)
 	stopped := make(chan struct{})
 	go func() {
 		running.Wait()
@@ -114,6 +134,10 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	}()
 	select {
 	case <-stopped:
+		// The last results' events, for at most 2 s and within the shutdown timeout.
+		flush, cancel := context.WithTimeout(context.Background(), min(2*time.Second, time.Until(deadline)))
+		publisher.Close(flush)
+		cancel()
 		log.Info("worker stopped")
 		return 0
 	case <-time.After(budget.ShutdownTimeout):
