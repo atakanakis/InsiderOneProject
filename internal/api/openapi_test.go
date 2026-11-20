@@ -13,7 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"go.yaml.in/yaml/v3"
 
@@ -72,6 +74,7 @@ type openAPIServer struct {
 	url      string
 	downTo   string
 	brokenTo string // the real handler on a database pool that is closed: every query fails
+	shutTo   string // the real handler whose WebSocket hub has shut down
 	exec     func(sql string, args ...any)
 }
 
@@ -320,12 +323,43 @@ var openAPIScenarios = map[string]func(s *openAPIServer) int{
 	},
 	"GET /v1/templates/{name} 404": func(s *openAPIServer) int { return s.do("GET", "/v1/templates/no-such-template", "") },
 
+	// Metrics.
+	"GET /v1/metrics 200": func(s *openAPIServer) int { return s.do("GET", "/v1/metrics?window=15m", "") },
+	"GET /v1/metrics 400": func(s *openAPIServer) int { return s.do("GET", "/v1/metrics?window=2h", "") },
+	"GET /v1/metrics 401": func(s *openAPIServer) int { return s.anonymous("GET", "/v1/metrics", "") },
+	"GET /metrics 200":    func(s *openAPIServer) int { return s.anonymous("GET", "/metrics", "") },
+
+	// WebSocket.
+	"GET /v1/ws 101": func(s *openAPIServer) int { return s.upgrade(s.url, "notificationId="+uuid.NewString()) },
+	"GET /v1/ws 400": func(s *openAPIServer) int { return s.do("GET", "/v1/ws", "") }, // no id
+	"GET /v1/ws 401": func(s *openAPIServer) int { return s.anonymous("GET", "/v1/ws?notificationId="+uuid.NewString(), "") },
+	"GET /v1/ws 403": func(s *openAPIServer) int {
+		return s.do("GET", "/v1/ws?notificationId="+uuid.NewString(), "", "Origin", "https://elsewhere.example")
+	},
+	"GET /v1/ws 503": func(s *openAPIServer) int { return s.upgrade(s.shutTo, "notificationId="+uuid.NewString()) },
+
 	// Open endpoints: no key needed.
 	"GET /healthz 200":      func(s *openAPIServer) int { return s.anonymous("GET", "/healthz", "") },
 	"GET /readyz 200":       func(s *openAPIServer) int { return s.anonymous("GET", "/readyz", "") },
 	"GET /readyz 503":       func(s *openAPIServer) int { code, _ := s.send(s.downTo, "GET", "/readyz", ""); return code },
 	"GET /openapi.yaml 200": func(s *openAPIServer) int { return s.anonymous("GET", "/openapi.yaml", "") },
 	"GET /docs 200":         func(s *openAPIServer) int { return s.anonymous("GET", "/docs", "") },
+}
+
+// upgrade opens a WebSocket with the API key and returns the status of the upgrade's answer.
+func (s *openAPIServer) upgrade(base, query string) int {
+	s.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(base, "http")+"/v1/ws?"+query,
+		&websocket.DialOptions{HTTPHeader: http.Header{"X-Api-Key": []string{testAPIKey}}})
+	if c != nil {
+		_ = c.CloseNow()
+	}
+	if resp == nil {
+		s.t.Fatalf("upgrade: %v", err)
+	}
+	return resp.StatusCode
 }
 
 // broken sends one request with the API key to the server whose database fails.
@@ -350,6 +384,8 @@ func init() {
 			return s.broken("POST", "/v1/templates", `{"name": "t", "channel": "sms", "body": "hi"}`)
 		},
 		"GET /v1/templates 500":        func(s *openAPIServer) int { return s.broken("GET", "/v1/templates", "") },
+		"GET /v1/metrics 500":          func(s *openAPIServer) int { return s.broken("GET", "/v1/metrics", "") },
+		"GET /v1/ws 500":               func(s *openAPIServer) int { return s.upgrade(s.brokenTo, "notificationId="+id) },
 		"GET /v1/templates/{name} 500": func(s *openAPIServer) int { return s.broken("GET", "/v1/templates/t", "") },
 	} {
 		openAPIScenarios[name] = run
@@ -416,6 +452,12 @@ func TestOpenAPIMatchesTheServer(t *testing.T) {
 		Health: Health{Postgres: closed.Ping, Redis: ok}, Pool: closed, APIKeys: []string{testAPIKey}, MaxAttempts: 6,
 	}))
 	t.Cleanup(broken.Close)
+	shutHub := NewHub(HubOptions{})
+	shutHub.Close()
+	shut := httptest.NewServer(NewHandler(log, Options{
+		Health: Health{Postgres: env.Pool.Ping, Redis: ok}, Pool: env.Pool, APIKeys: []string{testAPIKey}, MaxAttempts: 6, Hub: shutHub,
+	}))
+	t.Cleanup(shut.Close)
 
 	names := make([]string, 0, len(listed))
 	for name := range listed {
@@ -428,7 +470,7 @@ func TestOpenAPIMatchesTheServer(t *testing.T) {
 			if !ok {
 				t.Fatalf("no scenario produces %s", name)
 			}
-			s := &openAPIServer{t: t, url: up.URL, downTo: down.URL, brokenTo: broken.URL, exec: func(sql string, args ...any) {
+			s := &openAPIServer{t: t, url: up.URL, downTo: down.URL, brokenTo: broken.URL, shutTo: shut.URL, exec: func(sql string, args ...any) {
 				t.Helper()
 				if _, err := env.Pool.Exec(context.Background(), sql, args...); err != nil {
 					t.Fatalf("setup: %v", err)

@@ -22,6 +22,7 @@ import (
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/events"
+	"github.com/atakanakis/InsiderOneProject/internal/observability"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
 )
 
@@ -50,6 +51,11 @@ type Options struct {
 	// DatabaseDeadline bounds the database work of a request; 0 means the constant
 	// DatabaseDeadline. Tests shorten it.
 	DatabaseDeadline time.Duration
+	// Metrics are the API's (architecture §10); nil: a registry of their own.
+	Metrics *observability.APIMetrics
+	// Hub hands status events to WebSocket clients (architecture §9); nil: a hub with the
+	// bounds of §9 that no event reaches.
+	Hub *Hub
 }
 
 //go:embed openapi.yaml
@@ -90,12 +96,14 @@ func (s *server) routes() []route {
 		{"POST /v1/templates", s.createTemplate},
 		{"GET /v1/templates", s.templates},
 		{"GET /v1/templates/{name}", s.template},
+		{"GET /v1/ws", s.websocket},
+		{"GET /v1/metrics", s.metrics},
 	}
 }
 
 // routePatterns lists every route of the API, as registered on the mux.
 func routePatterns() []string {
-	out := []string{"GET /healthz", "GET /readyz", "GET /openapi.yaml", "GET /docs"}
+	out := []string{"GET /healthz", "GET /readyz", "GET /openapi.yaml", "GET /docs", "GET /metrics"}
 	for _, r := range (&server{}).routes() {
 		out = append(out, r.pattern)
 	}
@@ -111,6 +119,9 @@ func register(mux *http.ServeMux, log *slog.Logger, o Options) {
 	mux.HandleFunc("GET /docs", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, docsPage)
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotImplemented, apiError{Code: "not_implemented", Message: "not implemented"})
 	})
 	if o.Pool == nil {
 		return

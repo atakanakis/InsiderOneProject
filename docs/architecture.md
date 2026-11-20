@@ -924,7 +924,7 @@ time is a quota, left out (section 16).
 | Rate-limit window in Redis (section 7) | At most `limit` permits per channel, also with workers of different settings; both keys expire one window after the last permit (TestTheWindowHoldsAtMostTheLimitAndExpires, TestWorkersWithDifferentSettingsAreRefused) |
 | Provider response read by the worker (section 7) | Headers 64 KiB; body 4 KiB, the rest not read (TestResponseHeadersOverTheBoundAreNotAResponse, TestTheResponseBodyIsReadUpToItsBound) |
 | Text stored from a delivery result (section 5) | Error and outcome 1 KiB, provider message id 256 bytes, valid UTF-8 (TestFinishStoresTextAtItsBound, TestFinishStoresAnyErrorTextWithinItsBound) |
-| WebSocket | 1000 connections per API instance; 256 messages waiting per client, then it is disconnected; 5 s to write a message; no data message from the client; a ping every 30 s, answered within 10 s; 1 to 100 notification ids and at most 10 batch ids. The table and tests are in section 9 |
+| WebSocket | 1000 connections per API instance; 256 messages waiting per client, then it is disconnected; 5 s to write a message; no data message from the client; a ping every 30 s, answered within 10 s; up to 100 notification ids and 10 batch ids, at least one. The table and tests are in section 9 |
 | Status event read from Redis | 1 KiB; a larger or malformed event is dropped (TestAMalformedOrOversizedEventIsDropped) |
 | Status events waiting to be published | 4,096 per process; more are dropped and counted (TestPublishNeverBlocksWhenRedisHangs) |
 | `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged (TestCorrelationIDBound, TestCorrelationIDIsAcceptedOrReplaced) |
@@ -1005,9 +1005,12 @@ dropped and counted (TestAMalformedOrOversizedEventIsDropped).
 
 **The WebSocket endpoint** is `GET /v1/ws?notificationId=...&batchId=...`, behind the API key
 like every `/v1` path (TestWebSocketNeedsAnAPIKeyWhenConfigured). A client names what it
-wants to follow: 1 to 100 notification ids and at most 10 batch ids, each parameter repeated;
-no id, too many, a value that is not a UUID or another parameter is a 400 before the upgrade
-(TestWebSocketFiltersAreBounded). There is no "every event" stream: each client receives only
+wants to follow: up to 100 notification ids and up to 10 batch ids, each parameter repeated,
+at least one id; no id, too many, a value that is not a UUID, another parameter, or a request
+that is not a WebSocket upgrade is a 400 in the error form, before the upgrade
+(TestWebSocketFiltersAreBounded). A browser page of another origin (an `Origin` header whose
+host is not the request's) is a 403, so a page cannot use a browser's network position to
+read statuses. There is no "every event" stream: each client receives only
 what it named.
 
 When the connection opens, the server sends the current state first and then every change:

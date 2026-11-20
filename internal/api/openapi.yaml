@@ -283,6 +283,94 @@ paths:
         "500": { $ref: "#/components/responses/Internal" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/metrics:
+    get:
+      operationId: metrics
+      summary: The main figures of a recent window, per channel
+      description: |
+        The queue's depth by status and the age of its oldest due row (from Postgres), and,
+        for the attempts that started within the window, their number by outcome, per
+        second, the share that delivered, and the 50th, 95th and 99th percentile of the
+        attempt's duration and of the delivery latency (from creation to the end of the
+        attempt that delivered). An answer is computed at most once per 5 s per window.
+      parameters:
+        - name: window
+          in: query
+          description: One of 1m, 5m, 15m and 1h; anything else is a 400.
+          schema: { type: string, enum: ["1m", "5m", "15m", "1h"], default: "5m" }
+      responses:
+        "200":
+          description: The figures.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Metrics" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /v1/ws:
+    get:
+      operationId: websocket
+      summary: Live status events over a WebSocket
+      description: |
+        Names what to follow: up to 100 `notificationId` and up to 10 `batchId`, each
+        parameter repeated; at least one id. A browser page of another origin is refused. The server first sends the current state of
+        each (a `StatusMessage` per notification, a `BatchMessage` per batch; an id that does
+        not exist is not answered), then a `StatusMessage` for every change. The client sends
+        no data messages: one closes the connection with 1008. The server pings every 30 s
+        and closes a connection whose pong does not arrive within 10 s; a client that cannot
+        keep up with 256 waiting messages is closed with 1008. On shutdown, 1001.
+      parameters:
+        - name: notificationId
+          in: query
+          schema: { type: array, maxItems: 100, items: { type: string, format: uuid } }
+          style: form
+          explode: true
+        - name: batchId
+          in: query
+          schema: { type: array, maxItems: 10, items: { type: string, format: uuid } }
+          style: form
+          explode: true
+      responses:
+        "101":
+          description: |
+            Switching to the WebSocket protocol. Messages are JSON text:
+            `StatusMessage` or `BatchMessage`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/StatusMessage"
+                  - $ref: "#/components/schemas/BatchMessage"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: A browser page of another origin (`forbidden_origin`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503":
+          description: The instance holds its most WebSocket connections, 1000, or is shutting down (`unavailable`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /metrics:
+    get:
+      operationId: prometheus
+      summary: Prometheus metrics
+      description: |
+        Every metric is named `notifications_...` (docs/architecture.md, section 10). Labels
+        take values from fixed sets only. Open, like the health endpoints.
+      security: []
+      responses:
+        "200":
+          description: The Prometheus text format.
+          content:
+            text/plain:
+              schema: { type: string }
+
   /healthz:
     get:
       operationId: healthz
@@ -608,6 +696,62 @@ components:
         channel: { $ref: "#/components/schemas/Channel" }
         createdAt: { type: string, format: date-time }
 
+    Metrics:
+      type: object
+      required: [window, channels]
+      properties:
+        window: { type: string, enum: ["1m", "5m", "15m", "1h"] }
+        channels:
+          type: object
+          description: One entry per channel.
+          additionalProperties: { $ref: "#/components/schemas/ChannelMetrics" }
+    ChannelMetrics:
+      type: object
+      required: [queue, oldestDueAgeSeconds, attempts]
+      properties:
+        queue:
+          type: object
+          description: Rows by status, for scheduled, pending, retrying and processing.
+          additionalProperties: { type: integer }
+        oldestDueAgeSeconds: { type: number, description: "0 when nothing is due." }
+        attempts:
+          type: object
+          required: [total, perSecond, byOutcome]
+          properties:
+            total: { type: integer }
+            perSecond: { type: number }
+            byOutcome:
+              type: object
+              description: Every outcome of the verdict table, with 0 when none.
+              additionalProperties: { type: integer }
+        deliveredShare: { type: number, description: "Absent when there was no attempt." }
+        attemptDurationMs: { $ref: "#/components/schemas/Percentiles" }
+        deliveryLatencyMs: { $ref: "#/components/schemas/Percentiles" }
+    Percentiles:
+      type: object
+      description: Absent when there is nothing to measure.
+      properties:
+        p50: { type: number }
+        p95: { type: number }
+        p99: { type: number }
+    StatusMessage:
+      type: object
+      required: [type, id, status]
+      properties:
+        type: { type: string, const: status }
+        id: { type: string, format: uuid }
+        batchId: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/Status" }
+    BatchMessage:
+      type: object
+      required: [type, batchId, total, counts]
+      properties:
+        type: { type: string, const: batch }
+        batchId: { type: string, format: uuid }
+        total: { type: integer }
+        counts:
+          type: object
+          additionalProperties: { type: integer }
     Readiness:
       type: object
       required: [status, postgres, redis]

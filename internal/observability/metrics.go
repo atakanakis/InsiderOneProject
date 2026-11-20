@@ -193,3 +193,53 @@ func NewMetricsServer(addr string, g prometheus.Gatherer) *http.Server {
 		MaxHeaderBytes:    60 << 10,
 	}
 }
+
+// HTTPMethods are the methods a request is counted under; any other is "other".
+var HTTPMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+// APIMetrics are the API's metrics, with the registry they are on.
+type APIMetrics struct {
+	Registry          *prometheus.Registry
+	Requests          *prometheus.CounterVec   // method, route, code
+	Duration          *prometheus.HistogramVec // method, route
+	WebSockets        prometheus.Gauge
+	WebSocketsRefused prometheus.Counter
+	WebSocketsClosed  *prometheus.CounterVec // reason
+	Publish           *PublishMetrics
+	Subscribe         *SubscribeMetrics
+}
+
+// NewAPIMetrics registers the API's metrics on reg.
+func NewAPIMetrics(reg *prometheus.Registry) *APIMetrics {
+	m := &APIMetrics{
+		Registry: reg,
+		Requests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "notifications_http_requests_total",
+			Help: "HTTP requests by method, route pattern (unmatched for any other path) and status code."},
+			[]string{"method", "route", "code"}),
+		Duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "notifications_http_request_duration_seconds",
+			Help: "Time to answer an HTTP request; a WebSocket is not timed.", Buckets: prometheus.DefBuckets},
+			[]string{"method", "route"}),
+		WebSockets: prometheus.NewGauge(prometheus.GaugeOpts{Name: "notifications_websocket_connections",
+			Help: "Open WebSocket connections."}),
+		WebSocketsRefused: prometheus.NewCounter(prometheus.CounterOpts{Name: "notifications_websocket_refused_total",
+			Help: "WebSocket upgrades refused because the instance had its most connections."}),
+		WebSocketsClosed: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "notifications_websocket_closed_total",
+			Help: "WebSocket connections closed, by reason."}, []string{"reason"}),
+		Publish:   NewPublishMetrics(reg),
+		Subscribe: NewSubscribeMetrics(reg),
+	}
+	reg.MustRegister(m.Requests, m.Duration, m.WebSockets, m.WebSocketsRefused, m.WebSocketsClosed)
+	for _, r := range WebSocketCloseReasons {
+		m.WebSocketsClosed.WithLabelValues(r)
+	}
+	return m
+}
+
+// The figures the API reads from Postgres (architecture §10).
+var (
+	QueueDepthDesc = prometheus.NewDesc("notifications_queue_depth",
+		"Rows waiting or in flight, by channel and status, read from Postgres at most once per 5 s.",
+		[]string{"channel", "status"}, nil)
+	OldestDueAgeDesc = prometheus.NewDesc("notifications_queue_oldest_due_age_seconds",
+		"How long the oldest due row of the channel has been due; 0 when none is.", []string{"channel"}, nil)
+)
