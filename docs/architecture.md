@@ -623,7 +623,10 @@ that hangs needs an address that drops packets, which a test on one machine cann
   make a request that cannot be built (section 6, "no response" case 3; session 5).
 - The provider URL can hold a secret (a webhook.site path, credentials). It is never logged:
   `New`'s error does not quote it, and the worker logs only its scheme and host (session 5's
-  review, a nit; TestTheWorkerLogsOnlyTheProvidersHost). What it means for the row is
+  review, a nit; TestTheWorkerLogsOnlyTheProvidersHost). The error of a send does not quote
+  it either: Go's `*url.Error` does, and that text was stored as `last_error`, logged, and,
+  from session 6, shown by the API. `Send` keeps the operation and the cause and drops the
+  URL (session 6's review, F2; TestASendErrorDoesNotQuoteTheURL). What it means for the row is
   decided by `Classify` (section 6), in session 5 (TestTheResultCarriesWhatWasObserved).
 - No proxy: a send goes straight to the provider, as it does in every measurement here.
 - **Bounds.** The client reads at most 64 KiB of response headers (Go's default is 10 MiB,
@@ -757,8 +760,14 @@ and it counts towards the breaker.
 
 - **Create** (`POST /v1/notifications`): `recipient`, `channel` (`sms`, `email`, `push`),
   either `content` or `template` with `variables` (an object of strings), `priority` (`high`,
-  `normal`, `low`; default `normal`), `scheduledAt`, `idempotencyKey`. Unknown fields are
-  refused. 201 with the notification; 200 with the first one for a repeated key.
+  `normal`, `low`; default `normal`), `scheduledAt`, `idempotencyKey`. 201 with the
+  notification; 200 with the first one for a repeated key, answered as the status endpoint
+  answers it, with its attempt history (session 6's review, F6). The key is a field of the
+  body; an `Idempotency-Key` header on this endpoint is a 400, not ignored (review, F9).
+- **Field names** are matched exactly, each once, in every object the API decodes: an
+  unknown name, a name in another case (`Content`) and a name given twice are 400s naming it.
+  Go's decoder matches names in any case and keeps the last of two; the API checks the names
+  of each object before decoding it (session 6's review, F7).
 - **Batch** (`POST /v1/notifications/batch`): `{"notifications": [...]}`, items as above
   without `idempotencyKey` (a batch is retried as a whole, under its `Idempotency-Key`
   header). 201 with `batchId`, `total` and the ids in the order of the items. Item `i` gets
@@ -772,7 +781,11 @@ and it counts towards the breaker.
   (inclusive), `createdTo` (exclusive); `limit` (1 to 100, default 50); `cursor`. Items are
   summaries without `content`, newest first: `ORDER BY created_at DESC, id ASC`, the order of
   the list index. The cursor is the `(created_at, id)` of the last item, opaque to the
-  client; the next page is `created_at < c OR (created_at = c AND id > i)`. `nextCursor` is
+  client; the next page is `created_at <= c AND (created_at < c OR (created_at = c AND
+  id > i))`. The first term is redundant for the result and is what makes the cursor a bound
+  of the index scan: without it Postgres read the index from its start and filtered, and a
+  page 1.9 million rows deep took 300 ms instead of under 1 ms (session 6's review, F3;
+  TestAListPageReadsTheIndexFromItsCursor). `nextCursor` is
   present only when the page is full. A cursor the API could not have given (malformed, or a
   time after the year 9999) is a 400 (TestACursorOutsideTheTimeRangeIsRefused).
 - **Cancel** and **retry** answer 200 with the new status, 404 for an unknown id, and 409
@@ -785,7 +798,8 @@ and it counts towards the breaker.
   cursor; `GET /v1/templates/{name}` returns one with its body.
 
 An id that is not a UUID is a 400. Every status change the API makes (create, cancel, retry)
-is published through the narrow `events.Publisher` of section 9 after it is committed.
+is handed to the narrow `events.Publisher` of section 9 after it is committed; until session
+7 adds the Redis publisher, the binary gives it `events.Discard`.
 
 **There is no service layer.** The handlers call `domain` for validation and rendering and
 `store` for SQL. Section 14 listed an `internal/service` package for use cases; every use case
@@ -809,7 +823,12 @@ calls. It was removed in session 6.
 
 **Scheduling.** `scheduledAt` in the future creates the row as `scheduled` with that
 `ready_at`. A `scheduledAt` that is absent or not in the future creates it `pending`, due now.
-Postgres decides which, with `now()`, in the insert (rule 7).
+Postgres decides which, with `now()`, in the insert (rule 7). `scheduledAt` is cut to
+microseconds, as Postgres stores it, before it is hashed, and must lie before the year 10000
+in UTC: Go cannot write a later time as RFC 3339, and such a row answered every read with an
+empty 200 (session 6's review, F4; TestAScheduledAtFromTheYear10000IsRefused). An answer is
+encoded before its status is written, so one that cannot be encoded is a logged 500, never a
+2xx without a body (TestAnAnswerThatCannotBeEncodedIsA500).
 
 **Templates.** A template body contains `{{.name}}` placeholders. Rendering is substitution
 only; no template language is executed. Any other `{{` in a body is refused when the
@@ -829,23 +848,45 @@ channel (E.164 phone number, an email address of at most 254 bytes, a device tok
 known enum values. Content and variable values must not contain NUL, which Postgres refuses
 in `text`. Errors name the field (`notifications[3].recipient`).
 
-**Errors** have one form, written in one place:
+**Database time.** Every `/v1` request runs with a deadline of 5 s for its database work,
+set in one place, on top of the statement timeout of each statement (also 5 s). A statement
+timeout is enforced by Postgres itself, so it did not help when Postgres stalled: the
+reviewer paused it for 40 s and the client got no answer at all after 40 s, though the row
+was written (session 6's review, F5). With the deadline the client gets a 500 within the
+deadline (TestARequestEndsAtItsDeadlineWhenPostgresStalls). Whether a write that was cut off
+committed is then unknown to the API as well as to the client; a client that retries with an
+idempotency key gets the stored row or a new one, never two. Cancel and retry are queue
+writes with their own 10 s timeout (section 5, rule 8), so they can take up to 10 s.
+
+**Errors** of the handlers have one form, written in one place:
 `{"error": {"code", "message", "fields": [{"field", "message"}], "moreFields"}}`. A message
 is a fixed text and never quotes a value from the request; a name that comes from the request
 (an unknown field, a variable name) passes through one function, `domain.Echo`, which keeps
 its first 64 bytes. With at most 100 fields the size of an error body does not depend on the
 request: 1000 items with every field wrong answer 8,690 bytes, and 1000 items each with a
-64-byte variable name that JSON escapes to six bytes a character, the largest the form
-allows, 28,494 bytes (TestErrorBodiesStayWithinTheirBoundForAnyRequest,
+64-byte variable name of control characters, which JSON escapes to six bytes each, the
+largest the form allows, 47,794 bytes (TestErrorBodiesStayWithinTheirBoundForAnyRequest,
 `go test -count=1 -v -run TestErrorBodiesStayWithinTheirBoundForAnyRequest ./internal/api`).
 The first version echoed the value of a too-long field into its message: a 99 KB request
-produced a 68 MB error.
+produced a 68 MB error. A path or method the API does not have is answered by Go's router
+with a plain-text 404 or 405.
 
 **Decoding is bounded too.** The body is read through a limit (`http.MaxBytesReader`). The
 batch array is decoded one item at a time and the 1,001st item ends the request; the
 variables of an item are counted while they are decoded and the 51st ends it. So 8 MiB of
 `{}` items, or 1 MiB of variables, cost the server a bounded amount, not millions of decoded
 items.
+
+**Rendering is bounded across requests.** A template makes a small request render far more
+than it sent: session 6's reviewer made 5 KB requests render 16 MiB each, and 40 of them at
+once took the API from 59 MiB to 1.1 GiB. Two rules bound it. The rendered content of one
+request is at most 8 MiB, the batch's body bound, so it is never more than a client could
+have sent as plain content. And rendering and storing run in one of 4 slots per API instance
+(`api.MaxRenderingRequests`): a request that has been decoded and validated waits for a slot,
+with its deadline, before it renders anything. What waits is what the client sent; what is
+rendered at once is at most 4 × 8 MiB (TestConcurrentRequestsRenderInBoundedMemory). A
+template still lets a small request store up to 8 MiB; the total a client may store over
+time is a quota, left out (section 16).
 
 **Bounds.** Every input and every output has a stated limit, and each limit has a test.
 
@@ -857,14 +898,16 @@ items.
 | Content after rendering | Per channel: SMS 1600 characters, push 4096, email 100,000 |
 | Template body | The content bound of its channel; at most 50 distinct variables |
 | Template variables per notification | 50; names up to 64 characters |
-| Total rendered content per request | 16 MiB, calculated before rendering |
-| Template name, idempotency key | 64 and 128 characters |
+| Total rendered content per request | 8 MiB, the batch's body bound, calculated before rendering; at most 4 requests per API instance render at once (TestTheRenderedTotalOfARequestIsBounded, TestConcurrentRequestsRenderInBoundedMemory) |
+| `scheduledAt` | Before the year 10000 in UTC; cut to microseconds (TestAScheduledAtFromTheYear10000IsRefused) |
+| Template name, idempotency key | 64 and 128 characters; a template name starts with a letter or digit |
+| API key | At least 16 characters; the API refuses to start with a shorter one (TestAPIKeysMustBeAtLeast16Characters) |
 | Error response | 100 fields, plus a count of the rest; a name from the request 64 bytes; the whole body at most 64 KiB (TestErrorBodiesStayWithinTheirBoundForAnyRequest, TestFieldErrorsAreKeptUpToTheirBound) |
 | List page | 100 items; items are summaries without `content` |
 | Template list page | 100 names, without bodies |
 | Attempt history in a status answer | The last 100 attempts, with the total count (`/retry` can add attempts without end) |
 | Metrics window | 1 hour |
-| Database time per API request | Statement timeout of 5 s |
+| Database time per API request | A deadline of 5 s on the request, and a statement timeout of 5 s; cancel and retry 10 s (TestARequestEndsAtItsDeadlineWhenPostgresStalls, TestAPIDatabaseSessionsHaveAFiveSecondStatementTimeout) |
 | Rate-limit window in Redis (section 7) | At most `limit` permits per channel, also with workers of different settings; both keys expire one window after the last permit (TestTheWindowHoldsAtMostTheLimitAndExpires, TestWorkersWithDifferentSettingsAreRefused) |
 | Provider response read by the worker (section 7) | Headers 64 KiB; body 4 KiB, the rest not read (TestResponseHeadersOverTheBoundAreNotAResponse, TestTheResponseBodyIsReadUpToItsBound) |
 | Text stored from a delivery result (section 5) | Error and outcome 1 KiB, provider message id 256 bytes, valid UTF-8 (TestFinishStoresTextAtItsBound, TestFinishStoresAnyErrorTextWithinItsBound) |
@@ -889,7 +932,8 @@ wait at the gate (section 7) depends on the same property
 
 **Authentication** is optional and off by default for local use: when `API_KEYS` is set (keys
 separated by commas), every `/v1` request needs one of them, in `Authorization: Bearer` or
-`X-API-Key`; otherwise 401 (TestAPIKeysAreRequiredWhenConfigured). The keys are compared in
+`X-API-Key`; otherwise 401 (TestAPIKeysAreRequiredWhenConfigured). The scheme `Bearer` is
+matched in any case, as RFC 9110 says. The keys are compared in
 constant time, each against every configured key. `/healthz`, `/readyz`, `/docs` and `/openapi.yaml` stay open.
 
 **OpenAPI.** `GET /openapi.yaml` serves the specification, embedded in the binary; `GET /docs`
@@ -1079,3 +1123,4 @@ Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on
 | Expiry of idempotency keys | Needs a retention policy; without one, keeping keys is the safe default |
 | Exactly-once delivery | Not possible across a network call. See "At-least-once" in section 6. |
 | Tenants | The requirements have none. Keys, limits and templates would be scoped per tenant. |
+| Quotas and rate limits per client at the API | Each request is bounded, and rendering is bounded across requests (section 8), but how much one client may store over time is a policy per client, which needs tenants. A gateway in front of the API is the usual place. |
