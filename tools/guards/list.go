@@ -932,4 +932,266 @@ var guards = []Guard{
 		Old: "log.Info(\"worker started\", \"provider\", providerHost(cfg.ProviderURL),", New: "log.Info(\"worker started\", \"provider\", cfg.ProviderURL, \"host\", providerHost(cfg.ProviderURL),",
 		Package: "./cmd/worker", Test: "TestTheWorkerLogsOnlyTheProvidersHost",
 	},
+
+	// Session 6: the API of architecture §8.
+	{
+		Name: "domain: content is bounded per channel", File: "internal/domain/request.go",
+		Old: "} else if p.Channel != \"\" && chars > ContentLimit(p.Channel) {", New: "} else if false && p.Channel != \"\" && chars > ContentLimit(p.Channel) {",
+		Package: "./internal/domain", Test: "TestContentIsBoundedPerChannelInCharacters",
+	},
+	{
+		Name: "domain: content is counted in characters", File: "internal/domain/request.go",
+		Old: "chars, p.Bytes = utf8.RuneCountInString(p.content), len(p.content)", New: "chars, p.Bytes = len(p.content), len(p.content)",
+		Package: "./internal/domain", Test: "TestContentIsBoundedPerChannelInCharacters",
+	},
+	{
+		Name: "domain: content must not contain NUL", File: "internal/domain/request.go",
+		Old: "if strings.ContainsRune(p.content, 0) {", New: "if false {",
+		Package: "./internal/domain", Test: "TestContentAndVariablesMustNotContainNUL",
+	},
+	{
+		Name: "domain: variable values must not contain NUL", File: "internal/domain/request.go",
+		Old: "if strings.ContainsRune(v.Value, 0) {", New: "if false {",
+		Package: "./internal/domain", Test: "TestContentAndVariablesMustNotContainNUL",
+	},
+	{
+		Name: "domain: variables are counted while decoded", File: "internal/domain/request.go",
+		Old: "if len(out) == MaxVariables {", New: "if false {",
+		Package: "./internal/domain", Test: "TestVariablesAreCountedWhileDecoded",
+	},
+	{
+		Name: "domain: a variable name appears once", File: "internal/domain/request.go",
+		Old: "if err != nil || !ok1 || !ok2 || seen[n] {", New: "if err != nil || !ok1 || !ok2 {",
+		Package: "./internal/domain", Test: "TestVariablesAreCountedWhileDecoded",
+	},
+	{
+		Name: "domain: every {{ starts a placeholder", File: "internal/domain/request.go",
+		Old: "if end < 0 || !strings.HasPrefix(rest, \"{{.\") {", New: "if end < 0 {",
+		Package: "./internal/domain", Test: "TestVariableNamesAreBounded",
+	},
+	{
+		Name: "domain: variable names are bounded", File: "internal/domain/request.go",
+		Old: "if !variableName.MatchString(name) || len(name) > MaxVariableNameLen {", New: "if !variableName.MatchString(name) {",
+		Package: "./internal/domain", Test: "TestVariableNamesAreBounded",
+	},
+	{
+		Name: "domain: a template has at most 50 variables", File: "internal/domain/request.go",
+		Old: "if len(c.vars) == MaxVariables {", New: "if false {",
+		Package: "./internal/domain", Test: "TestTemplateBodyBounds",
+	},
+	{
+		Name: "domain: a template body is bounded by its channel", File: "internal/domain/request.go",
+		Old: "case ch != \"\" && utf8.RuneCountInString(body) > ContentLimit(ch):", New: "case false:",
+		Package: "./internal/domain", Test: "TestTemplateBodyBounds",
+	},
+	{
+		Name: "domain: a variable the template does not use is an error", File: "internal/domain/request.go",
+		Old: "if uses == 0 {", New: "if false {",
+		Package: "./internal/domain", Test: "TestTheRenderedLengthIsMeasuredBeforeRendering",
+	},
+	{
+		Name: "domain: a placeholder without a variable is an error", File: "internal/domain/request.go",
+		Old: "if !given[name] {", New: "if false {",
+		Package: "./internal/domain", Test: "TestTheRenderedLengthIsMeasuredBeforeRendering",
+	},
+	{
+		Name: "domain: a template's channel is the notification's", File: "internal/domain/request.go",
+		Old: "if p.Channel != \"\" && ch != p.Channel {", New: "if false && p.Channel != \"\" && ch != p.Channel {",
+		Package: "./internal/domain", Test: "TestATemplateItemIsMeasuredAgainstItsChannel",
+	},
+	{
+		Name: "domain: the hash separates fields", File: "internal/domain/request.go",
+		Old: "_ = binary.Write(h, binary.BigEndian, uint64(len(s)))", New: "_ = binary.BigEndian",
+		Package: "./internal/domain", Test: "TestTheRequestHashIgnoresFormAndDefaults",
+	},
+	{
+		Name: "domain: the hash fills in the default priority", File: "internal/domain/request.go",
+		Old: "priority = Normal.String()", New: "priority = \"\"",
+		Package: "./internal/domain", Test: "TestTheRequestHashIgnoresFormAndDefaults",
+	},
+	{
+		Name: "domain: the hash reads scheduledAt in UTC", File: "internal/domain/request.go",
+		Old: "at = t.UTC().Format(time.RFC3339Nano)", New: "at = t.Format(time.RFC3339Nano)",
+		Package: "./internal/domain", Test: "TestTheRequestHashIgnoresFormAndDefaults",
+	},
+	{
+		Name: "domain: the hash sorts the variables", File: "internal/domain/request.go",
+		Old: "slices.SortFunc(vars, func(a, b Variable) int { return strings.Compare(a.Name, b.Name) })", New: "_ = vars",
+		Package: "./internal/domain", Test: "TestTheRequestHashIgnoresFormAndDefaults",
+	},
+	{
+		Name: "domain: field errors are kept up to 100", File: "internal/domain/request.go",
+		Old: "if len(e.list) < MaxFieldErrors {", New: "if true {",
+		Package: "./internal/domain", Test: "TestFieldErrorsAreKeptUpToTheirBound",
+	},
+	{
+		Name: "domain: an SMS recipient is E.164", File: "internal/domain/request.go",
+		Old: "if !e164.MatchString(to) {", New: "if false {",
+		Package: "./internal/domain", Test: "TestRecipientFormatsPerChannel",
+	},
+	{
+		Name: "domain: an email recipient is at most 254 bytes", File: "internal/domain/request.go",
+		Old: "if len(to) > MaxEmailRecipientBytes || err != nil", New: "if err != nil",
+		Package: "./internal/domain", Test: "TestRecipientFormatsPerChannel",
+	},
+	{
+		Name: "domain: a device token is bounded", File: "internal/domain/request.go",
+		Old: "if len(to) < MinDeviceTokenLen || len(to) > MaxDeviceTokenLen || !deviceToken.MatchString(to) {", New: "if !deviceToken.MatchString(to) {",
+		Package: "./internal/domain", Test: "TestRecipientFormatsPerChannel",
+	},
+	{
+		Name: "domain: an idempotency key is printable ASCII", File: "internal/domain/request.go",
+		Old: "if s[i] < 0x21 || s[i] > 0x7e {", New: "if false {",
+		Package: "./internal/domain", Test: "TestIdempotencyKeyAndTemplateNameBounds",
+	},
+	{
+		Name: "domain: an idempotency key is at most 128", File: "internal/domain/request.go",
+		Old: "if len(s) == 0 || len(s) > MaxIdempotencyKeyLen {", New: "if len(s) == 0 {",
+		Package: "./internal/domain", Test: "TestIdempotencyKeyAndTemplateNameBounds",
+	},
+	{
+		Name: "domain: a template name is at most 64", File: "internal/domain/request.go",
+		Old: "return len(s) > 0 && len(s) <= MaxTemplateNameLen && templateName.MatchString(s)", New: "return len(s) > 0 && templateName.MatchString(s)",
+		Package: "./internal/domain", Test: "TestIdempotencyKeyAndTemplateNameBounds",
+	},
+	{
+		Name: "domain: a name from the request is cut to 64 bytes", File: "internal/domain/request.go",
+		Old: "if len(name) > MaxEchoedName {", New: "if false {",
+		Package: "./internal/api", Test: "TestErrorBodiesStayWithinTheirBoundForAnyRequest",
+	},
+	{
+		Name: "domain: a variable name in an error passes Echo", File: "internal/domain/request.go",
+		Old: "errs.Add(at(\"variables.\"+Echo(ve.Name)), ve.Message)", New: "errs.Add(at(\"variables.\"+ve.Name), ve.Message)",
+		Package: "./internal/api", Test: "TestErrorBodiesStayWithinTheirBoundForAnyRequest",
+	},
+	{
+		Name: "api: the body is bounded at its limit", File: "internal/api/notifications.go",
+		Old: "rd := http.MaxBytesReader(w, r.Body, limit)", New: "rd := http.MaxBytesReader(w, r.Body, limit+1)",
+		Package: "./internal/api", Test: "TestRequestBodiesAreBoundedAtTheirLimit",
+	},
+	{
+		Name: "api: a batch is decoded up to 1000 items", File: "internal/api/notifications.go",
+		Old: "if len(items) == domain.MaxBatchItems {", New: "if false {",
+		Package: "./internal/api", Test: "TestBatchSizeIsBoundedAtAThousand",
+	},
+	{
+		Name: "api: 8 MiB of empty items is not decoded", File: "internal/api/notifications.go",
+		Old: "if len(items) == domain.MaxBatchItems {", New: "if false {",
+		Package: "./internal/api", Test: "TestABatchOfManyEmptyItemsIsRefusedWithoutDecodingThemAll",
+	},
+	{
+		Name: "api: the rendered total is bounded", File: "internal/api/notifications.go",
+		Old: "if total > domain.MaxRenderedBytes {", New: "if false && total > domain.MaxRenderedBytes {",
+		Package: "./internal/api", Test: "TestTheRenderedTotalOfARequestIsBounded",
+	},
+	{
+		Name: "api: the rendered total's bound is inclusive", File: "internal/api/notifications.go",
+		Old: "if total > domain.MaxRenderedBytes {", New: "if total >= domain.MaxRenderedBytes {",
+		Package: "./internal/api", Test: "TestTheRenderedTotalOfARequestIsBounded",
+	},
+	{
+		Name: "api: a template is compiled once per request", File: "internal/api/notifications.go",
+		Old: "if t.compiled == nil {", New: "if true {",
+		Package: "./internal/api", Test: "TestATemplateIsCompiledOncePerRequest",
+	},
+	{
+		Name: "api: an unknown field's name passes Echo", File: "internal/api/notifications.go",
+		Old: "return &failure{http.StatusBadRequest, fieldError(prefix+domain.Echo(name), \"is not a known field\")}", New: "return &failure{http.StatusBadRequest, fieldError(prefix+name, \"is not a known field\")}",
+		Package: "./internal/api", Test: "TestErrorBodiesStayWithinTheirBoundForAnyRequest",
+	},
+	{
+		Name: "api: unknown fields are refused", File: "internal/api/notifications.go",
+		Old: "\tdec.DisallowUnknownFields()\n", New: "",
+		Package: "./internal/api", Test: "TestUnknownFieldsAndWrongTypesAreRefusedByName",
+	},
+	{
+		Name: "api: nothing follows the JSON value", File: "internal/api/notifications.go",
+		Old: "if _, err := dec.Token(); !errors.Is(err, io.EOF) {", New: "if _, err := dec.Token(); false && !errors.Is(err, io.EOF) {",
+		Package: "./internal/api", Test: "TestUnknownFieldsAndWrongTypesAreRefusedByName",
+	},
+	{
+		Name: "api: a batch item has no key of its own", File: "internal/api/notifications.go",
+		Old: "if in.IdempotencyKey != \"\" {\n\t\t\terrs.Add(", New: "if false {\n\t\t\terrs.Add(",
+		Package: "./internal/api", Test: "TestABatchIsValidatedWholeBeforeAnyIsStored",
+	},
+	{
+		Name: "api: a wrong API key is refused", File: "internal/api/notifications.go",
+		Old: "if given == \"\" || match != 1 {", New: "if given == \"\" {",
+		Package: "./internal/api", Test: "TestAPIKeysAreRequiredWhenConfigured",
+	},
+	{
+		Name: "api: /retry gives MAX_ATTEMPTS more attempts", File: "internal/api/notifications.go",
+		Old: "return s.queue.Requeue(r.Context(), id, s.maxAttempts)", New: "return s.queue.Requeue(r.Context(), id, 1)",
+		Package: "./internal/api", Test: "TestRetryRequeuesOnlyAFailedNotification",
+	},
+	{
+		Name: "api: a refused cancel reports the status found", File: "internal/api/notifications.go",
+		Old: "Message: \"the notification is not in a status that allows this\", Status: string(st)}", New: "Message: \"the notification is not in a status that allows this\"}",
+		Package: "./internal/api", Test: "TestCancelOnlyFromWaitingStatusesThroughTheAPI",
+	},
+	{
+		Name: "api: a created notification is published", File: "internal/api/notifications.go",
+		Old: "\t\ts.events.Publish(r.Context(), n.ID, n.Status)\n", New: "",
+		Package: "./internal/api", Test: "TestCreateAndReadANotification",
+	},
+	{
+		Name: "api: the list page is at most 100", File: "internal/api/notifications.go",
+		Old: "if err != nil || n < 1 || n > MaxPage {", New: "if err != nil || n < 1 {",
+		Package: "./internal/api", Test: "TestTheListIsOrderedAndPagedByCursor",
+	},
+	{
+		Name: "api: every route is in the specification", File: "internal/api/notifications.go",
+		Old: "\t\t{\"GET /v1/templates/{name}\", s.template},\n", New: "",
+		Package: "./internal/api", Test: "TestOpenAPIMatchesTheServer",
+	},
+	{
+		Name: "store: a repeated key reads the first row", File: "internal/store/notifications.go",
+		Old: "ON CONFLICT (idempotency_key) DO NOTHING\nRETURNING ` + notificationColumns", New: "RETURNING ` + notificationColumns",
+		Package: "./internal/api", Test: "TestConcurrentIdenticalRequestsCreateOneNotification",
+	},
+	{
+		Name: "store: a key with another request is a conflict", File: "internal/store/notifications.go",
+		Old: "\tif !bytes.Equal(hash, n.RequestHash) {\n\t\treturn existing, false, ErrIdempotencyConflict", New: "\tif len(hash) < 0 {\n\t\treturn existing, false, ErrIdempotencyConflict",
+		Package: "./internal/api", Test: "TestAKeyReusedWithAnotherRequestIsAConflict",
+	},
+	{
+		Name: "store: a repeated batch key reads the first batch", File: "internal/store/notifications.go",
+		Old: "VALUES ($1, NULLIF($2, ''), $3, $4) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`", New: "VALUES ($1, NULLIF($2, ''), $3, $4) RETURNING id`",
+		Package: "./internal/api", Test: "TestConcurrentIdenticalBatchesCreateOneBatch",
+	},
+	{
+		Name: "store: a batch key with another batch is a conflict", File: "internal/store/notifications.go",
+		Old: "\t\t\tif !bytes.Equal(hash, b.RequestHash) {", New: "\t\t\tif false {",
+		Package: "./internal/api", Test: "TestConcurrentIdenticalBatchesCreateOneBatch",
+	},
+	{
+		Name: "store: batch item ids derive from the batch id", File: "internal/store/notifications.go",
+		Old: "return uuid.NewSHA1(batch, []byte(strconv.Itoa(i)))", New: "return uuid.NewSHA1(uuid.New(), []byte(strconv.Itoa(i)))",
+		Package: "./internal/api", Test: "TestConcurrentIdenticalBatchesCreateOneBatch",
+	},
+	{
+		Name: "store: a future scheduledAt waits", File: "internal/store/notifications.go",
+		Old: "CASE WHEN $6::timestamptz > now() THEN 'scheduled' ELSE 'pending' END,", New: "'pending',",
+		Package: "./internal/api", Test: "TestAScheduledNotificationWaitsUntilItsTime",
+	},
+	{
+		Name: "store: the list cursor excludes the last item", File: "internal/store/notifications.go",
+		Old: "where = append(where, fmt.Sprintf(\"(created_at < $%d OR (created_at = $%d AND id > $%d))\", c, c, i))", New: "where = append(where, fmt.Sprintf(\"(created_at < $%d OR (created_at = $%d AND id >= $%d))\", c, c, i))",
+		Package: "./internal/api", Test: "TestTheListIsOrderedAndPagedByCursor",
+	},
+	{
+		Name: "store: the list order is the index's", File: "internal/store/notifications.go",
+		Old: "sql += fmt.Sprintf(\" ORDER BY created_at DESC, id ASC LIMIT $%d\", len(args))", New: "sql += fmt.Sprintf(\" ORDER BY created_at DESC, id DESC LIMIT $%d\", len(args))",
+		Package: "./internal/api", Test: "TestTheListIsOrderedAndPagedByCursor",
+	},
+	{
+		Name: "store: the attempt history is bounded", File: "internal/store/notifications.go",
+		Old: "ORDER BY attempt_number DESC LIMIT $2`", New: "ORDER BY attempt_number DESC LIMIT $2 + 1000`",
+		Package: "./internal/api", Test: "TestTheAttemptHistoryIsBounded",
+	},
+	{
+		Name: "config: MAX_ATTEMPTS must be positive", File: "internal/config/config.go",
+		Old: "if c.MaxAttempts <= 0 {", New: "if false {",
+		Package: "./internal/config", Test: "TestMaxAttemptsMustBePositive",
+	},
 }
