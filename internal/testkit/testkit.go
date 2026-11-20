@@ -16,6 +16,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -224,4 +226,39 @@ func Recorder(t testing.TB, opts recorder.Options) *recorder.Server {
 	}
 	t.Cleanup(s.Close)
 	return s
+}
+
+// HungRedis returns the URL of a server that accepts connections, reads what it is sent and
+// never answers: a paused Redis. It stops when the test ends.
+func HungRedis(t testing.TB) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conns sync.WaitGroup
+	var mu sync.Mutex
+	var open []net.Conn
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, c := range open {
+			_ = c.Close()
+		}
+		mu.Unlock()
+		conns.Wait()
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			open = append(open, c)
+			mu.Unlock()
+			conns.Go(func() { _, _ = io.Copy(io.Discard, c); _ = c.Close() })
+		}
+	}()
+	return "redis://" + ln.Addr().String() + "/0"
 }

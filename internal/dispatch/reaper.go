@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/atakanakis/InsiderOneProject/internal/events"
+	"github.com/atakanakis/InsiderOneProject/internal/observability"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
 )
 
@@ -22,8 +25,9 @@ const ReapBatch = 100
 type Reaper struct {
 	Queue  ReapQueue
 	Tick   time.Duration
-	Log    *slog.Logger     // nil: no logs
-	Events events.Publisher // nil: events are dropped
+	Log     *slog.Logger                 // nil: no logs
+	Events  events.Publisher             // nil: events are dropped
+	Metrics *observability.WorkerMetrics // nil: counted on a registry of their own
 }
 
 // Run reaps every Tick until ctx ends.
@@ -33,6 +37,9 @@ func (r Reaper) Run(ctx context.Context) {
 	}
 	if r.Events == nil {
 		r.Events = events.Discard{}
+	}
+	if r.Metrics == nil {
+		r.Metrics = observability.NewWorkerMetrics(prometheus.NewRegistry())
 	}
 	tick := time.NewTicker(r.Tick)
 	defer tick.Stop()
@@ -56,7 +63,7 @@ func (r Reaper) reap(ctx context.Context) {
 		}
 		for _, c := range changes {
 			r.Log.WarnContext(ctx, "lease expired; row returned", "notification_id", c.ID, "status", c.Status)
-			r.Events.Publish(ctx, c.ID, c.Status)
+			r.Events.Publish(ctx, events.Event{ID: c.ID, BatchID: c.BatchID, Status: c.Status})
 		}
 		if len(changes) < ReapBatch {
 			return

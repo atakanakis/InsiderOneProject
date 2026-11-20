@@ -456,7 +456,7 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	code := http.StatusCreated
 	if created {
-		s.events.Publish(r.Context(), n.ID, n.Status)
+		s.events.Publish(r.Context(), events.Event{ID: n.ID, Status: n.Status})
 	} else {
 		// A repeat answers the stored row as the status endpoint does (architecture §8).
 		code = http.StatusOK
@@ -541,8 +541,8 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 	code := http.StatusOK
 	if created {
 		code = http.StatusCreated
-		for i, id := range ids {
-			s.events.Publish(r.Context(), id, initialStatus(prepared[i]))
+		for i, item := range ids {
+			s.events.Publish(r.Context(), events.Event{ID: item, BatchID: id, Status: initialStatus(prepared[i])})
 		}
 	}
 	s.reply(w, r, code, map[string]any{"batchId": id, "total": n, "ids": ids})
@@ -719,7 +719,7 @@ func (s *server) change(w http.ResponseWriter, r *http.Request, op func(uuid.UUI
 	case err != nil:
 		s.internal(w, r, err)
 	default:
-		s.events.Publish(r.Context(), id, st)
+		s.events.Publish(r.Context(), events.Event{ID: id, BatchID: c.BatchID, Status: st})
 		s.reply(w, r, http.StatusOK, map[string]any{"id": id, "status": st})
 	}
 }

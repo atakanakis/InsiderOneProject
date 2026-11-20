@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
+	"github.com/atakanakis/InsiderOneProject/internal/events"
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
 	"github.com/atakanakis/InsiderOneProject/internal/testkit"
@@ -32,13 +33,13 @@ type recordedEvents struct {
 	seen map[uuid.UUID][]domain.Status
 }
 
-func (r *recordedEvents) Publish(_ context.Context, id uuid.UUID, s domain.Status) {
+func (r *recordedEvents) Publish(_ context.Context, e events.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.seen == nil {
 		r.seen = map[uuid.UUID][]domain.Status{}
 	}
-	r.seen[id] = append(r.seen[id], s)
+	r.seen[e.ID] = append(r.seen[e.ID], e.Status)
 }
 
 func (r *recordedEvents) of(id uuid.UUID) []domain.Status {

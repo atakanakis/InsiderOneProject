@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/events"
@@ -52,6 +53,8 @@ type Options struct {
 	Provider    provider.Options // the dispatcher builds its own client: no pool is shared
 	Log         *slog.Logger     // nil: no logs
 	Events      events.Publisher // nil: events are dropped
+	// Metrics are the worker's (architecture §10); nil: counted on a registry of their own.
+	Metrics *observability.WorkerMetrics
 }
 
 // Dispatcher serves one channel, with its own slots, breaker and waiting mark.
@@ -83,6 +86,9 @@ func New(o Options, q Queue, l Limiter) (*Dispatcher, error) {
 	}
 	if o.Events == nil {
 		o.Events = events.Discard{}
+	}
+	if o.Metrics == nil {
+		o.Metrics = observability.NewWorkerMetrics(prometheus.NewRegistry())
 	}
 	c, err := provider.New(o.Provider)
 	if err != nil {
@@ -188,7 +194,7 @@ func (d *Dispatcher) finish(ctx context.Context, row store.Claimed, r provider.R
 		status, changed, err := d.queue.Finish(ctx, row.ID, row.Attempt, res)
 		if err == nil {
 			if changed {
-				d.o.Events.Publish(ctx, row.ID, status)
+				d.o.Events.Publish(ctx, events.Event{ID: row.ID, BatchID: row.BatchID, Status: status})
 			}
 			level := slog.LevelInfo
 			if v.Status == domain.Sent {

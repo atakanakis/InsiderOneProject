@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
+	"github.com/atakanakis/InsiderOneProject/internal/events"
 	"github.com/atakanakis/InsiderOneProject/internal/provider"
 	"github.com/atakanakis/InsiderOneProject/internal/ratelimit"
 	"github.com/atakanakis/InsiderOneProject/internal/recorder"
@@ -514,10 +515,10 @@ type recordingEvents struct {
 	got map[uuid.UUID]domain.Status
 }
 
-func (r *recordingEvents) Publish(_ context.Context, id uuid.UUID, s domain.Status) {
+func (r *recordingEvents) Publish(_ context.Context, e events.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.got[id] = s
+	r.got[e.ID] = e.Status
 }
 
 func (r *recordingEvents) count() int {
