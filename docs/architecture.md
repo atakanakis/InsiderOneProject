@@ -753,37 +753,111 @@ and it counts towards the breaker.
 | `GET /metrics` | Prometheus |
 | `GET /docs`, `GET /openapi.yaml` | OpenAPI specification and viewer |
 
-**Idempotency.**
-- A notification may carry an `idempotencyKey`. The key is unique in the database. A repeat
-  with the same key and the same content returns the first notification. The same key with
-  different content is a 409. The comparison uses a hash of the request stored with the row.
-- A batch may carry an `Idempotency-Key` header. It is stored on the batch row, with a hash of
-  the whole request. A repeat returns the same batch. Batch keys and notification keys live in
-  different columns, so they cannot collide.
+**Requests.** Bodies and answers are JSON; times are RFC 3339 in UTC.
+
+- **Create** (`POST /v1/notifications`): `recipient`, `channel` (`sms`, `email`, `push`),
+  either `content` or `template` with `variables` (an object of strings), `priority` (`high`,
+  `normal`, `low`; default `normal`), `scheduledAt`, `idempotencyKey`. Unknown fields are
+  refused. 201 with the notification; 200 with the first one for a repeated key.
+- **Batch** (`POST /v1/notifications/batch`): `{"notifications": [...]}`, items as above
+  without `idempotencyKey` (a batch is retried as a whole, under its `Idempotency-Key`
+  header). 201 with `batchId`, `total` and the ids in the order of the items. Item `i` gets
+  the id `UUIDv5(batchId, i)`, so a repeated batch answers the same ids in the same order
+  without storing the order.
+- **Status** (`GET /v1/notifications/{id}`): every field of the row and the attempt history,
+  oldest first.
+- **Batch summary** (`GET /v1/batches/{id}`): `total` and a count for each of the seven
+  statuses.
+- **List** (`GET /v1/notifications`): filters `status`, `channel`, `batchId`, `createdFrom`
+  (inclusive), `createdTo` (exclusive); `limit` (1 to 100, default 50); `cursor`. Items are
+  summaries without `content`, newest first: `ORDER BY created_at DESC, id ASC`, the order of
+  the list index. The cursor is the `(created_at, id)` of the last item, opaque to the
+  client; the next page is `created_at < c OR (created_at = c AND id > i)`. `nextCursor` is
+  present only when the page is full.
+- **Cancel** and **retry** answer 200 with the new status, 404 for an unknown id, and 409
+  with the status found when the row is not in a status that allows it. Cancel is allowed
+  from `scheduled`, `pending` and `retrying`; retry from `failed` only, and it calls Requeue
+  with `MAX_ATTEMPTS` as the budget (section 5).
+- **Templates**: `POST /v1/templates` with `name`, `channel`, `body`. A template is never
+  changed: the same name with the same channel and body answers 200, with anything else
+  409. `GET /v1/templates` lists names and channels in name order, 100 per page, with a
+  cursor; `GET /v1/templates/{name}` returns one with its body.
+
+An id that is not a UUID is a 400. Every status change the API makes (create, cancel, retry)
+is published through the narrow `events.Publisher` of section 9 after it is committed.
+
+**There is no service layer.** The handlers call `domain` for validation and rendering and
+`store` for SQL. Section 14 listed an `internal/service` package for use cases; every use case
+here is "validate, then one statement or one transaction", so the layer would only forward
+calls. It was removed in session 6.
+
+**Idempotency** (I10).
+- A notification may carry an `idempotencyKey` (1 to 128 printable ASCII characters). The key
+  is unique in the database. The request hash is SHA-256 of the validated request in a
+  canonical form (fields in a fixed order, defaults filled in, `scheduledAt` in UTC, the
+  variables sorted by name), without the key itself. The insert is
+  `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`; when it inserts nothing, the row with
+  the key is read, and its hash decides: the same hash answers 200 with that row, another hash
+  is a 409. Two identical requests at the same moment both end with the same row: the second
+  insert waits on the unique index until the first commits, then does nothing.
+- A batch may carry an `Idempotency-Key` header (the same format). The batch row is inserted
+  the same way, first in the batch's transaction, with the hash of the whole validated batch.
+  A repeat with the same hash answers 200 with the same batch and the same ids; another hash is
+  a 409. Batch keys and notification keys live in different columns, so they cannot collide.
+- Keys never expire (section 16).
 
 **Scheduling.** `scheduledAt` in the future creates the row as `scheduled` with that
-`ready_at`.
+`ready_at`. A `scheduledAt` that is absent or not in the future creates it `pending`, due now.
+Postgres decides which, with `now()`, in the insert (rule 7).
 
 **Templates.** A template body contains `{{.name}}` placeholders. Rendering is substitution
-only; no template language is executed. A template is compiled once per request, and the
-rendered length is calculated before anything is rendered.
+only; no template language is executed. Any other `{{` in a body is refused when the
+template is created, so a stored body always compiles. A variable name is a letter or `_`
+followed by letters, digits or `_`, up to 64 characters; a body has at most 50 distinct
+variables, and its length is bounded like content of its channel. In a request, each
+template is read and compiled once, however many items use it. The rendered length of an
+item is calculated from the compiled parts and the variables (literal length plus each
+value's length times its uses) before anything is rendered, both in characters (the channel
+bound) and in bytes (the request's total bound). A variable the template does not use, or a
+placeholder without a variable, is an error naming it. The template's channel must be the
+notification's channel.
 
 **Validation** happens before anything is stored: required fields, the recipient format per
-channel (E.164 phone number, email address, device token), content length per channel, and
-known enum values. Errors name the field.
+channel (E.164 phone number, an email address of at most 254 bytes, a device token of 16 to
+256 characters of letters, digits, `_`, `-`, `:` and `.`), content length per channel, and
+known enum values. Content and variable values must not contain NUL, which Postgres refuses
+in `text`. Errors name the field (`notifications[3].recipient`).
+
+**Errors** have one form, written in one place:
+`{"error": {"code", "message", "fields": [{"field", "message"}], "moreFields"}}`. A message
+never quotes a value from the request; a field name that comes from the request (an unknown
+field, a variable name) is cut to 64 bytes, with every byte outside printable ASCII, `"` and
+`\` replaced. So the size of an error body does not depend on the request
+(TestErrorBodiesStayWithinTheirBoundForAnyRequest). The first version echoed the value of a
+too-long field into its message: a 99 KB request produced a 68 MB error.
+
+**Decoding is bounded too.** The body is read through a limit (`http.MaxBytesReader`). The
+batch array is decoded one item at a time and the 1,001st item ends the request; the
+variables of an item are counted while they are decoded and the 51st ends it. So 8 MiB of
+`{}` items, or 1 MiB of variables, cost the server a bounded amount, not millions of decoded
+items.
 
 **Bounds.** Every input and every output has a stated limit, and each limit has a test.
 
 | What | Limit |
 |---|---|
 | Request headers | 64 KiB, request line included, arriving within 5 s (TestRequestHeadersOverTheBoundAreRefused, TestSlowRequestHeadersAreCutOff) |
-| Request body | 1 MiB (8 MiB for a batch) |
-| Batch size | 1000 notifications |
+| Request body | 1 MiB (8 MiB for a batch); one byte over is a 413 |
+| Batch size | 1000 notifications; the 1,001st ends the decoding |
 | Content after rendering | Per channel: SMS 1600 characters, push 4096, email 100,000 |
+| Template body | The content bound of its channel; at most 50 distinct variables |
 | Template variables per notification | 50; names up to 64 characters |
-| Total rendered content per request | 16 MiB |
-| Validation errors in one response | 100 fields, 300 characters each, plus a count of the rest |
+| Total rendered content per request | 16 MiB, calculated before rendering |
+| Template name, idempotency key | 64 and 128 characters |
+| Error response | 100 fields, the field name and the message 300 bytes each, plus a count of the rest; the whole body at most 64 KiB |
 | List page | 100 items; items are summaries without `content` |
+| Template list page | 100 names, without bodies |
+| Attempt history in a status answer | The last 100 attempts, with the total count (`/retry` can add attempts without end) |
 | Metrics window | 1 hour |
 | Database time per API request | Statement timeout of 5 s |
 | Rate-limit window in Redis (section 7) | At most `limit` permits per channel, also with workers of different settings; both keys expire one window after the last permit (TestTheWindowHoldsAtMostTheLimitAndExpires, TestWorkersWithDifferentSettingsAreRefused) |
@@ -808,8 +882,14 @@ deadline waited 5 s against a paused Redis (found in session 1's review). The ra
 wait at the gate (section 7) depends on the same property
 (TestRedisClientHonoursContextDeadlines).
 
-**Authentication** is optional and off by default for local use: when `API_KEYS` is set,
-every `/v1` request needs a key (`Authorization: Bearer` or `X-API-Key`).
+**Authentication** is optional and off by default for local use: when `API_KEYS` is set (keys
+separated by commas), every `/v1` request needs one of them, in `Authorization: Bearer` or
+`X-API-Key`; otherwise 401. The keys are compared in constant time, each against every
+configured key. `/healthz`, `/readyz`, `/docs` and `/openapi.yaml` stay open.
+
+**OpenAPI.** `GET /openapi.yaml` serves the specification, embedded in the binary; `GET /docs`
+a viewer. Every path, method and status code in it is produced by the real server in a test,
+and every route of the server is in it (TestOpenAPIMatchesTheServer).
 
 ## 9. Status events and WebSocket
 
@@ -894,7 +974,7 @@ column does not hold.
 | Claim batch | `CLAIM_BATCH` | 10 | ≤ slots | TestClaimBatchMustNotExceedSlots |
 | Pause when there is no room / nothing to claim | `PAUSE_BUSY`, `PAUSE_IDLE` | 20 ms / 200 ms | | |
 | Reaper tick | `REAPER_TICK` | 5 s | | |
-| Attempts; backoff | `MAX_ATTEMPTS`; `BACKOFF_BASE`, `BACKOFF_CAP` | 6; 2 s doubling to a cap of 2 min, with jitter | | |
+| Attempts (read by the API: a new row's `max_attempts` and the budget of `/retry`); backoff | `MAX_ATTEMPTS`; `BACKOFF_BASE`, `BACKOFF_CAP` | 6; 2 s doubling to a cap of 2 min, with jitter | | |
 
 Every number in the table must also be positive (TestNonPositiveSettingsAreRefused); a relation
 between two settings means nothing if one of them is zero. The defaults are the table
@@ -936,7 +1016,6 @@ internal/redisclient   the one place a Redis client is built; context deadlines 
 internal/ratelimit     the Redis sliding window: Available, Wait
 internal/provider      the HTTP client with the send gate; Result
 internal/dispatch      the loop, Classify, retry policy, breaker, reaper
-internal/service       use cases behind the API
 internal/api           handlers, middleware, WebSocket
 internal/events        publish and subscribe
 internal/observability logging, metrics, tracing
@@ -953,8 +1032,9 @@ The recording server is its own package, not part of `testkit`, because `cmd/moc
 runs the same code as the local provider of the Compose stack. Inside `testkit` it would pull
 the testcontainers dependencies into that binary. (Changed in session 1.)
 
-Dependencies point one way: `api` and `dispatch` depend on `service`, `store`, `ratelimit`
-and `provider`; all of them depend on `domain`; `domain` depends on nothing.
+Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on `store`,
+`ratelimit` and `provider`; all of them depend on `domain`; `domain` depends on nothing.
+(Session 6 removed `internal/service`; section 8 says why.)
 
 ## 15. Requirements coverage
 
