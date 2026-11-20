@@ -9,6 +9,12 @@
 //  3. runs the named test and expects it to fail, by name;
 //  4. restores the file, whatever happened.
 //
+// Postgres and Redis are started once, before the first guard, and every test process uses
+// them (testkit.PostgresURLVar, testkit.RedisURLVar). Each test process still creates its own
+// database and runs the migrations as they are on disk, so a guard in a migration is checked
+// against a fresh schema. Starting the containers per test process took about 10 s per
+// guard of an integration package (session 1's record).
+//
 // Usage: go run ./tools/guards [-only substring]
 package main
 
@@ -26,6 +32,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/atakanakis/InsiderOneProject/internal/testkit"
 )
 
 // Guard is one line of code that enforces something, and the test that must notice when it
@@ -58,10 +66,29 @@ func main() {
 		os.Exit(130)
 	}()
 
+	if os.Getenv(testkit.PostgresURLVar) == "" || os.Getenv(testkit.RedisURLVar) == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		pgURL, redisURL, stop, err := testkit.StartServers(ctx)
+		cancel()
+		if err != nil {
+			stop()
+			fmt.Fprintf(os.Stderr, "start Postgres and Redis: %v\n", err)
+			os.Exit(1)
+		}
+		_ = os.Setenv(testkit.PostgresURLVar, pgURL)
+		_ = os.Setenv(testkit.RedisURLVar, redisURL)
+		code := run(*only)
+		stop()
+		os.Exit(code)
+	}
+	os.Exit(run(*only))
+}
+
+func run(only string) int {
 	failed := 0
 	ran := 0
 	for _, g := range guards {
-		if *only != "" && !strings.Contains(g.Name, *only) {
+		if only != "" && !strings.Contains(g.Name, only) {
 			continue
 		}
 		ran++
@@ -79,8 +106,9 @@ func main() {
 	}
 	fmt.Printf("\n%d guards, %d real, %d failed\n", ran, ran-failed, failed)
 	if failed > 0 {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func check(g Guard) error {

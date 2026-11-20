@@ -2,6 +2,12 @@
 // testcontainers. A package that uses it calls Main from its TestMain; each test calls Setup.
 // The containers start on the first Setup; with `go test -short`, Setup skips the test.
 //
+// When TESTKIT_POSTGRES_URL and TESTKIT_REDIS_URL are set, no container is started: the test
+// process creates its own new database on that Postgres server, migrates it and drops it at the
+// end, and uses that Redis. `make guards` starts the two servers once (StartServers) and runs
+// every test process against them, one at a time; Redis is emptied by each Setup, so the
+// variables are for sequential runs only.
+//
 // The recording provider server is in package recorder; Recorder below starts one for a test.
 package testkit
 
@@ -11,6 +17,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -83,28 +90,30 @@ func Setup(t testing.TB) *Env {
 	return env
 }
 
+// Variables that point the tests at servers that are already running.
+const (
+	PostgresURLVar = "TESTKIT_POSTGRES_URL"
+	RedisURLVar    = "TESTKIT_REDIS_URL"
+)
+
 func start() (*Env, error) {
 	ctx := context.Background()
-	pg, err := tcpostgres.Run(ctx, PostgresImage,
-		tcpostgres.WithDatabase("notifications"),
-		tcpostgres.WithUsername("test"),
-		tcpostgres.WithPassword("test"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	cleanups = append(cleanups, func() { _ = testcontainers.TerminateContainer(pg) })
-	if err != nil {
-		return nil, fmt.Errorf("start postgres: %w", err)
+	pgURL, redisURL := os.Getenv(PostgresURLVar), os.Getenv(RedisURLVar)
+	if pgURL == "" || redisURL == "" {
+		var stop func()
+		var err error
+		pgURL, redisURL, stop, err = StartServers(ctx)
+		cleanups = append(cleanups, stop)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		if pgURL, err = ownDatabase(ctx, pgURL); err != nil {
+			return nil, err
+		}
 	}
-	rc, err := tcredis.Run(ctx, RedisImage)
-	cleanups = append(cleanups, func() { _ = testcontainers.TerminateContainer(rc) })
-	if err != nil {
-		return nil, fmt.Errorf("start redis: %w", err)
-	}
-	dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		return nil, fmt.Errorf("postgres url: %w", err)
-	}
-	pool, err := store.Connect(ctx, dsn, store.Options{})
+	pool, err := store.Connect(ctx, pgURL, store.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
@@ -112,16 +121,73 @@ func start() (*Env, error) {
 	if _, err := store.Migrate(ctx, pool); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	redisURL, err := rc.ConnectionString(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("redis url: %w", err)
-	}
 	client, err := redisclient.New(redisURL)
 	if err != nil {
 		return nil, err
 	}
 	cleanups = append(cleanups, func() { _ = client.Close() })
-	return &Env{Pool: pool, DatabaseURL: dsn, Redis: client, RedisURL: redisURL}, nil
+	return &Env{Pool: pool, DatabaseURL: pgURL, Redis: client, RedisURL: redisURL}, nil
+}
+
+// ownDatabase creates a new database on the server of serverURL, for this process alone, and
+// returns its URL. The database is dropped when the tests end. A new database per process
+// means a test always runs the migrations as they are on disk, also when make guards has
+// just changed one.
+func ownDatabase(ctx context.Context, serverURL string) (string, error) {
+	admin, err := store.Connect(ctx, serverURL, store.Options{})
+	if err != nil {
+		return "", fmt.Errorf("connect postgres server: %w", err)
+	}
+	name := "p_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+name); err != nil {
+		admin.Close()
+		return "", fmt.Errorf("create database: %w", err)
+	}
+	cleanups = append(cleanups, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = admin.Exec(ctx, `DROP DATABASE IF EXISTS `+name+` WITH (FORCE)`)
+		admin.Close()
+	})
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return "", err
+	}
+	u.Path = "/" + name
+	return u.String(), nil
+}
+
+// StartServers starts a Postgres and a Redis container and returns their URLs and a function
+// that removes both. The Postgres URL names an empty database "notifications".
+func StartServers(ctx context.Context) (postgresURL, redisURL string, stop func(), err error) {
+	var terminate []func()
+	stop = func() {
+		for i := len(terminate) - 1; i >= 0; i-- {
+			terminate[i]()
+		}
+	}
+	pg, err := tcpostgres.Run(ctx, PostgresImage,
+		tcpostgres.WithDatabase("notifications"),
+		tcpostgres.WithUsername("test"),
+		tcpostgres.WithPassword("test"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	terminate = append(terminate, func() { _ = testcontainers.TerminateContainer(pg) })
+	if err != nil {
+		return "", "", stop, fmt.Errorf("start postgres: %w", err)
+	}
+	rc, err := tcredis.Run(ctx, RedisImage)
+	terminate = append(terminate, func() { _ = testcontainers.TerminateContainer(rc) })
+	if err != nil {
+		return "", "", stop, fmt.Errorf("start redis: %w", err)
+	}
+	if postgresURL, err = pg.ConnectionString(ctx, "sslmode=disable"); err != nil {
+		return "", "", stop, fmt.Errorf("postgres url: %w", err)
+	}
+	if redisURL, err = rc.ConnectionString(ctx); err != nil {
+		return "", "", stop, fmt.Errorf("redis url: %w", err)
+	}
+	return postgresURL, redisURL, stop, nil
 }
 
 // EmptyDatabase creates a new database with no schema in the test Postgres and returns its
