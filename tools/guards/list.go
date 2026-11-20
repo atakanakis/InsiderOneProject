@@ -515,18 +515,28 @@ var guards = []Guard{
 		Package: "./internal/ratelimit", Test: "TestAnUnreachableRedisIsAnErrorNotAPermit",
 	},
 	{
+		Name: "ratelimit: a limiter error is not ErrNoPermitInTime", File: "internal/ratelimit/ratelimit.go",
+		Old: "return 0, err // fail closed", New: "return 0, fmt.Errorf(\"%w: %w\", ErrNoPermitInTime, err) // fail closed",
+		Package: "./internal/ratelimit", Test: "TestAHungRedisIsALimiterErrorNotAWaitThatRanOut",
+	},
+	{
 		Name: "ratelimit: Wait stops when its context ends", File: "internal/ratelimit/ratelimit.go",
-		Old: "\t\tcase <-ctx.Done():\n\t\t\ttimer.Stop()\n\t\t\treturn 0, fmt.Errorf(\"rate limit wait: %w\", ctx.Err())\n", New: "",
+		Old: "\t\tcase <-ctx.Done():\n\t\t\ttimer.Stop()\n\t\t\treturn 0, fmt.Errorf(\"%w (%w)\", ErrNoPermitInTime, ctx.Err())\n", New: "",
 		Package: "./internal/ratelimit", Test: "TestWaitStopsWhenItsContextEnds",
 	},
 	{
+		Name: "ratelimit: an ended context is ErrNoPermitInTime", File: "internal/ratelimit/ratelimit.go",
+		Old: "if err := ctx.Err(); err != nil {", New: "if err := ctx.Err(); false && err != nil {",
+		Package: "./internal/ratelimit", Test: "TestWaitWithAnEndedContextTakesNoPermit",
+	},
+	{
 		Name: "ratelimit: Available only reads", File: "internal/ratelimit/ratelimit.go",
-		Old: "#!lua flags=no-writes\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
+		Old: "#!lua flags=no-writes\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
 		Package: "./internal/ratelimit", Test: "TestAvailableChangesNothing",
 	},
 	{
 		Name: "ratelimit: Available works when only writes fail", File: "internal/ratelimit/ratelimit.go",
-		Old: "#!lua flags=no-writes\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
+		Old: "#!lua flags=no-writes\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
 		Package: "./internal/ratelimit", Test: "TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails",
 	},
 	{
@@ -538,6 +548,21 @@ var guards = []Guard{
 		Name: "ratelimit: the window expires after its last permit", File: "internal/ratelimit/ratelimit.go",
 		Old: "  redis.call('PEXPIRE', key, math.floor(window / 1000) + 1)\n", New: "",
 		Package: "./internal/ratelimit", Test: "TestTheWindowHoldsAtMostTheLimitAndExpires",
+	},
+	{
+		Name: "ratelimit: the settings expire with the window", File: "internal/ratelimit/ratelimit.go",
+		Old: "redis.call('SET', KEYS[2], settings, 'PX', math.floor(window / 1000) + 1)", New: "redis.call('SET', KEYS[2], settings)",
+		Package: "./internal/ratelimit", Test: "TestTheWindowHoldsAtMostTheLimitAndExpires",
+	},
+	{
+		Name: "ratelimit: Wait refuses a worker with other settings", File: "internal/ratelimit/ratelimit.go",
+		Old: "if stored and stored ~= settings then", New: "if false then",
+		Package: "./internal/ratelimit", Test: "TestWorkersWithDifferentSettingsAreRefused",
+	},
+	{
+		Name: "ratelimit: Available refuses a worker with other settings", File: "internal/ratelimit/ratelimit.go",
+		Old: "if held and held ~= ARGV[1]", New: "if false and held ~= ARGV[1]",
+		Package: "./internal/ratelimit", Test: "TestWorkersWithDifferentSettingsAreRefused",
 	},
 	{
 		Name: "ratelimit: one window per channel", File: "internal/ratelimit/ratelimit.go",
@@ -552,11 +577,11 @@ var guards = []Guard{
 	{
 		Name: "ratelimit: the limit is at least 1", File: "internal/ratelimit/ratelimit.go",
 		Old: "if limit < 1 {", New: "if false && limit < 1 {",
-		Package: "./internal/ratelimit", Test: "TestNewRefusesALimitBelowOneAndANegativeMargin",
+		Package: "./internal/ratelimit", Test: "TestNewRefusesALimitBelowOneAndAMarginThatIsNotPositive",
 	},
 	{
-		Name: "ratelimit: the margin is not negative", File: "internal/ratelimit/ratelimit.go",
-		Old: "if margin < 0 {", New: "if false && margin < 0 {",
-		Package: "./internal/ratelimit", Test: "TestNewRefusesALimitBelowOneAndANegativeMargin",
+		Name: "ratelimit: the margin is positive", File: "internal/ratelimit/ratelimit.go",
+		Old: "if margin <= 0 {", New: "if margin < 0 {",
+		Package: "./internal/ratelimit", Test: "TestNewRefusesALimitBelowOneAndAMarginThatIsNotPositive",
 	},
 }
