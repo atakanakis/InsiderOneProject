@@ -294,3 +294,16 @@ func TestAPIDatabaseSessionsHaveAFiveSecondStatementTimeout(t *testing.T) {
 		t.Fatalf("statement_timeout %s, want 5s", got)
 	}
 }
+
+// §10: a failing readiness check is logged at most once per 10 s per dependency: the
+// platform probes every few seconds, and a Redis outage made a warning per probe.
+func TestAFailingReadinessCheckIsLoggedSparsely(t *testing.T) {
+	var log bytes.Buffer
+	h := handler(&log, ok, failing, time.Second)
+	for range 20 {
+		get(t, h, "/readyz")
+	}
+	if n := strings.Count(log.String(), "readiness check failed"); n != 1 {
+		t.Errorf("%d lines for 20 failed checks of Redis, want 1:\n%s", n, log.String())
+	}
+}

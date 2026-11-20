@@ -9,6 +9,7 @@ package redisclient
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -22,3 +23,6 @@ func New(url string) (*redis.Client, error) {
 	opts.ContextTimeoutEnabled = true
 	return redis.NewClient(opts), nil
 }
+
+// LogTo sends the Redis client's own lines to log. Stub.
+func LogTo(log *slog.Logger) {}

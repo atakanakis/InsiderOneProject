@@ -3,11 +3,13 @@ package redisclient
 import (
 	"context"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -88,4 +90,49 @@ func TestRedisClientsAreBuiltOnlyHere(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// §10: go-redis writes a plain-text line of its own on every failed dial; through LogTo they
+// go to the process's JSON log, at most one per 10 s. A Redis outage of 4 minutes made 307
+// lines on one worker before this (session 7, the Compose stack with Redis stopped).
+func TestTheRedisClientsOwnLinesAreLoggedSparsely(t *testing.T) {
+	var buf lockedBuffer
+	LogTo(slog.New(slog.NewJSONHandler(&buf, nil)))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close() // nothing listens: every dial fails
+	c, err := New("redis://" + addr + "/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	for range 10 {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		_ = c.Ping(ctx).Err()
+		cancel()
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], `"msg":"redis client"`) {
+		t.Errorf("%d lines for 10 failed dials, want one JSON line of the Redis client:\n%s", len(lines), buf.String())
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
