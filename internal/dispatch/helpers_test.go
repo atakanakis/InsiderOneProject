@@ -170,11 +170,12 @@ func (l stampingLimiter) Wait(ctx context.Context, ch domain.Channel) error {
 	return err
 }
 
-// late counts the requests of one channel that arrived more than margin after their permit:
+// delays returns, for every request of one channel, the time from its permit to its arrival:
 // the latest permit of the same notification granted before the arrival.
-func (s *stamps) late(reqs []recorder.Request, channel string, margin time.Duration) (late int, worst time.Duration) {
+func (s *stamps) delays(reqs []recorder.Request, channel string) []time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var out []time.Duration
 	for _, r := range reqs {
 		if r.Channel != channel {
 			continue
@@ -185,10 +186,17 @@ func (s *stamps) late(reqs []recorder.Request, channel string, margin time.Durat
 				permit = p
 			}
 		}
-		if permit.IsZero() {
-			continue
+		if !permit.IsZero() {
+			out = append(out, r.Arrived.Sub(permit))
 		}
-		d := r.Arrived.Sub(permit)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// late counts the requests of one channel that arrived more than margin after their permit.
+func (s *stamps) late(reqs []recorder.Request, channel string, margin time.Duration) (late int, worst time.Duration) {
+	for _, d := range s.delays(reqs, channel) {
 		worst = max(worst, d)
 		if d > margin {
 			late++
@@ -197,15 +205,28 @@ func (s *stamps) late(reqs []recorder.Request, channel string, margin time.Durat
 	return late, worst
 }
 
+// percentile returns the p-th percentile (0 to 100) of sorted durations.
+func percentile(sorted []time.Duration, p int) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[min(len(sorted)-1, len(sorted)*p/100)]
+}
+
 func (s *stamps) waitStats() (n int, median, longest time.Duration) {
-	s.mu.Lock()
-	ws := slices.Clone(s.waits)
-	s.mu.Unlock()
+	ws := s.sortedWaits()
 	if len(ws) == 0 {
 		return 0, 0, 0
 	}
-	slices.Sort(ws)
 	return len(ws), ws[len(ws)/2], ws[len(ws)-1]
+}
+
+func (s *stamps) sortedWaits() []time.Duration {
+	s.mu.Lock()
+	ws := slices.Clone(s.waits)
+	s.mu.Unlock()
+	slices.Sort(ws)
+	return ws
 }
 
 // workerSpec describes one worker of a test.

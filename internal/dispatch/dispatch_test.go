@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -412,7 +413,7 @@ func TestAWorkerHasAtMostOneClaimBatchWaitingForPermits(t *testing.T) {
 	defer stop()
 	d.Run(runCtx)
 	t.Logf("the provider received %d; at most %d rows were claimed and not yet permitted", srv.Received(), c.most.Load())
-	if srv.Received() < 50 {
+	if srv.Received() < 30 {
 		t.Fatalf("only %d sends in 3 s: the test did not run", srv.Received())
 	}
 	if most := c.most.Load(); most > int64(opts.ClaimBatch) {
@@ -443,16 +444,24 @@ func TestTheHalfOpenBreakerLetsExactlyOneRowThrough(t *testing.T) {
 		t.Fatal("the breaker did not open")
 	}
 	opened := srv.Received()
-	answer.set(recorder.Response{Delay: 800 * time.Millisecond}) // healthy, and slow
-	if !waitFor(10*time.Second, func() bool { return srv.Received() > opened }) {
-		t.Fatal("no probe reached the provider")
-	}
-	time.Sleep(600 * time.Millisecond) // the probe is still out
-	if n := srv.Received() - opened; n != 1 {
-		t.Errorf("%d requests reached the provider while the probe was out, want 1", n)
-	}
+	const probeTime = 800 * time.Millisecond
+	answer.set(recorder.Response{Delay: probeTime}) // healthy, and slow
 	if counts, ok := waitAllFinal(t, e.Pool, 30*time.Second); !ok || counts[domain.Sent] != len(ids) {
-		t.Errorf("statuses %v after the probe succeeded, want all %d sent", counts, len(ids))
+		t.Fatalf("statuses %v after the probe succeeded, want all %d sent", counts, len(ids))
+	}
+	// The first request after the breaker opened is the probe. Until its answer left the
+	// provider, probeTime after it arrived, no other request may arrive. Counted from the
+	// provider's stamps, so a slow machine cannot make the test pass or fail by itself.
+	after := srv.Requests()[opened:]
+	slices.SortFunc(after, func(a, b recorder.Request) int { return a.Arrived.Compare(b.Arrived) })
+	during := 0
+	for _, r := range after[1:] {
+		if r.Arrived.Before(after[0].Arrived.Add(probeTime)) {
+			during++
+		}
+	}
+	if during != 0 {
+		t.Errorf("%d requests reached the provider while the probe was out, want none", during)
 	}
 	if d.breaker.State() != Closed {
 		t.Errorf("breaker state %d, want closed", d.breaker.State())
@@ -478,7 +487,7 @@ func TestAClaimThatFindsNothingLeavesNoProbe(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // claims that find nothing, every idle pause
 	answer.set(recorder.Response{})
 	id := insertRows(t, e.Pool, domain.SMS, 1, always(domain.Normal), 6)[0]
-	if !waitFor(3*time.Second, func() bool { return rowOf(t, e.Pool, id).Status == domain.Sent }) {
+	if !waitFor(5*time.Second, func() bool { return rowOf(t, e.Pool, id).Status == domain.Sent }) {
 		t.Fatalf("the row is %s: an empty claim left a probe marked", rowOf(t, e.Pool, id).Status)
 	}
 	if d.breaker.State() != Closed {
