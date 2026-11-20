@@ -165,7 +165,32 @@ The shared limit of 100 per second per channel, as a sliding window in Redis: `A
   workers") was optimistic. The first two are fixed in code with tests and guards; the third
   is now an assumption that session 5 measures, instead of a claim.
 
-### Session 4 and later
+### Session 4: provider client and the send gate (2026-11-20)
+
+The HTTP client that delivers one notification, with the rate-limit permit taken when the
+connection is ready and before the request is written. Record:
+[sessions/04-provider.md](sessions/04-provider.md).
+
+- **A design detail was removed by measurement.** The design said: refuse a send by closing
+  its connection, then cancelling the request. Through the real client, the close alone let 0
+  of 20,000 refused sends through; the cancel added nothing, so it went, before any code was
+  committed.
+- **A rare event got a second, exact test.** A refused send that only cancels leaks a few
+  times in ten thousand, so a test that counts leaks is a weak guard. A second test checks
+  the order itself: when the client's hook returns, the connection is already closed.
+- **A guard must fail for the reason it names.** Two guards turned their tests red by
+  accident: a gate moved after the write let the response arrive while the gate still ran,
+  and the test read the gate's results too early. Both tests were fixed to fail for the
+  reason the guard names.
+- **CI caught a test that trusted a timing assumption.** Under the race detector on the CI
+  runner, the provider saw 106 requests in one second. The delay between permit and arrival
+  passed the 50 ms margin, a case the design already lists. The test now checks the
+  guarantee in the form the design states it.
+- **The review found a response that escapes the deadline.** To a `101 Switching Protocols`,
+  Go hands over the raw connection and stops applying the request's deadline; the client
+  waited as long as the provider kept the connection open. It no longer reads that body.
+
+### Session 5 and later
 
 Recorded here as each session finishes.
 
