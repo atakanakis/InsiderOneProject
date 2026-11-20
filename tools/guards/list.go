@@ -290,7 +290,7 @@ var guards = []Guard{
 
 	// Session 2: the queue of architecture §5.
 	{
-		Name: "queue: claims lock with SKIP LOCKED (I2)", File: "internal/store/queue.go",
+		Name: "queue: claims lock the rows they take (I2)", File: "internal/store/queue.go",
 		Old: "    LIMIT $3\n    FOR UPDATE SKIP LOCKED))", New: "    LIMIT $3))",
 		Package: "./internal/store", Test: "TestConcurrentClaimsNeverTakeTheSameRow",
 	},
@@ -397,7 +397,7 @@ var guards = []Guard{
 	{
 		Name: "queue: stored text is bounded", File: "internal/store/queue.go",
 		Old: "if len(s) <= limit {", New: "if true || len(s) <= limit {",
-		Package: "./internal/store", Test: "TestFinishStoresAnyErrorTextWithinItsBound",
+		Package: "./internal/store", Test: "TestFinishStoresTextAtItsBound",
 	},
 	{
 		Name: "queue: reap takes only ended leases (I4)", File: "internal/store/queue.go",
@@ -415,7 +415,7 @@ var guards = []Guard{
 		Package: "./internal/store", Test: "TestReapReturnsExpiredRowsToPendingOrFailed",
 	},
 	{
-		Name: "queue: reapers skip each other's rows (I4)", File: "internal/store/queue.go",
+		Name: "queue: reapers lock the rows they take (I4)", File: "internal/store/queue.go",
 		Old: "    LIMIT $1\n    FOR UPDATE SKIP LOCKED))", New: "    LIMIT $1))",
 		Package: "./internal/store", Test: "TestTwoReapersAtOnceReturnEachRowOnce",
 	},
@@ -448,5 +448,33 @@ var guards = []Guard{
 		Name: "queue: writes have their own timeout", File: "internal/store/queue.go",
 		Old: "context.WithTimeout(context.WithoutCancel(ctx), q.timeout)", New: "context.WithCancel(context.WithoutCancel(ctx))",
 		Package: "./internal/store", Test: "TestQueueWritesHaveTheirOwnTimeout",
+	},
+
+	// Session 2, after the review: the skip half of SKIP LOCKED, and the text bounds at
+	// their edge.
+	{
+		Name: "queue: claims skip locked rows instead of waiting", File: "internal/store/queue.go",
+		Old: "    LIMIT $3\n    FOR UPDATE SKIP LOCKED))", New: "    LIMIT $3\n    FOR UPDATE))",
+		Package: "./internal/store", Test: "TestClaimSkipsRowsLockedByAnotherTransaction",
+	},
+	{
+		Name: "queue: reapers skip locked rows instead of waiting", File: "internal/store/queue.go",
+		Old: "    LIMIT $1\n    FOR UPDATE SKIP LOCKED))", New: "    LIMIT $1\n    FOR UPDATE))",
+		Package: "./internal/store", Test: "TestReapSkipsRowsLockedByAnotherTransaction",
+	},
+	{
+		Name: "queue: the text bound is inclusive", File: "internal/store/queue.go",
+		Old: "if len(s) <= limit {", New: "if len(s) < limit {",
+		Package: "./internal/store", Test: "TestFinishStoresTextAtItsBound",
+	},
+	{
+		Name: "queue: text is cut at a character boundary", File: "internal/store/queue.go",
+		Old: "for cut > 0 && !utf8.RuneStart(s[cut]) {", New: "for false && cut > 0 && !utf8.RuneStart(s[cut]) {",
+		Package: "./internal/store", Test: "TestFinishStoresTextAtItsBound",
+	},
+	{
+		Name: "queue: the outcome text is bounded", File: "internal/store/queue.go",
+		Old: "bounded(r.Outcome, MaxErrorBytes)", New: "r.Outcome",
+		Package: "./internal/store", Test: "TestFinishStoresTextAtItsBound",
 	},
 }
