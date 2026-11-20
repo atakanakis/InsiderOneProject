@@ -287,4 +287,166 @@ var guards = []Guard{
 		Old: "if !tests[name] {", New: "if false && !tests[name] {",
 		Package: "./tools/testnames", Test: "TestTestNamesCheckReportsATestThatDoesNotExist",
 	},
+
+	// Session 2: the queue of architecture §5.
+	{
+		Name: "queue: claims lock with SKIP LOCKED (I2)", File: "internal/store/queue.go",
+		Old: "    LIMIT $3\n    FOR UPDATE SKIP LOCKED))", New: "    LIMIT $3))",
+		Package: "./internal/store", Test: "TestConcurrentClaimsNeverTakeTheSameRow",
+	},
+	{
+		Name: "queue: a claim takes only waiting rows (I2)", File: "internal/store/queue.go",
+		Old: "      AND status IN ('scheduled', 'pending', 'retrying')\n      AND ready_at <= now()", New: "      AND ready_at <= now()",
+		Package: "./internal/store", Test: "TestClaimTakesExactlyTheClaimableStatuses",
+	},
+	{
+		Name: "queue: a claim takes only due rows", File: "internal/store/queue.go",
+		Old: "      AND ready_at <= now()\n", New: "",
+		Package: "./internal/store", Test: "TestClaimReturnsOnlyDueRows",
+	},
+	{
+		Name: "queue: a claim takes only its channel", File: "internal/store/queue.go",
+		Old: "WHERE channel = $1 AND priority = $2", New: "WHERE $1::text <> '' AND priority = $2",
+		Package: "./internal/store", Test: "TestClaimTakesOnlyItsChannelAndPriority",
+	},
+	{
+		Name: "queue: a claim takes only its priority", File: "internal/store/queue.go",
+		Old: "WHERE channel = $1 AND priority = $2", New: "WHERE channel = $1 AND $2::smallint >= 0",
+		Package: "./internal/store", Test: "TestClaimTakesOnlyItsChannelAndPriority",
+	},
+	{
+		Name: "queue: a claim stops after n rows", File: "internal/store/queue.go",
+		Old: "    LIMIT $3\n", New: "    LIMIT $3 + 1\n",
+		Package: "./internal/store", Test: "TestClaimReturnsTheEarliestRowsInReadyAtOrder",
+	},
+	{
+		Name: "queue: the claim's order is in its SQL", File: "internal/store/queue.go",
+		Old: "    ORDER BY ready_at\n    LIMIT $3", New: "    LIMIT $3",
+		Package: "./internal/store", Test: "TestClaimTakesTheEarliestDueRowsWithoutTheIndex",
+	},
+	{
+		Name: "queue: claimed rows come back in ready_at order", File: "internal/store/queue.go",
+		Old: "slices.SortStableFunc(claimed, func(a, b Claimed) int { return a.ReadyAt.Compare(b.ReadyAt) })", New: "slices.SortStableFunc(claimed, func(a, b Claimed) int { return 0 })",
+		Package: "./internal/store", Test: "TestClaimReturnsTheEarliestRowsInReadyAtOrder",
+	},
+	{
+		Name: "queue: a claim is one attempt (I7)", File: "internal/store/queue.go",
+		Old: "attempts = attempts + 1,", New: "attempts = attempts,",
+		Package: "./internal/store", Test: "TestAttemptsNeverGoDown",
+	},
+	{
+		Name: "queue: the lease is on the database clock (I12)", File: "internal/store/queue.go",
+		Old: "locked_until = now() + $4::bigint * interval '1 microsecond'", New: "locked_until = clock_timestamp() + $4::bigint * interval '1 microsecond'",
+		Package: "./internal/store", Test: "TestClaimSetsTheLeaseOnTheDatabaseClock",
+	},
+	{
+		Name: "queue: a claim refuses an empty lease", File: "internal/store/queue.go",
+		Old: "if lease <= 0 {", New: "if lease < 0 {",
+		Package: "./internal/store", Test: "TestClaimRefusesAnEmptyLeaseAndAsksNothingForZeroRows",
+	},
+	{
+		Name: "queue: A3, the index order alone serves the claim", File: "internal/store/queue.go",
+		Old: "    ORDER BY ready_at\n", New: "    ORDER BY ready_at, id\n",
+		Package: "./internal/store", Test: "TestClaimPlanReadsTheIndexInOrder",
+	},
+	{
+		Name: "queue: A3, the ANY(ARRAY(...)) form", File: "internal/store/queue.go",
+		Old: "WHERE id = ANY(ARRAY(\n    SELECT id FROM notifications\n    WHERE channel = $1 AND priority = $2\n      AND status IN ('scheduled', 'pending', 'retrying')\n      AND ready_at <= now()\n    ORDER BY ready_at\n    LIMIT $3\n    FOR UPDATE SKIP LOCKED))\nRETURNING id, recipient", New: "WHERE id IN (\n    SELECT id FROM notifications\n    WHERE channel = $1 AND priority = $2\n      AND status IN ('scheduled', 'pending', 'retrying')\n      AND ready_at <= now()\n    ORDER BY ready_at\n    LIMIT $3\n    FOR UPDATE SKIP LOCKED)\nRETURNING id, recipient",
+		Package: "./internal/store", Test: "TestClaimPlanReadsTheIndexInOrder",
+	},
+	{
+		Name: "queue: finish only from the current attempt (I3)", File: "internal/store/queue.go",
+		Old: "WHERE id = $1 AND attempts = $2 AND status = 'processing'", New: "WHERE id = $1 AND $2::int > 0 AND status = 'processing'",
+		Package: "./internal/store", Test: "TestFinishFromAStaleAttemptChangesNothing",
+	},
+	{
+		Name: "queue: finish only while processing (I3)", File: "internal/store/queue.go",
+		Old: "WHERE id = $1 AND attempts = $2 AND status = 'processing'", New: "WHERE id = $1 AND attempts = $2",
+		Package: "./internal/store", Test: "TestFinishOnARowThatIsNoLongerProcessingChangesNothing",
+	},
+	{
+		Name: "queue: a repeated finish is harmless (I3)", File: "internal/store/queue.go",
+		Old: "ON CONFLICT DO NOTHING", New: "",
+		Package: "./internal/store", Test: "TestRepeatedFinishAddsNoSecondAttemptRow",
+	},
+	{
+		Name: "queue: a stale result is kept as history", File: "internal/store/queue.go",
+		Old: "return nil // stale", New: "return err // stale",
+		Package: "./internal/store", Test: "TestFinishFromAStaleAttemptChangesNothing",
+	},
+	{
+		Name: "queue: finish stores only results", File: "internal/store/queue.go",
+		Old: "case r.Status != domain.Sent && r.Status != domain.Failed && r.Status != domain.Retrying:", New: "case false && r.Status != domain.Sent && r.Status != domain.Failed && r.Status != domain.Retrying:",
+		Package: "./internal/store", Test: "TestFinishRefusesAStatusThatIsNotAResult",
+	},
+	{
+		Name: "queue: a retry on the last attempt is failed", File: "internal/store/queue.go",
+		Old: "WHEN $3::text = 'retrying' AND attempts >= max_attempts THEN 'failed'", New: "WHEN false THEN 'failed'",
+		Package: "./internal/store", Test: "TestARetryOnTheLastAttemptIsStoredAsFailed",
+	},
+	{
+		Name: "queue: attempt start time on the database clock (I12)", File: "internal/store/queue.go",
+		Old: "now() - $3::int * interval '1 millisecond'", New: "clock_timestamp() - $3::int * interval '1 millisecond'",
+		Package: "./internal/store", Test: "TestFinishStoresEachResultOnTheDatabaseClock",
+	},
+	{
+		Name: "queue: stored text has no NUL", File: "internal/store/queue.go",
+		Old: "strings.ReplaceAll(strings.ToValidUTF8(s, string(utf8.RuneError)), \"\\x00\", \"\")", New: "strings.ToValidUTF8(s, string(utf8.RuneError))",
+		Package: "./internal/store", Test: "TestFinishStoresAnyErrorTextWithinItsBound",
+	},
+	{
+		Name: "queue: stored text is bounded", File: "internal/store/queue.go",
+		Old: "if len(s) <= limit {", New: "if true || len(s) <= limit {",
+		Package: "./internal/store", Test: "TestFinishStoresAnyErrorTextWithinItsBound",
+	},
+	{
+		Name: "queue: reap takes only ended leases (I4)", File: "internal/store/queue.go",
+		Old: "WHERE status = 'processing' AND locked_until < now()", New: "WHERE status = 'processing'",
+		Package: "./internal/store", Test: "TestReapReturnsExpiredRowsToPendingOrFailed",
+	},
+	{
+		Name: "queue: reap fails a row at its last attempt (I4)", File: "internal/store/queue.go",
+		Old: "SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END", New: "SET status = 'pending'",
+		Package: "./internal/store", Test: "TestReapReturnsExpiredRowsToPendingOrFailed",
+	},
+	{
+		Name: "queue: reap takes a bounded batch", File: "internal/store/queue.go",
+		Old: "    LIMIT $1\n", New: "    LIMIT $1 + 5\n",
+		Package: "./internal/store", Test: "TestReapReturnsExpiredRowsToPendingOrFailed",
+	},
+	{
+		Name: "queue: reapers skip each other's rows (I4)", File: "internal/store/queue.go",
+		Old: "    LIMIT $1\n    FOR UPDATE SKIP LOCKED))", New: "    LIMIT $1))",
+		Package: "./internal/store", Test: "TestTwoReapersAtOnceReturnEachRowOnce",
+	},
+	{
+		Name: "queue: cancel only from waiting statuses", File: "internal/store/queue.go",
+		Old: "WHERE id = $1 AND status IN ('scheduled', 'pending', 'retrying')", New: "WHERE id = $1",
+		Package: "./internal/store", Test: "TestCancelOnlyFromWaitingStatuses",
+	},
+	{
+		Name: "queue: a missing row is not a wrong status", File: "internal/store/queue.go",
+		Old: "fmt.Errorf(\"%s %s: %w\", op, id, ErrNotFound)", New: "fmt.Errorf(\"%s %s: %w\", op, id, ErrWrongStatus)",
+		Package: "./internal/store", Test: "TestCancelOnlyFromWaitingStatuses",
+	},
+	{
+		Name: "queue: requeue only from failed", File: "internal/store/queue.go",
+		Old: "WHERE id = $1 AND status = 'failed'", New: "WHERE id = $1",
+		Package: "./internal/store", Test: "TestRequeueRaisesMaxAttemptsByTheBudget",
+	},
+	{
+		Name: "queue: requeue counts the budget from attempts (I7)", File: "internal/store/queue.go",
+		Old: "max_attempts = attempts + $2", New: "max_attempts = $2::int",
+		Package: "./internal/store", Test: "TestRequeueRaisesMaxAttemptsByTheBudget",
+	},
+	{
+		Name: "queue: writes ignore the caller's cancellation", File: "internal/store/queue.go",
+		Old: "context.WithoutCancel(ctx)", New: "ctx",
+		Package: "./internal/store", Test: "TestQueueWritesAreNotCutOffByACancelledCaller",
+	},
+	{
+		Name: "queue: writes have their own timeout", File: "internal/store/queue.go",
+		Old: "context.WithTimeout(context.WithoutCancel(ctx), q.timeout)", New: "context.WithCancel(context.WithoutCancel(ctx))",
+		Package: "./internal/store", Test: "TestQueueWritesHaveTheirOwnTimeout",
+	},
 }
