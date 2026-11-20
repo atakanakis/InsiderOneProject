@@ -11,6 +11,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -84,7 +85,11 @@ func read(src string) ([]byte, error) {
 	if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
 		return os.ReadFile(src)
 	}
-	resp, err := http.Get(src) //nolint:gosec // the URL is the operator's argument
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, src, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req) //nolint:gosec // the URL is the operator's argument
 	if err != nil {
 		return nil, err
 	}

@@ -234,7 +234,7 @@ func TestTheSubscriptionComesBackAfterRedisDropsIt(t *testing.T) {
 }
 
 // proxy stands between the subscription and Redis, to make outages: refuse closes every
-// connection and refuses new ones; hang stops forwarding on the connections it has, as a
+// connection and refuses new ones; freeze stops forwarding on the connections it has, as a
 // paused Redis would, while new ones are forwarded.
 type proxy struct {
 	ln     net.Listener
@@ -242,7 +242,6 @@ type proxy struct {
 
 	mu      sync.Mutex
 	refuse  bool
-	hang    bool
 	conns   []*piped
 	conWait sync.WaitGroup
 }

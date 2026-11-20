@@ -184,7 +184,7 @@ func followOne(ctx context.Context, c *client) error {
 		header.Set("X-API-Key", c.key)
 	}
 	wsURL := "ws" + strings.TrimPrefix(c.base, "http") + "/v1/ws?notificationId=" + created.ID
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: header})
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: header}) //nolint:bodyclose // the library closes it ("You never need to close resp.Body yourself")
 	if err != nil {
 		return fmt.Errorf("open the WebSocket: %w", err)
 	}

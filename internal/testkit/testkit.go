@@ -232,7 +232,7 @@ func Recorder(t testing.TB, opts recorder.Options) *recorder.Server {
 // never answers: a paused Redis. It stops when the test ends.
 func HungRedis(t testing.TB) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

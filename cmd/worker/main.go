@@ -106,7 +106,7 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	}
 	defer func() { _ = eventsClient.Close() }()
 	publisher := events.NewRedis(eventsClient, events.Options{Log: log, Metrics: observability.NewPublishMetrics(reg)})
-	metricsListener, err := net.Listen("tcp", cfg.MetricsAddr)
+	metricsListener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.MetricsAddr)
 	if err != nil {
 		log.Error("metrics listen", "addr", cfg.MetricsAddr, "error", err)
 		return 1

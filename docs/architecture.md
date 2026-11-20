@@ -1116,8 +1116,9 @@ by channel and status, through the claim index and the reaper's index; the oldes
 read from the claim index, one probe per channel and priority. The time is Postgres's
 (`now() - ready_at`, rule 7). The read has its own timeout of 2 s; when it fails, the figures
 are left out of that scrape and the failure is logged at most once per 10 s. Every API
-instance exports the same figures, so rules combine them with `max`, never `sum`. The cost on
-a large queue is measured in session 7's record.
+instance exports the same figures, so rules combine them with `max`, never `sum`. Measured on
+1,000,000 waiting rows and 1,080,000 sent rows: the depth 121 to 122 ms, the oldest due row
+0.09 to 0.15 ms (nine index probes) ([experiment 02](experiments/02-metrics-at-scale.md)).
 
 **`GET /v1/metrics`** answers the main figures as JSON for a recent window: `window` is one of
 `1m`, `5m` (the default), `15m` and `1h` (the bound of section 8); any other value is a 400.
@@ -1130,7 +1131,15 @@ attempt that delivered it plus its duration). The attempts are found by a BRIN i
 so the index is a few pages and needs no maintenance on the queue's path. An answer is
 computed at most once per 5 s per window and API instance, so any number of clients costs
 four queries every 5 s at most (TestTheMetricsEndpointReportsTheRecentWindow,
-TestTheMetricsEndpointIsComputedOncePerFiveSeconds).
+TestTheMetricsEndpointIsComputedOncePerFiveSeconds,
+TestTheWindowsAttemptsAreReadThroughTheirIndex). Measured with 2,080,000 notifications and an
+hour of attempts at the full rate (1,080,000): the counts and the percentiles of a 5-minute
+window take 105 to 110 ms and 143 to 163 ms, of a 1-hour window 0.31 s and 0.91 to 1.03 s.
+The attempts are found through the index, but Postgres joins them to their notifications by
+reading the whole notifications table, so the cost grows with the table, not only with the
+window; a join by primary key, bounded by the window, measured slower (0.22 to 0.27 s and 1.6
+to 2.2 s). Nothing removes old rows (section 16), so at some size the 1-hour window reaches the
+5 s deadline and answers 500; nothing else is affected ([experiment 02](experiments/02-metrics-at-scale.md)). Session 8 measures where.
 
 ### Tracing
 
@@ -1358,3 +1367,4 @@ Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on
 | A WebSocket stream of every event | Each client names what it follows (section 9). A stream of everything would send 300 events per second to each client, and is a job for a consumer of the Redis channel, not for a public endpoint. |
 | An API key in the WebSocket's query string | Browsers cannot set headers on a WebSocket, but a key in a URL is written to proxy and access logs. The key is a header, as on every `/v1` path; a browser client needs a server of its own in between. |
 | `traceparent` sent to the provider | The provider is outside; the trace ends at the worker's delivery span. The provider receives the correlation id (section 7). |
+| Removing old notifications and attempts | Needs a retention policy (how long a client may ask for a status) that the requirements do not give. Without it the tables grow without end; the one read whose cost grows with them is `GET /v1/metrics` over 1 hour (section 10). |
