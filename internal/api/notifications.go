@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/events"
@@ -77,6 +78,8 @@ type server struct {
 	events      events.Publisher
 	deadline    time.Duration
 	rendering   chan struct{} // a slot per request that renders and stores
+	hub         *Hub
+	figures     *figures
 }
 
 type route struct {
@@ -120,9 +123,7 @@ func register(mux *http.ServeMux, log *slog.Logger, o Options) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, docsPage)
 	})
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
-		writeError(w, http.StatusNotImplemented, apiError{Code: "not_implemented", Message: "not implemented"})
-	})
+	mux.Handle("GET /metrics", observability.MetricsHandler(o.Metrics.Registry))
 	if o.Pool == nil {
 		return
 	}
@@ -130,6 +131,12 @@ func register(mux *http.ServeMux, log *slog.Logger, o Options) {
 		log: log, store: store.NewNotifications(o.Pool, maxAttempts(o)), queue: store.NewQueue(o.Pool),
 		maxAttempts: maxAttempts(o), events: o.Events, deadline: o.DatabaseDeadline,
 		rendering: make(chan struct{}, MaxRenderingRequests),
+		hub:       o.Hub,
+	}
+	s.figures = newFigures(s.store, log)
+	// The queue's figures are scraped with the rest; a registry has them once.
+	if err := o.Metrics.Registry.Register(s.figures); err != nil && !errors.As(err, new(prometheus.AlreadyRegisteredError)) {
+		panic(err)
 	}
 	if s.deadline <= 0 {
 		s.deadline = DatabaseDeadline

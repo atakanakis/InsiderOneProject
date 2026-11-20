@@ -13,6 +13,7 @@ import (
 
 	"github.com/atakanakis/InsiderOneProject/internal/api"
 	"github.com/atakanakis/InsiderOneProject/internal/config"
+	"github.com/atakanakis/InsiderOneProject/internal/events"
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
 	"github.com/atakanakis/InsiderOneProject/internal/redisclient"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
@@ -47,12 +48,37 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	}
 	defer func() { _ = rdb.Close() }()
 
+	// Status events (architecture §9): the publisher and the subscription each have their own
+	// Redis client, so neither holds a connection the other or the readiness check needs.
+	metrics := api.NewMetrics()
+	publishClient, err := redisclient.New(cfg.RedisURL)
+	if err != nil {
+		log.Error("redis url", "error", err)
+		return 2
+	}
+	defer func() { _ = publishClient.Close() }()
+	subscribeClient, err := redisclient.New(cfg.RedisURL)
+	if err != nil {
+		log.Error("redis url", "error", err)
+		return 2
+	}
+	defer func() { _ = subscribeClient.Close() }()
+	publisher := events.NewRedis(publishClient, events.Options{Log: log, Metrics: metrics.Publish})
+	hub := api.NewHub(api.HubOptions{Metrics: metrics})
+	subscribed, stopSubscription := context.WithCancel(context.Background())
+	defer stopSubscription()
+	go events.Subscribe(subscribed, subscribeClient, hub.Deliver, events.SubscribeOptions{Log: log, Metrics: metrics.Subscribe})
+
 	srv := api.NewServer(cfg.APIAddr, api.NewHandler(log, api.Options{
 		Health:      api.Health{Postgres: pool.Ping, Redis: api.RedisCheck(rdb)},
 		Pool:        pool,
 		APIKeys:     cfg.APIKeys,
 		MaxAttempts: cfg.MaxAttempts,
+		Events:      publisher,
+		Metrics:     metrics,
+		Hub:         hub,
 	}))
+	srv.RegisterOnShutdown(hub.Close) // every WebSocket is closed with 1001
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	log.Info("api listening", "addr", cfg.APIAddr)
@@ -70,6 +96,10 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		log.Error("shutdown", "error", err)
 		return 1
 	}
+	stopSubscription()
+	flush, cancelFlush := context.WithTimeout(context.Background(), 2*time.Second)
+	publisher.Close(flush) // the last answers' events
+	cancelFlush()
 	log.Info("api stopped")
 	return 0
 }

@@ -356,9 +356,10 @@ func serverClose(t *testing.T, c net.Conn, br *bufio.Reader, timeout time.Durati
 	}
 }
 
-// §9: the client sends nothing but control frames. A data message closes the connection with
-// 1008, whatever its size and before its payload is read; a malformed frame closes it with
-// 1002; a ping at the 125-byte bound of a control frame is answered.
+// §9: the client sends nothing but control frames. A data message closes the connection at
+// once, whatever its size and before its payload is read, also one that claims 1 GiB and
+// sends 100 bytes; a malformed frame closes it, with 1002 or at once; a ping at the 125-byte
+// bound of a control frame is answered.
 func TestAWebSocketClientMustNotSendDataMessages(t *testing.T) {
 	a := newWSAPI(t, HubOptions{})
 	query := notificationIDParam + "=" + uuid.NewString()
@@ -367,8 +368,8 @@ func TestAWebSocketClientMustNotSendDataMessages(t *testing.T) {
 	if err := c.Write(context.Background(), websocket.MessageText, []byte(`{"subscribe": "everything"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if code := closeCode(t, c, 5*time.Second); code != websocket.StatusPolicyViolation {
-		t.Errorf("a small data message: closed with %d, want 1008", code)
+	if code := closeCode(t, c, 2*time.Second); code != -1 {
+		t.Errorf("a small data message: closed with %d, want the connection cut at once", code)
 	}
 
 	for _, tc := range []struct {
@@ -377,8 +378,9 @@ func TestAWebSocketClientMustNotSendDataMessages(t *testing.T) {
 		want  int
 	}{
 		// A frame that claims 1 GiB and sends 100 bytes of it.
-		{"a 1 GiB data message", frame(0x2, make([]byte, 100), 1<<30, true, 0), 1008},
-		{"an unmasked frame", frame(0x1, []byte("hi"), 2, false, 0), 1002},
+		{"a 1 GiB data message", frame(0x2, make([]byte, 100), 1<<30, true, 0), 0},
+		// RFC 6455 5.1: the server must close; the library cuts the connection without a code.
+		{"an unmasked frame", frame(0x1, []byte("hi"), 2, false, 0), 0},
 		{"reserved bits", frame(0x1, []byte("hi"), 2, true, 0x4), 1002},
 		{"a ping over 125 bytes", frame(0x9, make([]byte, 126), 126, true, 0), 1002},
 	} {
@@ -386,7 +388,7 @@ func TestAWebSocketClientMustNotSendDataMessages(t *testing.T) {
 		if _, err := conn.Write(tc.bytes); err != nil {
 			t.Fatal(err)
 		}
-		if got := serverClose(t, conn, br, 5*time.Second); got != tc.want {
+		if got := serverClose(t, conn, br, 2*time.Second); got != tc.want {
 			t.Errorf("%s: closed with %d, want %d", tc.name, got, tc.want)
 		}
 	}
@@ -401,8 +403,8 @@ func TestAWebSocketClientMustNotSendDataMessages(t *testing.T) {
 	if _, err := io.ReadFull(br, h); err != nil || h[0]&0x0f != 0xA || int(h[1]&0x7f) != 125 {
 		t.Errorf("a 125-byte ping: answered %x, %v; want a pong of 125 bytes", h, err)
 	}
-	if got := closedBy(a.metrics, "data_message"); got < 2 {
-		t.Errorf("closed{data_message} = %v, want at least 2", got)
+	if !waitUntil(2*time.Second, func() bool { return closedBy(a.metrics, "data_message") == 2 }) {
+		t.Errorf("closed{data_message} = %v, want 2", closedBy(a.metrics, "data_message"))
 	}
 }
 

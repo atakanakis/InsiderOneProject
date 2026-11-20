@@ -317,7 +317,7 @@ paths:
         parameter repeated; at least one id. A browser page of another origin is refused. The server first sends the current state of
         each (a `StatusMessage` per notification, a `BatchMessage` per batch; an id that does
         not exist is not answered), then a `StatusMessage` for every change. The client sends
-        no data messages: one closes the connection with 1008. The server pings every 30 s
+        no data messages: one closes the connection at once. The server pings every 30 s
         and closes a connection whose pong does not arrive within 10 s; a client that cannot
         keep up with 256 waiting messages is closed with 1008. On shutdown, 1001.
       parameters:

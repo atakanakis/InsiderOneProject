@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
@@ -60,6 +61,12 @@ func NewHandler(log *slog.Logger, o Options) http.Handler {
 	if h.Timeout <= 0 {
 		h.Timeout = ReadinessTimeout
 	}
+	if o.Metrics == nil {
+		o.Metrics = observability.NewAPIMetrics(prometheus.NewRegistry())
+	}
+	if o.Hub == nil {
+		o.Hub = NewHub(HubOptions{Metrics: o.Metrics})
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_ = writeJSON(w, http.StatusOK, map[string]string{"status": "ok"}) // a map of strings always encodes
@@ -68,7 +75,7 @@ func NewHandler(log *slog.Logger, o Options) http.Handler {
 		ready(w, r, log, h)
 	})
 	register(mux, log, o)
-	return correlate(log, mux)
+	return correlate(log, o.Metrics, mux)
 }
 
 // NewServer returns an HTTP server with the request bounds of architecture §8.
@@ -128,8 +135,9 @@ func ready(w http.ResponseWriter, r *http.Request, log *slog.Logger, h Health) {
 
 // correlate accepts the client's X-Correlation-ID when it is within the bound of
 // architecture §8, and otherwise creates one. The id is put in the context, so every log
-// line of the request carries it, and is sent back in the response.
-func correlate(log *slog.Logger, next http.Handler) http.Handler {
+// line of the request carries it, and is sent back in the response. The request is counted
+// under its route pattern, which the router sets (architecture §10).
+func correlate(log *slog.Logger, m *observability.APIMetrics, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(correlationHeader)
 		if !observability.ValidCorrelationID(id) {
@@ -139,9 +147,12 @@ func correlate(log *slog.Logger, next http.Handler) http.Handler {
 		w.Header().Set(correlationHeader, id)
 		began := time.Now()
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
-		next.ServeHTTP(sw, r.WithContext(ctx))
+		routed := r.WithContext(ctx)
+		next.ServeHTTP(sw, routed)
+		took := time.Since(began)
+		measured(m, routed, sw.code, took)
 		log.DebugContext(ctx, "request", "method", r.Method, "path", r.URL.Path,
-			"status", sw.code, "duration_ms", time.Since(began).Milliseconds())
+			"status", sw.code, "duration_ms", took.Milliseconds())
 	})
 }
 
@@ -154,6 +165,9 @@ func (s *statusWriter) WriteHeader(code int) {
 	s.code = code
 	s.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap lets the WebSocket's upgrade reach the connection (http.ResponseController's rule).
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // writeJSON encodes v before it writes the status, so an answer that cannot be encoded (a
 // time after the year 9999) is a 500 in the error form, never a 2xx without a body. It
