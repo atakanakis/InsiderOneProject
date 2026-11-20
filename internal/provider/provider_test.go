@@ -153,6 +153,7 @@ func TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite(t *testing.T) 
 		var calls, receivedAtGate atomic.Int64
 		var atGate atomic.Int64 // time from the start of Send to the gate, in ns
 		var gateDone atomic.Value
+		receivedAtGate.Store(-1)
 		began := time.Now()
 		r := c.Send(bg(t), m, func(context.Context) error {
 			calls.Add(1)
@@ -162,6 +163,10 @@ func TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite(t *testing.T) 
 			gateDone.Store(time.Now())
 			return nil
 		})
+		done, gateReturned := gateDone.Load().(time.Time)
+		if !gateReturned {
+			t.Fatalf("send %d: Send returned before its gate did: the gate did not hold the write back", i)
+		}
 		if !r.Responded || r.StatusCode != http.StatusAccepted {
 			t.Fatalf("send %d: %+v", i, r)
 		}
@@ -177,7 +182,6 @@ func TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite(t *testing.T) 
 		if n := receivedAtGate.Load(); n != int64(i) {
 			t.Errorf("send %d: the provider had received %d requests when the gate returned, want %d: the write began before the gate", i, n, i)
 		}
-		done, _ := gateDone.Load().(time.Time)
 		if arrived := srv.Requests()[i].Arrived; arrived.Before(done) {
 			t.Errorf("send %d: the request arrived %v before the gate returned", i, done.Sub(arrived))
 		}
@@ -320,9 +324,6 @@ func TestADeadReusedConnectionIsNotReplayed(t *testing.T) {
 	if closedByProvider.Load() != 1 {
 		t.Fatalf("the provider closed %d idle connections, want 1", closedByProvider.Load())
 	}
-	if !r.ConnReused {
-		t.Fatal("the second send did not run on the kept-alive connection")
-	}
 	if g.calls.Load() != 1 {
 		t.Errorf("the gate ran %d times in one send, want 1", g.calls.Load())
 	}
@@ -331,6 +332,9 @@ func TestADeadReusedConnectionIsNotReplayed(t *testing.T) {
 	}
 	if r.Responded || r.Err == nil {
 		t.Errorf("a send on a dead connection: %+v, want no response and an error", r)
+	}
+	if g.calls.Load() == 1 && !r.ConnReused {
+		t.Error("the send did not run on the kept-alive connection; the test did not test a dead reused connection")
 	}
 	t.Logf("gate calls %d, received %d, error %v", g.calls.Load(), received(srv, domain.Email), r.Err)
 }
