@@ -197,8 +197,12 @@ func (q *Queue) Finish(ctx context.Context, id uuid.UUID, attempt int, r Result)
 
 // bounded makes s storable as Postgres text, which refuses invalid UTF-8 and NUL, and cuts it
 // to at most limit bytes at a character boundary. Text from a provider can be anything, and a
-// result write that fails forever would make the row be sent again after its lease.
+// result write that fails forever would make the row be sent again after its lease. A long
+// input is cut first, so that it is not copied whole.
 func bounded(s string, limit int) string {
+	if len(s) > limit+utf8.UTFMax {
+		s = s[:limit+utf8.UTFMax]
+	}
 	s = strings.ReplaceAll(strings.ToValidUTF8(s, string(utf8.RuneError)), "\x00", "")
 	if len(s) <= limit {
 		return s
@@ -283,23 +287,28 @@ func (q *Queue) Requeue(ctx context.Context, id uuid.UUID, budget int) (domain.S
 	return q.change(ctx, "requeue", id, requeueSQL, id, budget)
 }
 
-// change runs a one-row status change. When it matches no row, it tells a missing row from
-// a row in another status.
+// change runs a one-row status change in one transaction. It locks the row first, so that
+// the status it reports when the update refuses is the status the update saw; the update's
+// own WHERE decides.
 func (q *Queue) change(ctx context.Context, op string, id uuid.UUID, sql string, args ...any) (domain.Status, error) {
-	var status string
-	err := q.pool.QueryRow(ctx, sql, args...).Scan(&status)
-	if err == nil {
-		return domain.Status(status), nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("%s: %w", op, err)
-	}
-	err = q.pool.QueryRow(ctx, `SELECT status FROM notifications WHERE id = $1`, id).Scan(&status)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var found, changed string
+	err := pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM notifications WHERE id = $1 FOR UPDATE`, id).Scan(&found); err != nil {
+			return err
+		}
+		err := tx.QueryRow(ctx, sql, args...).Scan(&changed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // refused by the update's WHERE
+		}
+		return err
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
 		return "", fmt.Errorf("%s %s: %w", op, id, ErrNotFound)
-	}
-	if err != nil {
+	case err != nil:
 		return "", fmt.Errorf("%s: %w", op, err)
+	case changed == "":
+		return domain.Status(found), fmt.Errorf("%s %s from %s: %w", op, id, found, ErrWrongStatus)
 	}
-	return domain.Status(status), fmt.Errorf("%s %s from %s: %w", op, id, status, ErrWrongStatus)
+	return domain.Status(changed), nil
 }

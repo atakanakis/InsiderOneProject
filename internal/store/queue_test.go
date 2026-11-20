@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
@@ -651,6 +652,48 @@ func us(interval string) string {
 	return "(extract(epoch FROM " + interval + ") * 1000000)::bigint"
 }
 
+// §5, §8, rule 10: the text bounds at their edge. Text of exactly the bound is stored whole;
+// one byte more is cut to the bound; a two-byte character across the bound is not split.
+func TestFinishStoresTextAtItsBound(t *testing.T) {
+	e := testkit.Setup(t)
+	q := store.NewQueue(e.Pool)
+	type tc struct {
+		name           string
+		errText, msgID string
+		wantErr        int // stored bytes of the error and the outcome
+		wantMsgID      int
+	}
+	cases := []tc{
+		{"exactly the bound", strings.Repeat("a", store.MaxErrorBytes), strings.Repeat("m", store.MaxProviderMessageIDBytes),
+			store.MaxErrorBytes, store.MaxProviderMessageIDBytes},
+		{"one byte over", strings.Repeat("a", store.MaxErrorBytes+1), strings.Repeat("m", store.MaxProviderMessageIDBytes+1),
+			store.MaxErrorBytes, store.MaxProviderMessageIDBytes},
+		{"a character across the bound", strings.Repeat("a", store.MaxErrorBytes-1) + "é", strings.Repeat("m", store.MaxProviderMessageIDBytes-1) + "é",
+			store.MaxErrorBytes - 1, store.MaxProviderMessageIDBytes - 1},
+	}
+	for _, c := range cases {
+		id := addRow(t, e.Pool, waiting(-time.Second))
+		cl := claim(t, q, domain.SMS, domain.High, 1, hour)
+		r := store.Result{Status: domain.Sent, Outcome: c.errText, Error: c.errText, ProviderMessageID: c.msgID}
+		if _, changed, err := q.Finish(ctx(t), id, cl[0].Attempt, r); err != nil || !changed {
+			t.Fatalf("%s: changed %v, %v", c.name, changed, err)
+		}
+		var lastErr, outcome, msgID string
+		if err := e.Pool.QueryRow(ctx(t), `SELECT n.last_error, a.outcome, n.provider_message_id
+			FROM notifications n JOIN delivery_attempts a ON a.notification_id = n.id WHERE n.id = $1`, id).
+			Scan(&lastErr, &outcome, &msgID); err != nil {
+			t.Fatal(err)
+		}
+		if len(lastErr) != c.wantErr || len(outcome) != c.wantErr || len(msgID) != c.wantMsgID {
+			t.Errorf("%s: stored error %d, outcome %d, message id %d bytes; want %d, %d, %d",
+				c.name, len(lastErr), len(outcome), len(msgID), c.wantErr, c.wantErr, c.wantMsgID)
+		}
+		if !strings.HasPrefix(c.errText, lastErr) || !strings.HasPrefix(c.msgID, msgID) {
+			t.Errorf("%s: the stored text is not a prefix of the input", c.name)
+		}
+	}
+}
+
 func lenOf(s *string) int {
 	if s == nil {
 		return -1
@@ -694,6 +737,16 @@ func TestReapReturnsExpiredRowsToPendingOrFailed(t *testing.T) {
 	}
 	if !readyAfter.Equal(readyBefore) || !lockCleared {
 		t.Errorf("reaped row: ready_at %v (was %v), lease cleared %v", readyAfter, readyBefore, lockCleared)
+	}
+	// The lost attempt leaves no attempt row (only Finish writes one); last_error says why.
+	for _, id := range []uuid.UUID{toPending, toFailed} {
+		var lastErr *string
+		if err := e.Pool.QueryRow(ctx(t), `SELECT last_error FROM notifications WHERE id = $1`, id).Scan(&lastErr); err != nil {
+			t.Fatal(err)
+		}
+		if lastErr == nil || *lastErr != "lease expired" || len(attemptRows(t, e.Pool, id)) != 0 {
+			t.Errorf("reaped row: last_error %v, attempt rows %v; want \"lease expired\" and none", lastErr, attemptRows(t, e.Pool, id))
+		}
 	}
 
 	for range 30 {
@@ -761,6 +814,75 @@ func TestTwoReapersAtOnceReturnEachRowOnce(t *testing.T) {
 	}
 	if twice > 0 || len(seen) != rows {
 		t.Errorf("%d rows reaped, %d of them more than once; want %d, each once", len(seen), twice, rows)
+	}
+}
+
+// lockRows holds row locks on the rows that query selects, in a transaction of its own, the
+// way a Finish, a Cancel or another claim holds them for a moment. It returns the locked ids.
+func lockRows(t *testing.T, pool *pgxpool.Pool, query string) []uuid.UUID {
+	t.Helper()
+	tx, err := pool.Begin(ctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	rows, err := tx.Query(ctx(t), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return locked
+}
+
+// §5, I2: SKIP LOCKED, not only the lock. A claim that meets rows locked by another
+// transaction takes the next due rows at once; it neither waits nor comes back empty.
+func TestClaimSkipsRowsLockedByAnotherTransaction(t *testing.T) {
+	e := testkit.Setup(t)
+	for i := range 20 {
+		addRow(t, e.Pool, waiting(-time.Duration(20-i)*time.Second))
+	}
+	locked := lockRows(t, e.Pool, `SELECT id FROM notifications ORDER BY ready_at LIMIT 10 FOR UPDATE`)
+	q := store.NewQueue(e.Pool).WithTimeout(2 * time.Second)
+	began := time.Now()
+	got, err := q.Claim(ctx(t), domain.SMS, domain.High, 10, hour)
+	took := time.Since(began)
+	if err != nil || len(got) != 10 {
+		t.Fatalf("claim next to locked rows: %d rows after %v, %v; want the 10 unlocked rows at once", len(got), took, err)
+	}
+	for _, c := range got {
+		if slices.Contains(locked, c.ID) {
+			t.Errorf("claim returned row %s, which another transaction holds", c.ID)
+		}
+	}
+	if took > time.Second {
+		t.Errorf("the claim took %v: it waited for the locked rows", took)
+	}
+}
+
+// §5, I4: the same for the reaper, which every worker runs.
+func TestReapSkipsRowsLockedByAnotherTransaction(t *testing.T) {
+	e := testkit.Setup(t)
+	for range 15 {
+		addRow(t, e.Pool, held(-time.Second, 1, 6))
+	}
+	locked := lockRows(t, e.Pool, `SELECT id FROM notifications LIMIT 5 FOR UPDATE`)
+	q := store.NewQueue(e.Pool).WithTimeout(2 * time.Second)
+	began := time.Now()
+	got, err := q.Reap(ctx(t), 10)
+	took := time.Since(began)
+	if err != nil || len(got) != 10 {
+		t.Fatalf("reap next to locked rows: %d rows after %v, %v; want the 10 unlocked rows at once", len(got), took, err)
+	}
+	for _, c := range got {
+		if slices.Contains(locked, c.ID) {
+			t.Errorf("reap returned row %s, which another transaction holds", c.ID)
+		}
+	}
+	if took > time.Second {
+		t.Errorf("the reap took %v: it waited for the locked rows", took)
 	}
 }
 
@@ -857,26 +979,28 @@ func TestRequeueRaisesMaxAttemptsByTheBudget(t *testing.T) {
 	}
 }
 
-// I7: attempts only goes up. Random sequences of all five operations on a few rows: each
-// claim returns the previous count plus one, nothing else changes the count, and no attempt
-// number is recorded twice.
+// I7: attempts only goes up. A random sequence of all five operations on six rows: each
+// claim returns the previous count plus one, and nothing else changes the count. A row that
+// becomes final (sent or cancelled) is replaced by a new one, so the queue stays busy for
+// the whole run. The seed changes on every run and is logged.
 func TestAttemptsNeverGoDown(t *testing.T) {
 	e := testkit.Setup(t)
 	q := store.NewQueue(e.Pool)
-	rng := rand.New(rand.NewPCG(2, 2026))
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed %d", seed)
+	rng := rand.New(rand.NewPCG(seed, 2026))
+	fresh := func() uuid.UUID { return addRow(t, e.Pool, row{status: domain.Pending, maxAttempts: 3}) }
 	var rows []uuid.UUID
 	for range 6 {
-		rows = append(rows, addRow(t, e.Pool, row{status: domain.Pending, maxAttempts: 3}))
+		rows = append(rows, fresh())
 	}
-	last := map[uuid.UUID]int{}
-	results := []store.Result{sent,
-		{Status: domain.Failed, Outcome: "rejected", StatusCode: 400},
-		{Status: domain.Retrying, Outcome: "server error", StatusCode: 503}, // due again at once
-	}
-	held := map[uuid.UUID]int{} // attempt numbers handed out, by row
+	retry := store.Result{Status: domain.Retrying, Outcome: "server error", StatusCode: 503} // due again at once
+	results := []store.Result{sent, {Status: domain.Failed, Outcome: "rejected", StatusCode: 400}, retry, retry, retry, retry}
+	last := map[uuid.UUID]int{} // the attempt number each row's last claim handed out
+	var claims, finished, reaped, requeued, cancelled int
 	for step := range 600 {
 		id := rows[rng.IntN(len(rows))]
-		switch op := rng.IntN(6); op {
+		switch rng.IntN(6) {
 		case 0, 1:
 			lease := time.Microsecond // lost at once: the reaper returns it
 			if rng.IntN(4) == 0 {
@@ -887,44 +1011,56 @@ func TestAttemptsNeverGoDown(t *testing.T) {
 					t.Fatalf("step %d: claim returned attempt %d after %d", step, c.Attempt, last[c.ID])
 				}
 				last[c.ID] = c.Attempt
-				held[c.ID] = c.Attempt
+				claims++
 			}
 		case 2:
-			if held[id] == 0 {
+			if last[id] == 0 {
 				continue
 			}
-			attempt := max(1, held[id]-rng.IntN(2)) // the current attempt, or a stale one
-			if _, _, err := q.Finish(ctx(t), id, attempt, results[rng.IntN(len(results))]); err != nil {
+			attempt := max(1, last[id]-rng.IntN(2)) // the current attempt, or a stale one
+			_, changed, err := q.Finish(ctx(t), id, attempt, results[rng.IntN(len(results))])
+			if err != nil {
 				t.Fatalf("step %d: finish: %v", step, err)
+			}
+			if changed {
+				finished++
 			}
 		case 3:
 			time.Sleep(time.Millisecond)
-			if _, err := q.Reap(ctx(t), 10); err != nil {
+			got, err := q.Reap(ctx(t), 10)
+			if err != nil {
 				t.Fatalf("step %d: reap: %v", step, err)
 			}
+			reaped += len(got)
 		case 4:
-			if _, err := q.Requeue(ctx(t), id, 2); err != nil && !errors.Is(err, store.ErrWrongStatus) {
+			if _, err := q.Requeue(ctx(t), id, 2); err == nil {
+				requeued++
+			} else if !errors.Is(err, store.ErrWrongStatus) {
 				t.Fatalf("step %d: requeue: %v", step, err)
 			}
 		case 5:
-			if rng.IntN(20) == 0 {
-				if _, err := q.Cancel(ctx(t), id); err != nil && !errors.Is(err, store.ErrWrongStatus) {
+			if rng.IntN(3) == 0 {
+				if _, err := q.Cancel(ctx(t), id); err == nil {
+					cancelled++
+				} else if !errors.Is(err, store.ErrWrongStatus) {
 					t.Fatalf("step %d: cancel: %v", step, err)
 				}
 			}
 		}
-		for _, r := range rows {
-			if s := stateOf(t, e.Pool, r); s.Attempts != last[r] {
+		for i, r := range rows {
+			s := stateOf(t, e.Pool, r)
+			if s.Attempts != last[r] {
 				t.Fatalf("step %d (op on %s): row %s has %d attempts, the claims handed out %d", step, id, r, s.Attempts, last[r])
+			}
+			if s.Status == domain.Sent || s.Status == domain.Cancelled {
+				rows[i] = fresh()
 			}
 		}
 	}
-	total := 0
-	for _, n := range last {
-		total += n
-	}
-	if total < 20 {
-		t.Errorf("only %d claims in the run; the sequence did not exercise the queue", total)
+	t.Logf("%d claims, %d results stored, %d rows reaped, %d requeued, %d cancelled", claims, finished, reaped, requeued, cancelled)
+	if claims < 50 || finished == 0 || reaped == 0 || requeued == 0 || cancelled == 0 {
+		t.Errorf("the run did not exercise every operation: %d claims, %d results, %d reaped, %d requeued, %d cancelled",
+			claims, finished, reaped, requeued, cancelled)
 	}
 }
 
@@ -1028,29 +1164,60 @@ func TestQueueWritesAreNotCutOffByACancelledCaller(t *testing.T) {
 	}
 }
 
-// §5: a queue write that cannot finish ends at its own timeout, even when its caller waits
-// forever.
+// §5: every queue write that cannot finish ends at its own timeout, even when its caller
+// waits forever.
 func TestQueueWritesHaveTheirOwnTimeout(t *testing.T) {
 	e := testkit.Setup(t)
-	q := store.NewQueue(e.Pool).WithTimeout(300 * time.Millisecond)
+	q := store.NewQueue(e.Pool)
 	addRow(t, e.Pool, waiting(-time.Second))
-	release := blockQueue(t, e.Pool)
-	defer release()
-	done := make(chan error, 1)
-	began := time.Now()
-	go func() {
-		_, err := q.Claim(context.Background(), domain.SMS, domain.High, 1, hour)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Error("a claim blocked past its timeout succeeded")
+	c := claim(t, q, domain.SMS, domain.High, 1, hour)
+	addRow(t, e.Pool, held(-time.Second, 1, 6))
+	waitingRow := addRow(t, e.Pool, waiting(time.Minute))
+	failedRow := addRow(t, e.Pool, row{status: domain.Failed, attempts: 6, maxAttempts: 6})
+
+	short := q.WithTimeout(300 * time.Millisecond)
+	ops := map[string]func() error{
+		"claim": func() error {
+			_, err := short.Claim(context.Background(), domain.SMS, domain.High, 1, hour)
+			return err
+		},
+		"finish": func() error {
+			_, _, err := short.Finish(context.Background(), c[0].ID, c[0].Attempt, sent)
+			return err
+		},
+		"reap": func() error {
+			_, err := short.Reap(context.Background(), 10)
+			return err
+		},
+		"cancel": func() error {
+			_, err := short.Cancel(context.Background(), waitingRow)
+			return err
+		},
+		"requeue": func() error {
+			_, err := short.Requeue(context.Background(), failedRow, 6)
+			return err
+		},
+	}
+	for name, op := range ops {
+		release := blockQueue(t, e.Pool)
+		done := make(chan error, 1)
+		began := time.Now()
+		go func() { done <- op() }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Errorf("%s: a write blocked past its timeout succeeded", name)
+			}
+			if took := time.Since(began); took > 3*time.Second {
+				t.Errorf("%s returned after %v, want about 300 ms", name, took)
+			}
+			release()
+		case <-time.After(3 * time.Second):
+			t.Errorf("%s: a blocked write did not end at its own timeout of 300 ms", name)
+			release()
+			if err := <-done; err != nil {
+				t.Logf("%s after the lock was released: %v", name, err)
+			}
 		}
-		if took := time.Since(began); took > 3*time.Second {
-			t.Errorf("the claim returned after %v, want about 300 ms", took)
-		}
-	case <-time.After(3 * time.Second):
-		t.Error("a blocked claim did not end at its own timeout of 300 ms")
 	}
 }
