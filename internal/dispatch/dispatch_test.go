@@ -229,13 +229,18 @@ func TestAFailedResultWriteIsRetriedAndNotSentAgain(t *testing.T) {
 			srv := testkit.Recorder(t, recorder.Options{Respond: acc.respond(nil)})
 			ids := insertRows(t, e.Pool, domain.SMS, 20, always(domain.Normal), 6)
 			q := &flakyFinish{lostAfterCommit: lost, calls: map[uuid.UUID]int{}}
-			startWorker(t, e, workerSpec{
+			w := startWorker(t, e, workerSpec{
 				channels: []domain.Channel{domain.SMS}, limit: 100, margin: 50 * time.Millisecond,
 				opts: testOptions(t), provider: providerOptions(srv, false), reaperTick: 100 * time.Millisecond,
 				wrapQueue: func(inner Queue) Queue { q.Queue = inner; return q },
 			})
 			if counts, ok := waitAllFinal(t, e.Pool, 20*time.Second); !ok || counts[domain.Sent] != len(ids) {
 				t.Fatalf("statuses %v, want all %d sent", counts, len(ids))
+			}
+			// A write whose commit was lost is still being retried when the row shows sent;
+			// stopping waits for the rows in flight, and so for their result writes.
+			if !w.stop(10 * time.Second) {
+				t.Fatal("the worker did not stop")
 			}
 			for _, id := range ids {
 				if n := acc.of(id.String()); n != 1 {

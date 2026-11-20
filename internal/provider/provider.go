@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
+	"github.com/atakanakis/InsiderOneProject/internal/observability"
 )
 
 // Bounds of what the client reads from the provider (architecture §8).
@@ -42,7 +44,7 @@ const (
 // Message is one notification as the provider receives it.
 type Message struct {
 	ID            uuid.UUID // the notification id, sent as the Idempotency-Key header
-	CorrelationID string    // sent as X-Correlation-ID when not empty
+	CorrelationID string    // sent as X-Correlation-ID when within its bound (architecture §8)
 	To            string
 	Channel       domain.Channel
 	Content       string
@@ -103,8 +105,10 @@ type Client struct {
 
 // New returns a client with its own transport.
 func New(o Options) (*Client, error) {
-	if o.URL == "" {
-		return nil, errors.New("provider: no URL")
+	// The URL is the same for every message: a URL that cannot make a request would fail
+	// every one of them, so it is refused here (architecture §6, "no response" case 3).
+	if u, err := url.Parse(o.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("provider: %q is not an absolute http or https URL", o.URL)
 	}
 	if o.SendTimeout <= 0 || o.GateBudget <= 0 || o.DialTimeout <= 0 || o.TLSHandshakeTimeout <= 0 ||
 		o.IdleConns <= 0 || o.IdleConnTimeout <= 0 {
@@ -181,7 +185,7 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 	req.GetBody = nil // the transport cannot replay the request (property 3)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", m.ID.String())
-	if m.CorrelationID != "" {
+	if observability.ValidCorrelationID(m.CorrelationID) { // within its bound, so it cannot make the request invalid
 		req.Header.Set("X-Correlation-ID", m.CorrelationID)
 	}
 
@@ -191,6 +195,7 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 		if r.Refusal != nil {
 			r.Err = fmt.Errorf("refused at the send gate: %w", r.Refusal)
 		}
+		r.ClosedIdle = r.Refusal == nil && closedIdle(err)
 		return r
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -211,6 +216,17 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 		}
 	}
 	return r
+}
+
+// serverClosedIdle is the text of Go's error for a kept-alive connection that the server
+// closed while no request was on it (net/http transport.go, errServerClosedIdle, line 1090).
+// The error is not exported; TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle
+// fails if Go changes it.
+const serverClosedIdle = "http: server closed idle connection"
+
+func closedIdle(err error) bool {
+	var ue *url.Error
+	return errors.As(err, &ue) && ue.Err != nil && ue.Err.Error() == serverClosedIdle
 }
 
 // retryAfter reads a Retry-After value in either form of RFC 9110: seconds, or an HTTP date

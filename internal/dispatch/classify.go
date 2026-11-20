@@ -1,10 +1,13 @@
 package dispatch
 
 import (
+	"errors"
+	"net/http"
 	"time"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/provider"
+	"github.com/atakanakis/InsiderOneProject/internal/ratelimit"
 )
 
 // Lesson is what the circuit breaker learns from one attempt.
@@ -34,8 +37,29 @@ type Verdict struct {
 	Outcome    string // a short name of the table row, stored with the attempt
 }
 
-// Classify decides the verdict from what one send observed (architecture §6, the verdict
-// table). It is the only place that decides.
+// Classify decides the verdict from what one send observed: the table of architecture §6,
+// read top to bottom. It is the only place that decides (CLAUDE.md, rule 6).
 func Classify(r provider.Result) Verdict {
-	return Verdict{}
+	switch {
+	case r.Responded && r.StatusCode >= 200 && r.StatusCode < 300: // a response always wins (I6)
+		return Verdict{Status: domain.Sent, Lesson: Success, Outcome: "sent"}
+	case r.Responded && rejected(r.StatusCode):
+		return Verdict{Status: domain.Failed, Lesson: Success, Outcome: "rejected"}
+	case r.Responded:
+		return Verdict{Status: domain.Retrying, Delay: Backoff, RetryAfter: r.RetryAfter, Lesson: Failure, Outcome: "error response"}
+	case r.Refusal != nil && !errors.Is(r.Refusal, ratelimit.ErrNoPermitInTime):
+		return Verdict{Status: domain.Retrying, Delay: Soon, Lesson: Failure, Outcome: "limiter error"}
+	case r.Refusal != nil:
+		return Verdict{Status: domain.Retrying, Delay: Soon, Lesson: Nothing, Outcome: "no permit in time"}
+	case r.ClosedIdle:
+		return Verdict{Status: domain.Retrying, Delay: Soon, Lesson: Nothing, Outcome: "closed idle"}
+	default:
+		return Verdict{Status: domain.Retrying, Delay: Backoff, Lesson: Failure, Outcome: "no response"}
+	}
+}
+
+// rejected reports whether the provider refused this message, not the channel: resending the
+// same message would fail the same way.
+func rejected(code int) bool {
+	return code == http.StatusBadRequest || code == http.StatusRequestEntityTooLarge || code == http.StatusUnprocessableEntity
 }
