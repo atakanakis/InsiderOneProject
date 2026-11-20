@@ -1465,7 +1465,7 @@ var guards = []Guard{
 	},
 	{
 		Name: "api: a data message from the client ends the connection", File: "internal/api/ws.go",
-		Old: "\t\t\tif data {\n", New: "\t\t\tif data && false {\n",
+		Old: "\t\t\tif data {\n\t\t\t\t// Closed at once", New: "\t\t\tif data && false {\n\t\t\t\t// Closed at once",
 		Package: "./internal/api", Test: "TestAWebSocketClientMustNotSendDataMessages",
 	},
 	{
@@ -1535,7 +1535,7 @@ var guards = []Guard{
 	},
 	{
 		Name: "api: a figure from Postgres is read once per 5 s", File: "internal/api/metrics.go",
-		Old: "if c.at.IsZero() || time.Since(c.at) >= FiguresTTL {", New: "if true {",
+		Old: "if !c.at.IsZero() && time.Since(c.at) < FiguresTTL {", New: "if false {",
 		Package: "./internal/api", Test: "TestTheMetricsEndpointIsComputedOncePerFiveSeconds",
 	},
 	{
@@ -1632,5 +1632,56 @@ var guards = []Guard{
 		Name: "api: a failed readiness check is logged sparsely", File: "internal/api/health.go",
 		Old: "failures[name].Log(r.Context(), log, slog.LevelWarn, \"readiness check failed\", \"dependency\", name, \"error\", err)", New: "log.WarnContext(r.Context(), \"readiness check failed\", \"dependency\", name, \"error\", err)",
 		Package: "./internal/api", Test: "TestAFailingReadinessCheckIsLoggedSparsely",
+	},
+	// Session 7's review.
+	{
+		Name: "alertcheck: up is checked against the jobs of the configuration", File: "tools/alertcheck/main.go",
+		Old: "\tfor _, j := range jobs {\n\t\te.add(\"up\", \"job\", j)\n\t}", New: "\t_ = jobs",
+		Package: "./tools/alertcheck", Test: "TestTheCheckRefusesWhatNoBinaryExports",
+	},
+	{
+		Name: "alertcheck: the jobs are read from prometheus.yml", File: "tools/alertcheck/main.go",
+		Old: "\t\tjobs = append(jobs, sc.JobName)", New: "\t\t_ = sc",
+		Package: "./tools/alertcheck", Test: "TestEveryAlertRuleUsesMetricsTheBinariesExport",
+	},
+	{
+		Name: "api: a failed figure read is kept for 5 s (review F3)", File: "internal/api/metrics.go",
+		Old: "c.value, c.err, c.at, c.reading = v, err, time.Now(), nil", New: "c.value, c.err, c.reading = v, err, nil",
+		Package: "./internal/api", Test: "TestAFailingFigureReadIsSharedKeptAndLeftByItsCallers",
+	},
+	{
+		Name: "api: a figure read is shared by its callers (review F3)", File: "internal/api/metrics.go",
+		Old: "\tif c.reading == nil {", New: "\tif true {",
+		Package: "./internal/api", Test: "TestAFailingFigureReadIsSharedKeptAndLeftByItsCallers",
+	},
+	{
+		Name: "api: a caller stops waiting for a figure at its deadline (review F3)", File: "internal/api/metrics.go",
+		Old: "\tcase <-ctx.Done():\n\t\tvar zero T\n\t\treturn zero, ctx.Err()", New: "\tcase <-make(chan struct{}):\n\t\tvar zero T\n\t\treturn zero, ctx.Err()",
+		Package: "./internal/api", Test: "TestAFailingFigureReadIsSharedKeptAndLeftByItsCallers",
+	},
+	{
+		Name: "api: a request has a line at info (review F4)", File: "internal/api/health.go",
+		Old: "log.InfoContext(ctx, \"request\", \"method\"", New: "log.DebugContext(ctx, \"request\", \"method\"",
+		Package: "./internal/systemtest", Test: "TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider",
+	},
+	{
+		Name: "dispatch: every attempt has a line at info, a delivery included (review F4)", File: "internal/dispatch/dispatch.go",
+		Old: "log.InfoContext(ctx, \"attempt finished\",", New: "log.DebugContext(ctx, \"attempt finished\",",
+		Package: "./internal/systemtest", Test: "TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider",
+	},
+	{
+		Name: "api: an upgrade has exactly one key (review F6)", File: "internal/api/ws.go",
+		Old: "if len(keys) != 1 || !r.ProtoAtLeast(1, 1) {", New: "if len(keys) == 0 || !r.ProtoAtLeast(1, 1) {",
+		Package: "./internal/api", Test: "TestAnUpgradeTheLibraryWouldRefuseIsRefusedFirst",
+	},
+	{
+		Name: "api: an upgrade is HTTP/1.1 or later (review F6)", File: "internal/api/ws.go",
+		Old: "if len(keys) != 1 || !r.ProtoAtLeast(1, 1) {", New: "if len(keys) != 1 {",
+		Package: "./internal/api", Test: "TestAnUpgradeTheLibraryWouldRefuseIsRefusedFirst",
+	},
+	{
+		Name: "api: a client that hung up under a ping is the client's (review F8)", File: "internal/api/ws.go",
+		Old: "\t\t\tcase data := <-read:\n\t\t\t\tif data {\n\t\t\t\t\treturn \"data_message\"\n\t\t\t\t}\n\t\t\t\treturn \"client\"\n\t\t\tdefault:\n\t\t\t}", New: "\t\t\tdefault:\n\t\t\t}",
+		Package: "./internal/api", Test: "TestAClientThatHangsUpIsCountedAsTheClients",
 	},
 }
