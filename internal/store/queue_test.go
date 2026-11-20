@@ -979,7 +979,8 @@ func TestRequeueRaisesMaxAttemptsByTheBudget(t *testing.T) {
 	}
 }
 
-// I7: attempts only goes up. A random sequence of all five operations on six rows: each
+// I7: attempts only goes up. A random sequence of all five operations on six rows (at least
+// 600 steps, more until every operation has taken effect): each
 // claim returns the previous count plus one, and nothing else changes the count. A row that
 // becomes final (sent or cancelled) is replaced by a new one, so the queue stays busy for
 // the whole run. The seed changes on every run and is logged.
@@ -998,7 +999,11 @@ func TestAttemptsNeverGoDown(t *testing.T) {
 	results := []store.Result{sent, {Status: domain.Failed, Outcome: "rejected", StatusCode: 400}, retry, retry, retry, retry}
 	last := map[uuid.UUID]int{} // the attempt number each row's last claim handed out
 	var claims, finished, reaped, requeued, cancelled int
-	for step := range 600 {
+	// At least 600 steps, and on until every operation has taken effect: a cancel takes
+	// effect on about one step in 30, so 600 steps alone missed it in 2 of 30 runs (found in
+	// session 6). The check below still fails a run that never reaches one.
+	everyOperation := func() bool { return claims >= 50 && finished > 0 && reaped > 0 && requeued > 0 && cancelled > 0 }
+	for step := 0; step < 600 || (!everyOperation() && step < 3000); step++ {
 		id := rows[rng.IntN(len(rows))]
 		switch rng.IntN(6) {
 		case 0, 1:
@@ -1058,7 +1063,7 @@ func TestAttemptsNeverGoDown(t *testing.T) {
 		}
 	}
 	t.Logf("%d claims, %d results stored, %d rows reaped, %d requeued, %d cancelled", claims, finished, reaped, requeued, cancelled)
-	if claims < 50 || finished == 0 || reaped == 0 || requeued == 0 || cancelled == 0 {
+	if !everyOperation() {
 		t.Errorf("the run did not exercise every operation: %d claims, %d results, %d reaped, %d requeued, %d cancelled",
 			claims, finished, reaped, requeued, cancelled)
 	}
