@@ -1,0 +1,631 @@
+openapi: 3.1.0
+info:
+  title: Notification service
+  version: "1.0"
+  summary: Create, schedule, track, cancel and retry SMS, email and push notifications.
+  description: |
+    The API of the event-driven notification service (docs/architecture.md, section 8).
+
+    - Bodies and answers are JSON; times are RFC 3339 in UTC. Optional fields are left out
+      when empty.
+    - Every input and output has a bound, stated in the schemas below.
+    - When the server has API keys configured, every `/v1` request needs one, as
+      `Authorization: Bearer <key>` or `X-API-Key: <key>`. The health endpoints and the
+      documentation stay open.
+    - Every path, method and status code of this document is produced by the real server in
+      a test, and every route of the server is in it (TestOpenAPIMatchesTheServer).
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+  - apiKeyHeader: []
+
+paths:
+  /v1/notifications:
+    post:
+      operationId: createNotification
+      summary: Create one notification
+      description: |
+        `content`, or `template` with `variables`. A `scheduledAt` in the future creates the
+        notification `scheduled`; otherwise it is `pending`, due now. A repeated
+        `idempotencyKey` with the same request answers 200 with the first notification; with
+        another request, 409.
+      requestBody:
+        required: true
+        description: At most 1 MiB.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateNotification" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Notification" }
+        "200":
+          description: A repeat of an earlier request with the same idempotency key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Notification" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        "413": { $ref: "#/components/responses/BodyTooLarge" }
+    get:
+      operationId: listNotifications
+      summary: List notifications, newest first
+      description: |
+        Summaries without `content`, ordered by `createdAt` descending, then `id`.
+        `nextCursor` is present only when the page is full.
+      parameters:
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/Status" } }
+        - { name: channel, in: query, schema: { $ref: "#/components/schemas/Channel" } }
+        - { name: batchId, in: query, schema: { type: string, format: uuid } }
+        - name: createdFrom
+          in: query
+          description: Inclusive.
+          schema: { type: string, format: date-time }
+        - name: createdTo
+          in: query
+          description: Exclusive.
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 100
+                    items: { $ref: "#/components/schemas/NotificationSummary" }
+                  nextCursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/notifications/batch:
+    post:
+      operationId: createBatch
+      summary: Create up to 1000 notifications at once
+      description: |
+        Every item is validated before any is stored. Item `i` gets the id
+        `UUIDv5(batchId, i)`. A repeat with the same `Idempotency-Key` and the same request
+        answers 200 with the same batch and the same ids; with another request, 409.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema: { $ref: "#/components/schemas/IdempotencyKey" }
+      requestBody:
+        required: true
+        description: At most 8 MiB.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [notifications]
+              additionalProperties: false
+              properties:
+                notifications:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items: { $ref: "#/components/schemas/BatchItem" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchCreated" }
+        "200":
+          description: A repeat of an earlier batch with the same Idempotency-Key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchCreated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        "413": { $ref: "#/components/responses/BodyTooLarge" }
+
+  /v1/notifications/{id}:
+    get:
+      operationId: getNotification
+      summary: One notification with its attempt history
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: The notification.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Notification" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/notifications/{id}/cancel:
+    post:
+      operationId: cancelNotification
+      summary: Cancel a notification before it is sent
+      description: Allowed from `scheduled`, `pending` and `retrying`.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusChange" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/WrongStatus" }
+
+  /v1/notifications/{id}/retry:
+    post:
+      operationId: retryNotification
+      summary: Queue a failed notification again
+      description: Allowed from `failed` only. The notification gets a new attempt budget.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Queued again.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusChange" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/WrongStatus" }
+
+  /v1/batches/{id}:
+    get:
+      operationId: getBatch
+      summary: A batch with a count of its notifications per status
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: The batch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchSummary" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/templates:
+    post:
+      operationId: createTemplate
+      summary: Create a template
+      description: |
+        A template is never changed. The same name with the same channel and body answers
+        200; with anything else, 409.
+      requestBody:
+        required: true
+        description: At most 1 MiB.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTemplate" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+        "200":
+          description: The same template exists already.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: A template with this name and another channel or body exists (`template_exists`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413": { $ref: "#/components/responses/BodyTooLarge" }
+    get:
+      operationId: listTemplates
+      summary: List templates in name order, without bodies
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of at most 100 templates.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 100
+                    items: { $ref: "#/components/schemas/TemplateSummary" }
+                  nextCursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/templates/{name}:
+    get:
+      operationId: getTemplate
+      summary: One template with its body
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { $ref: "#/components/schemas/TemplateName" }
+      responses:
+        "200":
+          description: The template.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /healthz:
+    get:
+      operationId: healthz
+      summary: Liveness
+      security: []
+      responses:
+        "200":
+          description: The process answers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ok }
+
+  /readyz:
+    get:
+      operationId: readyz
+      summary: Readiness
+      description: |
+        Postgres decides: it must answer a ping within 2 s. Redis is pinged and reported,
+        but an unreachable Redis does not make the API unready.
+      security: []
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+        "503":
+          description: Postgres does not answer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+
+  /openapi.yaml:
+    get:
+      operationId: openapi
+      summary: This document
+      security: []
+      responses:
+        "200":
+          description: The OpenAPI document.
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /docs:
+    get:
+      operationId: docs
+      summary: A viewer for this document
+      security: []
+      responses:
+        "200":
+          description: An HTML page.
+          content:
+            text/html:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "`Authorization: Bearer <key>`, one of the keys in API_KEYS."
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: One of the keys in API_KEYS.
+
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      description: A UUID; anything else is a 400.
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      description: The `nextCursor` of the previous page. Opaque.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: The request is not JSON (`invalid_json`), or a field is not valid (`validation_failed`), or the id is not a UUID.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: API keys are configured and the request has none of them (`unauthorized`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such resource (`not_found`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyConflict:
+      description: The idempotency key was used for another request (`idempotency_conflict`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    WrongStatus:
+      description: The notification is not in a status that allows this (`wrong_status`); `error.status` is the status found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BodyTooLarge:
+      description: The body is over its bound (`body_too_large`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Channel:
+      type: string
+      enum: [sms, email, push]
+    Priority:
+      type: string
+      enum: [high, normal, low]
+    Status:
+      type: string
+      enum: [scheduled, pending, processing, retrying, sent, failed, cancelled]
+    IdempotencyKey:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[\x20-\x7E]+$'
+      description: 1 to 128 printable ASCII characters.
+    TemplateName:
+      type: string
+      minLength: 1
+      maxLength: 64
+    Recipient:
+      type: string
+      minLength: 1
+      maxLength: 256
+      description: |
+        Per channel: `sms` an E.164 phone number; `email` an address of at most 254 bytes;
+        `push` a device token of 16 to 256 characters of letters, digits, `_`, `-`, `:` and `.`.
+    Content:
+      type: string
+      minLength: 1
+      maxLength: 100000
+      description: |
+        In characters, after rendering: `sms` 1600, `push` 4096, `email` 100,000. Must not
+        contain NUL.
+    Variables:
+      type: object
+      maxProperties: 50
+      propertyNames:
+        pattern: '^[A-Za-z_][A-Za-z0-9_]{0,63}$'
+      additionalProperties: { type: string }
+      description: Every variable the template uses, and no other. Values must not contain NUL.
+
+    BatchItem:
+      type: object
+      required: [recipient, channel]
+      additionalProperties: false
+      description: Either `content`, or `template` with `variables`.
+      properties:
+        recipient: { $ref: "#/components/schemas/Recipient" }
+        channel: { $ref: "#/components/schemas/Channel" }
+        content: { $ref: "#/components/schemas/Content" }
+        template: { $ref: "#/components/schemas/TemplateName" }
+        variables: { $ref: "#/components/schemas/Variables" }
+        priority: { $ref: "#/components/schemas/Priority", default: normal }
+        scheduledAt: { type: string, format: date-time }
+    CreateNotification:
+      type: object
+      required: [recipient, channel]
+      additionalProperties: false
+      description: Either `content`, or `template` with `variables`.
+      properties:
+        recipient: { $ref: "#/components/schemas/Recipient" }
+        channel: { $ref: "#/components/schemas/Channel" }
+        content: { $ref: "#/components/schemas/Content" }
+        template: { $ref: "#/components/schemas/TemplateName" }
+        variables: { $ref: "#/components/schemas/Variables" }
+        priority: { $ref: "#/components/schemas/Priority", default: normal }
+        scheduledAt: { type: string, format: date-time }
+        idempotencyKey: { $ref: "#/components/schemas/IdempotencyKey" }
+
+    Attempt:
+      type: object
+      required: [number, startedAt, durationMs, outcome]
+      properties:
+        number: { type: integer, minimum: 1 }
+        startedAt: { type: string, format: date-time }
+        durationMs: { type: integer, minimum: 0 }
+        statusCode:
+          type: integer
+          description: Absent when no response arrived.
+        outcome: { type: string, maxLength: 1024 }
+        error: { type: string, maxLength: 1024 }
+    Notification:
+      type: object
+      required: [id, recipient, channel, content, priority, status, attempts, maxAttempts,
+                 readyAt, createdAt, updatedAt, correlationId, attemptHistory,
+                 attemptHistoryTotal]
+      properties:
+        id: { type: string, format: uuid }
+        batchId: { type: string, format: uuid }
+        recipient: { type: string }
+        channel: { $ref: "#/components/schemas/Channel" }
+        content: { type: string }
+        priority: { $ref: "#/components/schemas/Priority" }
+        status: { $ref: "#/components/schemas/Status" }
+        attempts: { type: integer, minimum: 0 }
+        maxAttempts: { type: integer, minimum: 1 }
+        readyAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        sentAt: { type: string, format: date-time }
+        lastError: { type: string, maxLength: 1024 }
+        providerMessageId: { type: string, maxLength: 256 }
+        correlationId: { type: string, maxLength: 64 }
+        attemptHistory:
+          type: array
+          maxItems: 100
+          description: The last 100 attempts, oldest first.
+          items: { $ref: "#/components/schemas/Attempt" }
+        attemptHistoryTotal:
+          type: integer
+          minimum: 0
+          description: The number of attempts recorded, also those not in `attemptHistory`.
+    NotificationSummary:
+      type: object
+      required: [id, recipient, channel, priority, status, attempts, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        batchId: { type: string, format: uuid }
+        recipient: { type: string }
+        channel: { $ref: "#/components/schemas/Channel" }
+        priority: { $ref: "#/components/schemas/Priority" }
+        status: { $ref: "#/components/schemas/Status" }
+        attempts: { type: integer, minimum: 0 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    StatusChange:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/Status" }
+
+    BatchCreated:
+      type: object
+      required: [batchId, total, ids]
+      properties:
+        batchId: { type: string, format: uuid }
+        total: { type: integer, minimum: 1, maximum: 1000 }
+        ids:
+          type: array
+          maxItems: 1000
+          description: The ids in the order of the items.
+          items: { type: string, format: uuid }
+    BatchSummary:
+      type: object
+      required: [id, total, createdAt, counts]
+      properties:
+        id: { type: string, format: uuid }
+        total: { type: integer, minimum: 0, maximum: 1000 }
+        createdAt: { type: string, format: date-time }
+        counts:
+          type: object
+          required: [scheduled, pending, processing, retrying, sent, failed, cancelled]
+          additionalProperties: false
+          properties:
+            scheduled: { type: integer, minimum: 0 }
+            pending: { type: integer, minimum: 0 }
+            processing: { type: integer, minimum: 0 }
+            retrying: { type: integer, minimum: 0 }
+            sent: { type: integer, minimum: 0 }
+            failed: { type: integer, minimum: 0 }
+            cancelled: { type: integer, minimum: 0 }
+
+    CreateTemplate:
+      type: object
+      required: [name, channel, body]
+      additionalProperties: false
+      properties:
+        name: { $ref: "#/components/schemas/TemplateName" }
+        channel: { $ref: "#/components/schemas/Channel" }
+        body:
+          type: string
+          minLength: 1
+          maxLength: 100000
+          description: |
+            `{{.name}}` placeholders, at most 50 distinct variables; any other `{{` is refused.
+            Bounded like content of its channel.
+    Template:
+      type: object
+      required: [name, channel, body, variables, createdAt]
+      properties:
+        name: { $ref: "#/components/schemas/TemplateName" }
+        channel: { $ref: "#/components/schemas/Channel" }
+        body: { type: string }
+        variables:
+          type: array
+          maxItems: 50
+          description: The names of the variables the body uses.
+          items: { type: string, maxLength: 64 }
+        createdAt: { type: string, format: date-time }
+    TemplateSummary:
+      type: object
+      required: [name, channel, createdAt]
+      properties:
+        name: { $ref: "#/components/schemas/TemplateName" }
+        channel: { $ref: "#/components/schemas/Channel" }
+        createdAt: { type: string, format: date-time }
+
+    Readiness:
+      type: object
+      required: [status, postgres, redis]
+      properties:
+        status: { type: string, enum: [ready, unavailable] }
+        postgres: { type: string, enum: [ok, unreachable] }
+        redis: { type: string, enum: [ok, unreachable] }
+
+    Error:
+      type: object
+      required: [error]
+      description: |
+        The one form of every error from `/v1`. A message never quotes a value from the
+        request. The whole body is at most 64 KiB.
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_json, validation_failed, body_too_large, not_found,
+                     idempotency_conflict, wrong_status, template_exists, unauthorized]
+            message: { type: string, maxLength: 300 }
+            fields:
+              type: array
+              maxItems: 100
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field: { type: string, maxLength: 300 }
+                  message: { type: string, maxLength: 300 }
+            moreFields:
+              type: integer
+              minimum: 1
+              description: The number of field errors not listed in `fields`.
+            status:
+              $ref: "#/components/schemas/Status"
+              description: For `wrong_status`, the status found.

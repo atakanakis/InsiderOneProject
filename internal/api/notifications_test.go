@@ -462,7 +462,9 @@ func TestTheRenderedTotalOfARequestIsBounded(t *testing.T) {
 func TestARequestOverTheRenderedTotalIsRefusedBeforeRendering(t *testing.T) {
 	a := newAPI(t)
 	createTemplate(t, a, "amp", "email", strings.Repeat("{{.v}}", 16_000))
-	body := items(1000, func(int) map[string]any { return fromTemplate("amp", map[string]string{"v": strings.Repeat("😀", 6)}) })
+	body := items(1000, func(int) map[string]any {
+		return fromTemplate("amp", map[string]string{"v": strings.Repeat("😀", 6)})
+	})
 	var r reply
 	alloc := allocated(func() { r = a.post(t, "/v1/notifications/batch", body) })
 	if r.code != http.StatusBadRequest {
@@ -555,10 +557,14 @@ func TestErrorBodiesStayWithinTheirBoundForAnyRequest(t *testing.T) {
 		"invalid JSON after a long string": func() reply {
 			return a.do(t, http.MethodPost, "/v1/notifications", []byte(`{"content":"`+strings.Repeat("Q", 500_000)+`"`))
 		},
-		"a long template name":    func() reply { return a.post(t, "/v1/templates", map[string]any{"name": long, "channel": long, "body": long}) },
-		"a long list filter":      func() reply { return a.get(t, "/v1/notifications?status="+long+"&cursor="+long+"&channel="+long) },
-		"a long template cursor":  func() reply { return a.get(t, "/v1/templates?cursor="+long) },
-		"a long idempotency key":  func() reply { return a.post(t, "/v1/notifications/batch", items(1, func(int) map[string]any { return sms("x") }), "Idempotency-Key", long) },
+		"a long template name": func() reply {
+			return a.post(t, "/v1/templates", map[string]any{"name": long, "channel": long, "body": long})
+		},
+		"a long list filter":     func() reply { return a.get(t, "/v1/notifications?status="+long+"&cursor="+long+"&channel="+long) },
+		"a long template cursor": func() reply { return a.get(t, "/v1/templates?cursor="+long) },
+		"a long idempotency key": func() reply {
+			return a.post(t, "/v1/notifications/batch", items(1, func(int) map[string]any { return sms("x") }), "Idempotency-Key", long)
+		},
 		"a long template to read": func() reply { return a.get(t, "/v1/templates/"+long) },
 	}
 	for name, run := range cases {
