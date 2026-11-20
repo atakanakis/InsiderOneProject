@@ -25,9 +25,13 @@ func productionProvider(srv *recorder.Server) provider.Options {
 // stamps decide. A4 is measured on the same requests: the time from each permit to the
 // request's arrival at the provider.
 //
-// As in session 4's I1 test, the guarantee holds while every request arrives within the
-// margin of its permit; the test always checks the peak against the limit plus the requests
-// that arrived later than the margin, and, without the race detector, against the limit.
+// The guarantee holds while every request arrives within the margin of its permit (A4). Under
+// the race detector A4 does not hold, and the lateness cannot be measured either: the permit
+// is stamped when Wait returns on a worker that is itself starved, so a request can be late
+// by its grant and on time by its stamp. CI run 44750111098 saw a peak of 47 with a limit of
+// 40 and only 6 requests counted late, in the fault test. So the peak is checked against the
+// limit without the race detector (make guards and CI's measurement step run it so), and
+// only logged with it.
 func TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers(t *testing.T) {
 	const limit, margin, perChannel, workers = 100, 50 * time.Millisecond, 400, 3
 	e := testkit.Setup(t)
@@ -55,7 +59,7 @@ func TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers(t *testing.T) {
 		t.Logf("%s: peak %d within one second; permit to arrival over %d requests: median %v, p99 %v, max %v; %d later than %v",
 			ch, peak, len(d), percentile(d, 50).Round(10*time.Microsecond), percentile(d, 99).Round(10*time.Microsecond),
 			percentile(d, 100).Round(10*time.Microsecond), late, margin)
-		if peak > limit+late || (peak > limit && !raceDetector) {
+		if peak > limit && !raceDetector {
 			t.Errorf("I1: the provider received %d %s requests within one second; limit %d, %d late", peak, ch, limit, late)
 		}
 	}

@@ -38,10 +38,10 @@ jobs:
         run: make test
       - name: Every test named in docs/ exists
         run: make check-docs
-      - name: I1, A4 and A5 through the dispatchers, without the race detector
+      - name: I1, A4 and A5 through the dispatchers, and the fault test, without the race detector
         # The race detector slows the client and the recording server on the same CPUs
         # (architecture §12, A4); these measurements are of the program as it ships.
-        run: A5_FULL=1 go test -count=1 -v -run 'TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers|TestGateWaitAndThroughputWithManyDispatchers' ./internal/dispatch
+        run: A5_FULL=1 go test -count=1 -v -run 'TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers|TestGateWaitAndThroughputWithManyDispatchers|TestInvariantsHoldUnderRandomFaults' ./internal/dispatch
 
   guards:
     # Each guard is disabled in turn; its named test must fail (CLAUDE.md, rule 13).

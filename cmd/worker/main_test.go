@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"os/exec"
@@ -108,20 +107,13 @@ func TestWorkerBinaryExitsZeroOnSIGTERM(t *testing.T) {
 	}
 	cmd := exec.Command(bin)
 	cmd.Env = []string{"DATABASE_URL=" + e.DatabaseURL, "REDIS_URL=" + e.RedisURL}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// A writer, not StdoutPipe: Wait closes a pipe as soon as the process exits, and the last
+	// lines could be lost (CI run 44750111098); with a writer, Wait returns after the copy.
+	var out syncBuffer
+	cmd.Stdout = &out
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	var out syncBuffer
-	go func() {
-		sc := bufio.NewScanner(stdout)
-		for sc.Scan() {
-			_, _ = out.Write(append(sc.Bytes(), '\n'))
-		}
-	}()
 	waitFor(t, &out, "worker started")
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)

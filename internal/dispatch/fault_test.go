@@ -5,8 +5,9 @@ package dispatch
 // workers, and then checks the invariants that must hold whatever happened:
 //
 //   - I1: the provider never received more than the limit of one channel within one second,
-//     by its own arrival stamps (within the limits of architecture §7: a request that
-//     arrived more than the margin after its permit may add one);
+//     by its own arrival stamps. It holds while every request arrives within the margin of
+//     its permit (A4), so it is checked without the race detector only; with it, the peak
+//     and the late requests are logged;
 //   - I5: every notification ended as sent, failed or cancelled;
 //   - no notification was accepted by the provider twice, and every sent notification was
 //     accepted; within the limits of architecture §6, "at-least-once": a notification may be
@@ -242,7 +243,7 @@ func runScenario(t *testing.T, sc scenario) {
 		peak, late = max(peak, p), late+l
 		t.Logf("%s: peak %d within one second; %d requests arrived later than %v after their permit, the latest %v",
 			ch, p, l, margin, worst.Round(time.Millisecond))
-		if p > limit+l || (p > limit && !raceDetector) {
+		if p > limit && !raceDetector { // why not under -race: TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers
 			t.Errorf("I1: the provider received %d %s requests within one second; limit %d, late requests %d (%s)", p, ch, limit, l, sc)
 		}
 	}
