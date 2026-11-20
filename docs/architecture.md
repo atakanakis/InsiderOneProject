@@ -489,9 +489,11 @@ times at which they were granted, in microseconds.
   returns the time until the oldest permit leaves the window, and `Wait` sleeps that long, or
   until its context ends, and asks again. A permit granted at Redis time `t` counts for every
   `now < t + window`, so any `limit + 1` permits span at least one window, and no half-open
-  window `[a, a + 1 s + margin)` holds more than the limit.
+  window `[a, a + 1 s + margin)` holds more than the limit (TestNoWindowHoldsMoreThanTheLimit,
+  TestWaitReturnsWhenTheOldestPermitLeavesTheWindow, TestAPermitCountsForOneSecondPlusTheMargin).
 - **Go passes no time to Redis.** The script is given the limit, the window as a duration and
-  the token; the clock is Redis's (I12). Workers' clocks do not matter.
+  the token; the clock is Redis's (I12). Workers' clocks do not matter
+  (TestTheLimiterSendsRedisNoClockTime, TestPermitsAreStampedWithTheRedisClock).
 - **Microseconds, not milliseconds.** The first version stamped permits in milliseconds; the
   truncation let two permits that were one window apart in milliseconds be up to 1 ms less
   than a window apart in real time. Lua formats numbers with 14 significant digits, so the
@@ -502,14 +504,17 @@ times at which they were granted, in microseconds.
   changes nothing, and it keeps working when only the take script fails: on a read-only
   replica after a failover, and when Redis is out of memory (the take script is declared
   `#!lua` without `allow-oom`, so Redis refuses it before it runs). This is the half-failure
-  that the breaker must see (section 6): `Available` says there is room, `Wait` refuses.
+  that the breaker must see (section 6): `Available` says there is room, `Wait` refuses
+  (TestAvailableChangesNothing, TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails).
 - **Errors are never permits.** A Redis error, a script error or a malformed reply makes
-  `Wait` return an error. When the context ends while `Wait` sleeps, it returns the context's
-  error and has taken nothing. When the context ends during the script call, Redis may have
-  granted a permit whose reply never arrived; it counts against the limit and nothing is sent
-  on it. That costs at most one permit per cut-off call and never adds a request.
+  `Wait` return an error (TestAnUnreachableRedisIsAnErrorNotAPermit). When the context ends
+  while `Wait` sleeps, it returns the context's error and has taken nothing
+  (TestWaitStopsWhenItsContextEnds, TestWaitWithAnEndedContextTakesNoPermit). When the context
+  ends during the script call, Redis may have granted a permit whose reply never arrived; it
+  counts against the limit and nothing is sent on it. That costs throughput, never a request.
 - **The bound.** The set of a channel holds at most `limit` members, because a refused call
-  adds nothing, and the key expires one window after the last permit.
+  adds nothing, and the key expires one window after the last permit
+  (TestTheWindowHoldsAtMostTheLimitAndExpires).
 - **No permit is given back** (CLAUDE.md, rule 4). The first version's `Refund`, and its
   batch `Take`, are not carried over.
 
@@ -631,7 +636,7 @@ the session that builds the part.
 
 | # | Invariant | Enforced in | Tests so far |
 |---|---|---|---|
-| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | |
+| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | The limiter's part (A6): TestNoWindowHoldsMoreThanTheLimit, TestAPermitIsRefusedAtTheLimit, TestChannelsHaveSeparateWindows. At the provider's side: sessions 4 and 5. |
 | I2 | A row is never claimed by a second worker while its lease is valid | The row lock and the status filter in Claim; `SKIP LOCKED` so that claims do not wait | TestConcurrentClaimsNeverTakeTheSameRow (32 claimers, 2,000 rows), TestClaimTakesExactlyTheClaimableStatuses, TestClaimSkipsRowsLockedByAnotherTransaction |
 | I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish | The database part: TestAnAttemptNumberIsRecordedOnce. The `WHERE` of Finish: TestFinishFromAStaleAttemptChangesNothing, TestFinishOnARowThatIsNoLongerProcessingChangesNothing, TestRepeatedFinishAddsNoSecondAttemptRow |
 | I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | Reap: TestReapReturnsExpiredRowsToPendingOrFailed, TestTwoReapersAtOnceReturnEachRowOnce, TestReapSkipsRowsLockedByAnotherTransaction. The single exit: session 5. |
@@ -642,7 +647,7 @@ the session that builds the part.
 | I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule | The queue's part: TestClaimsInPriorityTurnTakeHigherPrioritiesFirst, TestClaimTakesOnlyItsChannelAndPriority. The loop: session 5. |
 | I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash | The database part: TestIdempotencyKeysAreUniqueInTheDatabase. The request hash: session 6. |
 | I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8 | Request headers and the correlation id (section 8). The rest: session 6. |
-| I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script | Queue: TestClaimSetsTheLeaseOnTheDatabaseClock, TestFinishStoresEachResultOnTheDatabaseClock. Redis: session 3. |
+| I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script | Queue: TestClaimSetsTheLeaseOnTheDatabaseClock, TestFinishStoresEachResultOnTheDatabaseClock. Redis: TestTheLimiterSendsRedisNoClockTime, TestPermitsAreStampedWithTheRedisClock. |
 
 Tests of I1, I4, I5 and I8 observe the system **from the provider's side**: a recording HTTP
 server stamps each request at the moment it arrives. They run through the real provider
@@ -657,7 +662,7 @@ client. The test kit does not contain a fake provider that could skip the send g
 | A3 | The claim reads the index in order with no sort and no full scan, under a custom plan and under a generic plan, also with many tied `ready_at` values and many rows that are not due yet | **Measured** by the second design reviewer on the final query: 2.8 million rows, 1 million of them future high-priority rows; 0.15 to 0.59 ms under both plans; a claim that finds nothing due reads 3 index pages. **Permanent test** (session 2): TestClaimPlanReadsTheIndexInOrder, on 300,000 rows (50,000 due with one `ready_at`, 200,000 not due, 50,000 finished). Under both plans: one ordered index scan, no sort, no sequential or bitmap scan of the claim index; a claim of 10 reads 4 index pages in 0.13 to 0.31 ms, a claim that finds nothing reads 3 pages in 0.03 ms (`go test -count=1 -v -run TestClaimPlanReadsTheIndexInOrder ./internal/store`). With the rejected `IN (SELECT ...)` form the generic plan is a sequential scan with a hash join, 32.5 ms (the same test, mutation applied by `make guards`). |
 | A4 | The time from permit to arrival at the provider varies by less than the 50 ms margin, on new and on reused connections | To measure in sessions 4 and 5 at the recording server |
 | A5 | With the claim batch rule, the wait at the gate stays near one window plus `10 × W / 100` seconds and nothing is refused, for up to 12 workers; throughput stays near the top speed | Simulated in the design review (93 to 96 sends per second, no refusals, worst wait 2.04 s at 12 workers). To measure on the real system in session 5. |
-| A6 | The sliding-window script grants at most the limit per window under concurrent callers | Carried over from the first version, where it held in 203 randomised fault scenarios. Re-proven in session 3. |
+| A6 | The sliding-window script grants at most the limit per window under concurrent callers | **Permanent test** (session 3): TestNoWindowHoldsMoreThanTheLimit. 200 callers on 4 Redis clients, half waiting in `Wait`, half asking once at random moments, limit 100, margin 50 ms, for 3.3 s: 400 permits, at most 100 in any window of 1,050,000 µs on the permits' own Redis times (`go test -count=1 -v -run TestNoWindowHoldsMoreThanTheLimit ./internal/ratelimit`). With the window's lower bound moved 2 ms early, it fails in 3 of 3 runs. |
 
 ## 13. Timing budget
 
