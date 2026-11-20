@@ -13,8 +13,8 @@ early parts were lost by the time later parts were built.
 | 0 | Lessons, architecture, design review, this plan | **done** (2026-11-20) |
 | 1 | Skeleton: module, config, migrations, Compose, CI, health | **done** (2026-11-20, [record](sessions/01-skeleton.md)) |
 | 2 | Queue: the five operations | **done** (2026-11-20, [record](sessions/02-queue.md)) |
-| 3 | Rate limiter | next |
-| 4 | Provider client and the send gate | |
+| 3 | Rate limiter | **done** (2026-11-20, [record](sessions/03-ratelimit.md)) |
+| 4 | Provider client and the send gate | next |
 | 5 | Dispatcher, breaker, reaper; fault tests | |
 | 6 | API: notifications, batches, templates, idempotency | |
 | 7 | Events, WebSocket, metrics, tracing, alerts | |

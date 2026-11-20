@@ -145,7 +145,27 @@ The five queue operations on Postgres: claim, finish, reap, cancel, requeue. Rec
 - **The guard check got faster.** Postgres and Redis now start once per `make guards` run, not
   twice per guard; a database guard takes about 3.5 s instead of 10 s.
 
-### Session 3 and later
+### Session 3: rate limiter (2026-11-20)
+
+The shared limit of 100 per second per channel, as a sliding window in Redis: `Available` and
+`Wait`. Record: [sessions/03-ratelimit.md](sessions/03-ratelimit.md).
+
+- **The design was checked before it was written down.** Each claim the new §7 makes about
+  Redis (a read-only replica, a full memory, a write inside a read-only script, how Lua prints
+  a large number) was tried on the real Redis image first. One of them, Lua printing a
+  microsecond time with 14 digits, decided how the scripts format numbers.
+- **A guard check found a test that could not fail.** Every caller in the concurrency test
+  waited for the limiter's own "come back in N ms" hint, so a bug that freed permits 100 ms
+  early went unseen: nobody asked during those 100 ms. Real sends arrive at any moment. With
+  half the callers arriving at random, the test catches a window that is 2 ms short.
+- **The review found problems in how later sessions will use the limiter**, not in the
+  limit itself. "No permit in time" and "Redis hangs" looked the same to a caller, though the
+  design treats them differently; workers with different settings could break the limit
+  together; and waiters are served in no order, so a figure in the design ("about 35
+  workers") was optimistic. The first two are fixed in code with tests and guards; the third
+  is now an assumption that session 5 measures, instead of a claim.
+
+### Session 4 and later
 
 Recorded here as each session finishes.
 

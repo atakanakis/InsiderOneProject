@@ -6,17 +6,18 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 
 > **Status: build in progress.** The skeleton runs: the stack starts, the API answers its
 > health endpoints, the worker starts and stops, and the mock provider records what it
-> receives. The queue's five operations exist and are tested on Postgres; nothing is
-> delivered yet, because the dispatcher that uses them comes in session 5. This README says only what exists; the table
-> below is updated at the end of every session.
+> receives. The queue's five operations exist and are tested on Postgres, and the rate
+> limiter exists and is tested on Redis; nothing is delivered yet, because the provider
+> client and the dispatcher that use them come in sessions 4 and 5. This README says only
+> what exists; the table below is updated at the end of every session.
 
 | # | Session | Status |
 |---|---|---|
 | 0 | Lessons, architecture, design review, plan | done |
 | 1 | Skeleton: module, config, migrations, Compose, CI, health | done ([record](docs/sessions/01-skeleton.md)) |
 | 2 | Queue: the five operations | done ([record](docs/sessions/02-queue.md)) |
-| 3 | Rate limiter | next |
-| 4 | Provider client and the send gate | |
+| 3 | Rate limiter | done ([record](docs/sessions/03-ratelimit.md)) |
+| 4 | Provider client and the send gate | next |
 | 5 | Dispatcher, breaker, reaper; fault tests | |
 | 6 | API | |
 | 7 | Events, WebSocket, metrics, tracing, alerts | |
