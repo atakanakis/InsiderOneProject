@@ -133,4 +133,17 @@ missed a cancel in 2 of 30 runs; it now runs until every operation has taken eff
 
 ## CI
 
-CI_PLACEHOLDER
+CI on `d5b5cf8`, run 44778025697: lint, test and compose succeeded; the guards job would have
+failed on session 1's header guard, whose text `04871f8` had changed (found by the local
+`make guards`, fixed in `d6d21cb`), and was cancelled by the next push. CI on `d6d21cb`, the
+commit the review was given, run 44781178603: all four jobs succeeded; guards `235 guards, 235
+real, 0 failed`; the compose job sent 1501 notifications through the API, all `sent`, the mock
+provider's peak 100 per channel.
+
+CI on `e5b9e6e`, the session's last code and document commit after the review, run
+44795810086: lint, test, guards and compose all succeeded. The guards job printed `249 guards,
+249 real, 0 failed`; the fault test's three scenarios at peak 40, the limit, none accepted
+twice; the compose job: `all 1501 notifications sent in 5.61s`, the mock provider received
+1501, peak 100 per channel (`gh run watch 44795810086 --exit-status`, and `--log` of the
+guards, test and compose jobs). The commit that adds these paragraphs changes only the two
+records.
