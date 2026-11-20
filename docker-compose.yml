@@ -2,6 +2,7 @@
 #
 #   API            http://localhost:8080/healthz, http://localhost:8080/readyz
 #   Mock provider  http://localhost:9090/stats
+#   Workers        two (WORKER_REPLICAS); make enqueue adds rows, make status counts them
 #
 # Every setting of internal/config can be set in an optional .env file.
 
@@ -70,6 +71,9 @@ services:
   worker:
     <<: *app
     command: ["/app/worker"]
+    # Two workers share the rate limit through Redis and the queue through Postgres.
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
     # Architecture §13: the grace period must be longer than the worker's shutdown timeout
     # (25 s), so Docker does not kill a worker that still waits for sends in flight. The
     # container's grace period and the worker's STOP_GRACE_PERIOD come from one variable, and

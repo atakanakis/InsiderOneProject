@@ -53,7 +53,8 @@ jobs:
         run: git diff --exit-code
 
   compose:
-    # The stack starts with one command, and the API answers its health endpoints.
+    # The stack starts with one command, the API answers its health endpoints, and two
+    # workers deliver.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -64,10 +65,25 @@ jobs:
           curl -sf localhost:8080/healthz
           curl -sf localhost:8080/readyz
           curl -sf localhost:9090/stats
-      - name: The worker stops cleanly
+      - name: Two workers deliver, within the limit at the provider
+        # No API until session 6: rows go straight into the database (make enqueue).
+        run: |
+          test "$(docker compose ps worker --format '{{.Name}}' | wc -l)" -eq 2
+          make enqueue N=500
+          for i in $(seq 1 60); do
+            left=$(docker compose exec -T postgres psql -U notifications -tAc \
+              "SELECT count(*) FROM notifications WHERE status <> 'sent'")
+            [ "$left" = 0 ] && break
+            sleep 1
+          done
+          make status
+          curl -s localhost:9090/stats | tee stats.json
+          test "$left" = 0
+          python3 -c 'import json, sys; s = json.load(open("stats.json")); p = s["maxInAnyOneSecondWindow"]; sys.exit(0 if s["received"] == 1500 and max(p[c] for c in ("sms", "email", "push")) <= 100 else 1)'
+      - name: The workers stop cleanly
         run: |
           docker compose stop worker
-          test "$(docker compose ps -a worker --format '{{.ExitCode}}')" = 0
+          test "$(docker compose ps -a worker --format '{{.ExitCode}}' | sort -u)" = 0
       - name: Logs on failure
         if: failure()
         run: docker compose logs --tail 200
