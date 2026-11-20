@@ -71,6 +71,7 @@ type Claimed struct {
 	LockedUntil   time.Time
 	CorrelationID string
 	Traceparent   string
+	BatchID       uuid.UUID // uuid.Nil for a notification created alone
 }
 
 // claimSQL is the claim of architecture §5. $1 channel, $2 priority, $3 n, $4 the lease in
@@ -88,7 +89,7 @@ WHERE id = ANY(ARRAY(
     LIMIT $3
     FOR UPDATE SKIP LOCKED))
 RETURNING id, recipient, channel, content, priority, attempts, max_attempts, ready_at,
-    locked_until, correlation_id, traceparent`
+    locked_until, correlation_id, traceparent, batch_id`
 
 // Claim takes up to n due rows of one channel and one priority, marks them processing with a
 // lease, adds one attempt to each, and returns them in ready_at order. n of 0 or less claims
@@ -110,9 +111,13 @@ func (q *Queue) Claim(ctx context.Context, ch domain.Channel, p domain.Priority,
 		var c Claimed
 		var channel string
 		var priority int16
+		var batch *uuid.UUID
 		err := r.Scan(&c.ID, &c.Recipient, &channel, &c.Content, &priority, &c.Attempt, &c.MaxAttempts,
-			&c.ReadyAt, &c.LockedUntil, &c.CorrelationID, &c.Traceparent)
+			&c.ReadyAt, &c.LockedUntil, &c.CorrelationID, &c.Traceparent, &batch)
 		c.Channel, c.Priority = domain.Channel(channel), domain.Priority(priority)
+		if batch != nil {
+			c.BatchID = *batch
+		}
 		return c, err
 	})
 	if err != nil {
@@ -214,11 +219,30 @@ func bounded(s string, limit int) string {
 	return s[:cut]
 }
 
-// Change is a row whose status an operation changed.
+// Change is a row whose status an operation changed, with what its status event and its log
+// line need (architecture §9, §10).
 type Change struct {
-	ID     uuid.UUID
-	Status domain.Status
+	ID            uuid.UUID
+	Status        domain.Status
+	BatchID       uuid.UUID // uuid.Nil for a notification created alone
+	CorrelationID string
 }
+
+// scanChange reads the columns of changeColumns.
+func scanChange(r pgx.Row) (Change, error) {
+	var c Change
+	var status string
+	var batch *uuid.UUID
+	err := r.Scan(&c.ID, &status, &batch, &c.CorrelationID)
+	c.Status = domain.Status(status)
+	if batch != nil {
+		c.BatchID = *batch
+	}
+	return c, err
+}
+
+// changeColumns are what a status change returns.
+const changeColumns = `id, status, batch_id, correlation_id`
 
 // reapSQL returns rows whose lease has ended, in the claim's form. attempts and ready_at are
 // kept: the attempt was used, and the row goes back to its place in the queue.
@@ -231,7 +255,7 @@ WHERE id = ANY(ARRAY(
     ORDER BY locked_until
     LIMIT $1
     FOR UPDATE SKIP LOCKED))
-RETURNING id, status`
+RETURNING ` + changeColumns
 
 // Reap returns up to limit processing rows whose lease has ended to pending, or to failed
 // when they have used their last attempt, and returns what it changed.
@@ -245,13 +269,7 @@ func (q *Queue) Reap(ctx context.Context, limit int) ([]Change, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reap: %w", err)
 	}
-	changes, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Change, error) {
-		var c Change
-		var status string
-		err := r.Scan(&c.ID, &status)
-		c.Status = domain.Status(status)
-		return c, err
-	})
+	changes, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Change, error) { return scanChange(r) })
 	if err != nil {
 		return nil, fmt.Errorf("reap: %w", err)
 	}
@@ -261,11 +279,11 @@ func (q *Queue) Reap(ctx context.Context, limit int) ([]Change, error) {
 const cancelSQL = `UPDATE notifications
 SET status = 'cancelled', updated_at = now()
 WHERE id = $1 AND status IN ('scheduled', 'pending', 'retrying')
-RETURNING status`
+RETURNING ` + changeColumns
 
-// Cancel cancels a waiting row. It returns cancelled, or the status it found with
-// ErrWrongStatus, or ErrNotFound.
-func (q *Queue) Cancel(ctx context.Context, id uuid.UUID) (domain.Status, error) {
+// Cancel cancels a waiting row. It returns the change to cancelled, or the status it found
+// with ErrWrongStatus, or ErrNotFound.
+func (q *Queue) Cancel(ctx context.Context, id uuid.UUID) (Change, error) {
 	ctx, cancel := q.writeContext(ctx)
 	defer cancel()
 	return q.change(ctx, "cancel", id, cancelSQL, id)
@@ -274,13 +292,14 @@ func (q *Queue) Cancel(ctx context.Context, id uuid.UUID) (domain.Status, error)
 const requeueSQL = `UPDATE notifications
 SET status = 'pending', max_attempts = attempts + $2, ready_at = now(), updated_at = now()
 WHERE id = $1 AND status = 'failed'
-RETURNING status`
+RETURNING ` + changeColumns
 
 // Requeue moves a failed row to pending, due now, with budget more attempts. attempts is
-// kept, so no attempt number is used twice (I7).
-func (q *Queue) Requeue(ctx context.Context, id uuid.UUID, budget int) (domain.Status, error) {
+// kept, so no attempt number is used twice (I7). It returns the change, or the status it
+// found with ErrWrongStatus, or ErrNotFound.
+func (q *Queue) Requeue(ctx context.Context, id uuid.UUID, budget int) (Change, error) {
 	if budget <= 0 {
-		return "", fmt.Errorf("requeue: budget %d must be positive", budget)
+		return Change{}, fmt.Errorf("requeue: budget %d must be positive", budget)
 	}
 	ctx, cancel := q.writeContext(ctx)
 	defer cancel()
@@ -290,25 +309,27 @@ func (q *Queue) Requeue(ctx context.Context, id uuid.UUID, budget int) (domain.S
 // change runs a one-row status change in one transaction. It locks the row first, so that
 // the status it reports when the update refuses is the status the update saw; the update's
 // own WHERE decides.
-func (q *Queue) change(ctx context.Context, op string, id uuid.UUID, sql string, args ...any) (domain.Status, error) {
-	var found, changed string
+func (q *Queue) change(ctx context.Context, op string, id uuid.UUID, sql string, args ...any) (Change, error) {
+	var found string
+	var changed Change
 	err := pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `SELECT status FROM notifications WHERE id = $1 FOR UPDATE`, id).Scan(&found); err != nil {
 			return err
 		}
-		err := tx.QueryRow(ctx, sql, args...).Scan(&changed)
+		c, err := scanChange(tx.QueryRow(ctx, sql, args...))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // refused by the update's WHERE
 		}
+		changed = c
 		return err
 	})
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return "", fmt.Errorf("%s %s: %w", op, id, ErrNotFound)
+		return Change{}, fmt.Errorf("%s %s: %w", op, id, ErrNotFound)
 	case err != nil:
-		return "", fmt.Errorf("%s: %w", op, err)
-	case changed == "":
-		return domain.Status(found), fmt.Errorf("%s %s from %s: %w", op, id, found, ErrWrongStatus)
+		return Change{}, fmt.Errorf("%s: %w", op, err)
+	case changed.Status == "":
+		return Change{ID: id, Status: domain.Status(found)}, fmt.Errorf("%s %s from %s: %w", op, id, found, ErrWrongStatus)
 	}
-	return domain.Status(changed), nil
+	return changed, nil
 }

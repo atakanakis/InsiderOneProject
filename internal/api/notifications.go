@@ -703,12 +703,13 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 }
 
 // change answers a cancel or a retry.
-func (s *server) change(w http.ResponseWriter, r *http.Request, op func(uuid.UUID) (domain.Status, error)) {
+func (s *server) change(w http.ResponseWriter, r *http.Request, op func(uuid.UUID) (store.Change, error)) {
 	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
-	st, err := op(id)
+	c, err := op(id)
+	st := c.Status
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		notFound(w, "notification")
@@ -724,12 +725,12 @@ func (s *server) change(w http.ResponseWriter, r *http.Request, op func(uuid.UUI
 }
 
 func (s *server) cancel(w http.ResponseWriter, r *http.Request) {
-	s.change(w, r, func(id uuid.UUID) (domain.Status, error) { return s.queue.Cancel(r.Context(), id) })
+	s.change(w, r, func(id uuid.UUID) (store.Change, error) { return s.queue.Cancel(r.Context(), id) })
 }
 
 // retry requeues a failed row with MAX_ATTEMPTS more attempts (architecture §5).
 func (s *server) retry(w http.ResponseWriter, r *http.Request) {
-	s.change(w, r, func(id uuid.UUID) (domain.Status, error) { return s.queue.Requeue(r.Context(), id, s.maxAttempts) })
+	s.change(w, r, func(id uuid.UUID) (store.Change, error) { return s.queue.Requeue(r.Context(), id, s.maxAttempts) })
 }
 
 func templateJSON(t store.StoredTemplate, withBody bool) map[string]any {

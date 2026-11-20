@@ -895,10 +895,11 @@ func TestCancelOnlyFromWaitingStatuses(t *testing.T) {
 		r := waiting(time.Minute)
 		r.status = s
 		id := addRow(t, e.Pool, r)
-		got, err := q.Cancel(ctx(t), id)
+		c, err := q.Cancel(ctx(t), id)
+		got := c.Status
 		if s.IsClaimable() {
-			if err != nil || got != domain.Cancelled {
-				t.Errorf("cancel from %s: %s, %v; want cancelled", s, got, err)
+			if err != nil || got != domain.Cancelled || c.ID != id {
+				t.Errorf("cancel from %s: %+v, %v; want cancelled", s, c, err)
 			}
 			continue
 		}
@@ -948,8 +949,8 @@ func TestRequeueRaisesMaxAttemptsByTheBudget(t *testing.T) {
 	q := store.NewQueue(e.Pool)
 	id := addRow(t, e.Pool, row{status: domain.Failed, readyIn: time.Hour, attempts: 6, maxAttempts: 6})
 	got, err := q.Requeue(ctx(t), id, 4)
-	if err != nil || got != domain.Pending {
-		t.Fatalf("requeue: %s, %v", got, err)
+	if err != nil || got.Status != domain.Pending || got.ID != id {
+		t.Fatalf("requeue: %+v, %v", got, err)
 	}
 	if s := stateOf(t, e.Pool, id); s != (state{domain.Pending, 6, 10}) {
 		t.Errorf("row after requeue: %+v, want pending, 6 attempts, max 10", s)
@@ -966,8 +967,8 @@ func TestRequeueRaisesMaxAttemptsByTheBudget(t *testing.T) {
 		r := waiting(time.Minute)
 		r.status = s
 		other := addRow(t, e.Pool, r)
-		if got, err := q.Requeue(ctx(t), other, 4); !errors.Is(err, store.ErrWrongStatus) || got != s {
-			t.Errorf("requeue from %s: %s, %v; want ErrWrongStatus", s, got, err)
+		if got, err := q.Requeue(ctx(t), other, 4); !errors.Is(err, store.ErrWrongStatus) || got.Status != s {
+			t.Errorf("requeue from %s: %s, %v; want ErrWrongStatus", s, got.Status, err)
 		}
 	}
 	if _, err := q.Requeue(ctx(t), uuid.New(), 4); !errors.Is(err, store.ErrNotFound) {
@@ -1225,4 +1226,69 @@ func TestQueueWritesHaveTheirOwnTimeout(t *testing.T) {
 			}
 		}
 	}
+}
+
+// §9, §10: the statements that change a status return what the status event and the log
+// line need: the row's batch id and its correlation id. Claim, Reap, Cancel and Requeue each
+// return them from the same statement.
+func TestStatusChangesReturnTheBatchAndTheCorrelationID(t *testing.T) {
+	e := testkit.Setup(t)
+	q := store.NewQueue(e.Pool)
+	batch := uuid.New()
+	if _, err := e.Pool.Exec(ctx(t), `INSERT INTO batches (id, total) VALUES ($1, 4)`, batch); err != nil {
+		t.Fatal(err)
+	}
+	add := func(status domain.Status, attempts int, lockedFor string, inBatch bool) (uuid.UUID, string) {
+		t.Helper()
+		id := uuid.New()
+		var b *uuid.UUID
+		if inBatch {
+			b = &batch
+		}
+		corr := "corr-" + id.String()[:8]
+		if _, err := e.Pool.Exec(ctx(t), `INSERT INTO notifications
+    (id, batch_id, recipient, channel, content, priority, status, attempts, max_attempts, ready_at, locked_until, correlation_id)
+VALUES ($1, $2, '+905551234567', 'sms', 'hello', 0, $3, $4, 6, now() - interval '1 second',
+    now() + $5::interval, $6)`, id, b, string(status), attempts, lockedFor, corr); err != nil {
+			t.Fatal(err)
+		}
+		return id, corr
+	}
+	check := func(op string, c store.Change, id uuid.UUID, corr string, inBatch bool) {
+		t.Helper()
+		want := uuid.Nil
+		if inBatch {
+			want = batch
+		}
+		if c.ID != id || c.BatchID != want || c.CorrelationID != corr {
+			t.Errorf("%s returned %+v, want id %s, batch %s, correlation id %q", op, c, id, want, corr)
+		}
+	}
+
+	claimed, claimedCorr := add(domain.Pending, 0, "0 seconds", true)
+	got := claim(t, q, domain.SMS, domain.High, 10, hour)
+	if len(got) != 1 || got[0].ID != claimed || got[0].BatchID != batch || got[0].CorrelationID != claimedCorr {
+		t.Errorf("claim returned %+v, want the row with its batch and correlation id", got)
+	}
+
+	reaped, reapedCorr := add(domain.Processing, 1, "-1 second", true)
+	changes, err := q.Reap(ctx(t), 100)
+	if err != nil || len(changes) != 1 {
+		t.Fatalf("reap: %+v, %v", changes, err)
+	}
+	check("reap", changes[0], reaped, reapedCorr, true)
+
+	cancelled, cancelledCorr := add(domain.Pending, 0, "0 seconds", false)
+	c, err := q.Cancel(ctx(t), cancelled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("cancel", c, cancelled, cancelledCorr, false)
+
+	requeued, requeuedCorr := add(domain.Failed, 6, "0 seconds", true)
+	c, err = q.Requeue(ctx(t), requeued, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("requeue", c, requeued, requeuedCorr, true)
 }
