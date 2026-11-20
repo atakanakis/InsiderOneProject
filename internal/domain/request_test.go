@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func str(s string) *string { return &s }
@@ -44,7 +45,7 @@ func TestContentIsBoundedPerChannelInCharacters(t *testing.T) {
 		}
 		for _, n := range []int{limit - 1, limit, limit + 1} {
 			in := valid(ch)
-			in.Content = str(strings.Repeat("ç", n))
+			in.Content = str(strings.Repeat("é", n))
 			_, errs := prepare(in, noTemplates)
 			if refused := hasField(errs, "content"); refused != (n > limit) {
 				t.Errorf("%s with %d characters (bound %d): refused=%v %v", ch, n, limit, refused, errs)
@@ -133,8 +134,10 @@ func TestIdempotencyKeyAndTemplateNameBounds(t *testing.T) {
 			t.Errorf("template name of %d characters: %v, want %v", n, got, want)
 		}
 	}
-	if ValidTemplateName("a/b") || ValidTemplateName("a b") {
-		t.Error("a template name with a separator accepted")
+	for _, bad := range []string{"a/b", "a b", ".", "..", "-a", "_a"} {
+		if ValidTemplateName(bad) {
+			t.Errorf("template name %q accepted", bad)
+		}
 	}
 }
 
@@ -223,12 +226,12 @@ func TestTemplateBodyBounds(t *testing.T) {
 	for _, ch := range Channels {
 		limit := ContentLimit(ch)
 		var errs Errors
-		CheckTemplate("t", string(ch), strings.Repeat("ç", limit), &errs)
+		CheckTemplate("t", string(ch), strings.Repeat("é", limit), &errs)
 		if errs.Len() != 0 {
 			t.Errorf("%s body at the bound refused: %v", ch, errs.List())
 		}
 		errs = Errors{}
-		CheckTemplate("t", string(ch), strings.Repeat("ç", limit+1), &errs)
+		CheckTemplate("t", string(ch), strings.Repeat("é", limit+1), &errs)
 		if errs.Len() == 0 {
 			t.Errorf("%s body over the bound accepted", ch)
 		}
@@ -245,13 +248,13 @@ func TestTheRenderedLengthIsMeasuredBeforeRendering(t *testing.T) {
 	if got := c.Variables(); len(got) != 2 || got[0] != "name" || got[1] != "code" {
 		t.Errorf("variables %v", got)
 	}
-	vars := Variables{{"code", "42"}, {"name", "Çağrı"}}
+	vars := Variables{{"code", "42"}, {"name", "José"}}
 	chars, size, err := c.Measure(vars)
 	if err != nil {
 		t.Fatal(err)
 	}
 	out := c.Render(vars)
-	if out != "Hi Çağrı, Çağrı! Code 42." {
+	if out != "Hi José, José! Code 42." {
 		t.Errorf("rendered %q", out)
 	}
 	if size != len(out) || chars != len([]rune(out)) {
@@ -274,12 +277,12 @@ func TestTheRenderedLengthIsMeasuredBeforeRendering(t *testing.T) {
 func TestATemplateItemIsMeasuredAgainstItsChannel(t *testing.T) {
 	c, _ := CompileTemplate("{{.v}}{{.v}}")
 	lookup := func(string) (*Compiled, Channel, bool) { return c, SMS, true }
-	in := Input{Recipient: "+905551234567", Channel: "sms", Template: "t", Variables: Variables{{"v", strings.Repeat("ç", 800)}}}
+	in := Input{Recipient: "+905551234567", Channel: "sms", Template: "t", Variables: Variables{{"v", strings.Repeat("é", 800)}}}
 	p, errs := prepare(in, lookup)
-	if len(errs) != 0 || p.Content() != strings.Repeat("ç", 1600) || p.Bytes != 3200 {
+	if len(errs) != 0 || p.Content() != strings.Repeat("é", 1600) || p.Bytes != 3200 {
 		t.Fatalf("at the bound: %v, %d bytes", errs, p.Bytes)
 	}
-	in.Variables[0].Value += "ç"
+	in.Variables[0].Value += "é"
 	if _, errs := prepare(in, lookup); !hasField(errs, "content") {
 		t.Errorf("over the bound: %v", errs)
 	}
@@ -298,6 +301,12 @@ func TestTheRequestHashIgnoresFormAndDefaults(t *testing.T) {
 	b.Priority = "normal"
 	b.ScheduledAt = "2030-01-01T15:00:00+03:00"
 	b.IdempotencyKey = "k2"
+	// Postgres stores microseconds: a time that differs only below them is the same request.
+	c := a
+	c.ScheduledAt = "2030-01-01T12:00:00.000000999Z"
+	if !bytes.Equal(Hash(a), Hash(c)) {
+		t.Error("nanoseconds that Postgres does not store changed the hash")
+	}
 	if !bytes.Equal(Hash(a), Hash(b)) || len(Hash(a)) != 32 {
 		t.Errorf("the same request hashes differently: %x %x", Hash(a), Hash(b))
 	}
@@ -329,5 +338,60 @@ func TestTheRequestHashIgnoresFormAndDefaults(t *testing.T) {
 	y := Input{Recipient: "+905551234567", Channel: "sms", Template: "t", Variables: Variables{{"a", "b"}}, Priority: "cnormal"}
 	if bytes.Equal(Hash(x), Hash(y)) {
 		t.Error("the hash does not separate fields")
+	}
+}
+
+// Go cannot write a time from the year 10000 as RFC 3339: a row scheduled then answered every
+// read with an empty 200 (session 6's review, F4). A time is cut to microseconds, as stored.
+func TestAScheduledAtFromTheYear10000IsRefused(t *testing.T) {
+	for at, ok := range map[string]bool{
+		"9999-12-31T23:59:59.999999Z":         true,
+		"9999-12-31T23:59:59-23:59":           false, // the year 10000 in UTC
+		"9999-12-31T23:59:59.9999999Z":        true,
+		"0001-01-01T00:00:00Z":                true,
+		"2030-01-01T12:00:00.123456789Z":      true,
+		"2030-01-01T12:00:00.123456789+03:00": true,
+	} {
+		in := valid(SMS)
+		in.ScheduledAt = at
+		p, errs := prepare(in, noTemplates)
+		if accepted := !hasField(errs, "scheduledAt"); accepted != ok {
+			t.Errorf("%s: accepted=%v, want %v", at, accepted, ok)
+		}
+		if ok && (p.ScheduledAt == nil || p.ScheduledAt.Nanosecond()%1000 != 0 || p.ScheduledAt.Location() != time.UTC) {
+			t.Errorf("%s: stored as %v, want UTC microseconds", at, p.ScheduledAt)
+		}
+	}
+}
+
+// Go's decoder matches field names in any case and keeps the last of two. The API matches
+// them exactly, each once (session 6's review, F7).
+func TestFieldNamesAreMatchedExactlyAndOnce(t *testing.T) {
+	for body, name := range map[string]string{
+		`{"Content":"x"}`:               "Content",
+		`{"CONTENT":"x"}`:               "CONTENT",
+		`{"content":"a","content":"b"}`: "content",
+		`{"colour":"red"}`:              "colour",
+	} {
+		var in Input
+		err := json.Unmarshal([]byte(body), &in)
+		var fe *FieldNameError
+		if !errors.As(err, &fe) || fe.Name != name {
+			t.Errorf("%s: %v, want a FieldNameError naming %s", body, err, name)
+		}
+	}
+	var in Input
+	if err := json.Unmarshal([]byte(`{"recipient":"+905551234567","channel":"sms","content":"x","variables":null}`), &in); err != nil || *in.Content != "x" {
+		t.Errorf("a valid item: %v", err)
+	}
+	var tmpl TemplateInput
+	if err := json.Unmarshal([]byte(`{"name":"t","Body":"x"}`), &tmpl); err == nil {
+		t.Error("a template field in another case accepted")
+	}
+	if err := json.Unmarshal([]byte(`{"name":"t","channel":"sms","body":"x"}`), &tmpl); err != nil || tmpl.Body != "x" {
+		t.Errorf("a valid template: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`[]`), &in); !errors.Is(err, ErrNotAnObject) {
+		t.Errorf("an array: %v, want ErrNotAnObject", err)
 	}
 }

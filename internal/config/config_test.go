@@ -168,13 +168,13 @@ func TestEveryBrokenRelationIsReported(t *testing.T) {
 func TestLoadReadsEverySettingFromTheEnvironment(t *testing.T) {
 	c, err := Load(env(map[string]string{
 		"DATABASE_URL": "postgres://db", "REDIS_URL": "redis://r", "PROVIDER_URL": "http://p/send",
-		"API_ADDR": ":1", "LOG_LEVEL": "debug", "API_KEYS": " k1, ,k2 ", "MAX_ATTEMPTS": "16",
+		"API_ADDR": ":1", "LOG_LEVEL": "debug", "API_KEYS": " key-one-0123456789, ,key-two-0123456789 ", "MAX_ATTEMPTS": "16",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := (Config{DatabaseURL: "postgres://db", RedisURL: "redis://r", ProviderURL: "http://p/send", APIAddr: ":1", LogLevel: "debug",
-		APIKeys: []string{"k1", "k2"}, MaxAttempts: 16}); !reflect.DeepEqual(c, want) {
+		APIKeys: []string{"key-one-0123456789", "key-two-0123456789"}, MaxAttempts: 16}); !reflect.DeepEqual(c, want) {
 		t.Fatalf("Load\n got %+v\nwant %+v", c, want)
 	}
 	w, err := LoadWorker(env(map[string]string{
@@ -255,5 +255,16 @@ func TestMaxAttemptsMustBePositive(t *testing.T) {
 	}
 	if c, err := Load(env(map[string]string{})); err != nil || c.MaxAttempts != 6 {
 		t.Errorf("default: %d %v", c.MaxAttempts, err)
+	}
+}
+
+// A short API key can be guessed; the API refuses to start with one (session 6's review, a
+// nit).
+func TestAPIKeysMustBeAtLeast16Characters(t *testing.T) {
+	if _, err := Load(env(map[string]string{"API_KEYS": "k1,0123456789abcdef"})); err == nil || !strings.Contains(err.Error(), "API_KEYS") || strings.Contains(err.Error(), "k1") {
+		t.Errorf("a 2-character key: %v, want an error that names API_KEYS and not the key", err)
+	}
+	if _, err := Load(env(map[string]string{"API_KEYS": "0123456789abcdef"})); err != nil {
+		t.Errorf("a 16-character key: %v", err)
 	}
 }

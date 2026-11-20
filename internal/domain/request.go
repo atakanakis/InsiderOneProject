@@ -487,3 +487,21 @@ func Echo(name string) string {
 	}
 	return name
 }
+
+// FieldNameError names a field of a JSON object that is unknown, in another case, or given
+// twice.
+type FieldNameError struct {
+	Name, Message string
+}
+
+func (e *FieldNameError) Error() string { return e.Message }
+
+// ErrNotAnObject: a JSON value that must be an object is not one.
+var ErrNotAnObject = errors.New("must be a JSON object")
+
+// TemplateInput is a template as the client sends it.
+type TemplateInput struct {
+	Name    string `json:"name"`
+	Channel string `json:"channel"`
+	Body    string `json:"body"`
+}

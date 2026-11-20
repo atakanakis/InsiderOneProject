@@ -11,9 +11,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -436,26 +438,33 @@ func fromTemplate(name string, vars map[string]string) map[string]any {
 	return map[string]any{"recipient": "ada@example.com", "channel": "email", "template": name, "variables": vars}
 }
 
-// architecture §8: the rendered content of one request is at most 16 MiB. Each "amp" item
-// renders 16,000 copies of 6 four-byte characters: 384,000 bytes from a 100-byte item. 43 of
-// them and one direct item of 265,216 bytes are exactly 16 MiB.
+// architecture §8: the rendered content of one request is bounded. Each "amp" item renders
+// 16,000 copies of 6 four-byte characters: 384,000 bytes from a 100-byte item. As many as fit
+// and one direct item with the rest are exactly the bound.
 func TestTheRenderedTotalOfARequestIsBounded(t *testing.T) {
+	if domain.MaxRenderedBytes > MaxBatchBodyBytes {
+		t.Fatalf("the rendered bound %d is larger than the batch's body bound %d", domain.MaxRenderedBytes, MaxBatchBodyBytes)
+	}
 	a := newAPI(t)
 	createTemplate(t, a, "amp", "email", strings.Repeat("{{.v}}", 16_000))
 	emoji := strings.Repeat("😀", 6)
+	const amps = domain.MaxRenderedBytes / 384_000
+	const rest = domain.MaxRenderedBytes - amps*384_000
+	if rest/4 > domain.ContentLimit(domain.Email) {
+		t.Fatalf("the direct item of %d bytes is over the email bound", rest)
+	}
 	batch := func(directBytes int) map[string]any {
 		list := []map[string]any{}
-		for range 43 {
+		for range amps {
 			list = append(list, fromTemplate("amp", map[string]string{"v": emoji}))
 		}
 		direct := strings.Repeat("😀", directBytes/4) + strings.Repeat("a", directBytes%4)
 		return map[string]any{"notifications": append(list, email(direct))}
 	}
-	const rest = domain.MaxRenderedBytes - 43*384_000
 	for _, n := range []int{rest - 1, rest, rest + 1} {
 		r := a.post(t, "/v1/notifications/batch", batch(n))
 		if (r.code == http.StatusCreated) != (n <= rest) {
-			t.Errorf("total %d bytes (bound %d): %d %.300s", 43*384_000+n, domain.MaxRenderedBytes, r.code, r.raw)
+			t.Errorf("total %d bytes (bound %d): %d %.300s", amps*384_000+n, domain.MaxRenderedBytes, r.code, r.raw)
 		}
 	}
 }
@@ -479,18 +488,18 @@ func TestARequestOverTheRenderedTotalIsRefusedBeforeRendering(t *testing.T) {
 	}
 }
 
-// architecture §8: a template is compiled once per request. 1000 items of a template with
-// 16,000 placeholders: compiled per item, that is 16 million parts.
+// architecture §8: a template is compiled once per request. 500 items of a template with
+// 16,000 placeholders: compiled per item, that is 8 million parts.
 func TestATemplateIsCompiledOncePerRequest(t *testing.T) {
 	a := newAPI(t)
 	createTemplate(t, a, "many", "email", strings.Repeat("{{.v}}", 16_000))
-	body := items(1000, func(int) map[string]any { return fromTemplate("many", map[string]string{"v": "a"}) })
+	body := items(500, func(int) map[string]any { return fromTemplate("many", map[string]string{"v": "a"}) })
 	var r reply
 	alloc := allocated(func() { r = a.post(t, "/v1/notifications/batch", body) })
 	if r.code != http.StatusCreated {
 		t.Fatalf("%d %.300s", r.code, r.raw)
 	}
-	t.Logf("16 MB rendered and stored; %d MiB allocated", alloc>>20)
+	t.Logf("8 MB rendered and stored; %d MiB allocated", alloc>>20)
 	if alloc > 256<<20 {
 		t.Errorf("allocated %d MiB", alloc>>20)
 	}
@@ -554,12 +563,12 @@ func TestErrorBodiesStayWithinTheirBoundForAnyRequest(t *testing.T) {
 			return a.post(t, "/v1/notifications", map[string]any{"recipient": "+905551234567", "channel": "sms", "template": "t",
 				"variables": map[string]string{"a": "x", strings.Repeat("Q", 500_000): "x"}})
 		},
-		// 1000 items each with a 64-byte name that JSON escapes to 6 bytes a character: the
-		// largest error the form allows.
+		// 1000 items each with a name of control characters, which JSON escapes to 6 bytes
+		// each: the largest error the form allows (session 6's reviewer found it).
 		"names that JSON escapes": func() reply {
 			return a.post(t, "/v1/notifications/batch", items(1000, func(int) map[string]any {
 				return map[string]any{"recipient": "+905551234567", "channel": "sms", "template": "t",
-					"variables": map[string]string{"a": "x", strings.Repeat("\"\x01<", 30): "x"}}
+					"variables": map[string]string{"a": "x", strings.Repeat("\x01", 100): "x"}}
 			}))
 		},
 		"a long string where an object belongs": func() reply {
@@ -614,6 +623,26 @@ func TestUnknownFieldsAndWrongTypesAreRefusedByName(t *testing.T) {
 	}
 	if r := a.do(t, http.MethodPost, "/v1/notifications", []byte(`{"recipient":5}`)); r.code != http.StatusBadRequest || fmt.Sprint(r.errorFields(t)) != "[recipient]" {
 		t.Errorf("wrong type: %d %s", r.code, r.raw)
+	}
+	for body, want := range map[string]string{
+		`{"Content":"x"}`:               "[Content]",
+		`{"content":"a","content":"b"}`: "[content]",
+		`[]`:                            "[]",
+	} {
+		if r := a.do(t, http.MethodPost, "/v1/notifications", []byte(body)); r.code != http.StatusBadRequest || fmt.Sprint(r.errorFields(t)) != want {
+			t.Errorf("%s: %d %s, want the fields %s", body, r.code, r.raw, want)
+		}
+	}
+	for body, want := range map[string]string{
+		`{"notifications":[5]}`: "[notifications[0]]",
+		`{"notifications":[{"recipient":"+905551234567","RECIPIENT":"x"}]}`: "[notifications[0].RECIPIENT]",
+	} {
+		if r := a.do(t, http.MethodPost, "/v1/notifications/batch", []byte(body)); r.code != http.StatusBadRequest || fmt.Sprint(r.errorFields(t)) != want {
+			t.Errorf("%s: %d %s, want the fields %s", body, r.code, r.raw, want)
+		}
+	}
+	if r := a.do(t, http.MethodPost, "/v1/templates", []byte(`{"name":"t","channel":"sms","Body":"x"}`)); r.code != http.StatusBadRequest || fmt.Sprint(r.errorFields(t)) != "[Body]" {
+		t.Errorf("a template field in another case: %d %s", r.code, r.raw)
 	}
 	valid, _ := json.Marshal(sms("x"))
 	if r := a.do(t, http.MethodPost, "/v1/notifications", append(valid, []byte(` {}`)...)); r.code != http.StatusBadRequest {
@@ -849,6 +878,7 @@ func TestAPIKeysAreRequiredWhenConfigured(t *testing.T) {
 		{[]string{"X-API-Key", "key-one-012345678"}, http.StatusUnauthorized},
 		{[]string{"Authorization", "key-one-0123456789"}, http.StatusUnauthorized},
 		{[]string{"Authorization", "Bearer key-one-0123456789"}, http.StatusOK},
+		{[]string{"Authorization", "bearer key-one-0123456789"}, http.StatusOK}, // RFC 9110: the scheme in any case
 		{[]string{"X-API-Key", "key-two-0123456789"}, http.StatusOK},
 	}
 	for _, c := range cases {
@@ -957,5 +987,192 @@ func TestACursorOutsideTheTimeRangeIsRefused(t *testing.T) {
 	at := encodeCursor(store.Cursor{CreatedAt: time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC), ID: uuid.New()})
 	if r := a.get(t, "/v1/notifications?cursor="+at); r.code != http.StatusOK {
 		t.Errorf("cursor in the year 9999: %d %.200s", r.code, r.raw)
+	}
+}
+
+// The rendering of many requests at once is bounded, not only each request (session 6's
+// review, F1): 40 batches at once, each rendering 8 MB from a 66 KB body. The heap is sampled
+// while they run.
+func TestConcurrentRequestsRenderInBoundedMemory(t *testing.T) {
+	a := newAPI(t)
+	createTemplate(t, a, "amp", "email", strings.Repeat("{{.v}}", 16_000))
+	body, err := json.Marshal(items(500, func(int) map[string]any { return fromTemplate("amp", map[string]string{"v": "a"}) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var base runtime.MemStats
+	runtime.ReadMemStats(&base)
+	var peak atomic.Uint64
+	stop := make(chan struct{})
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		var m runtime.MemStats
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			runtime.ReadMemStats(&m)
+			if m.HeapInuse > peak.Load() {
+				peak.Store(m.HeapInuse)
+			}
+		}
+	}()
+	const requests = 40
+	codes := make([]int, requests)
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Go(func() { codes[i] = a.do(t, http.MethodPost, "/v1/notifications/batch", body).code })
+	}
+	wg.Wait()
+	close(stop)
+	<-sampled
+	for i, c := range codes {
+		if c != http.StatusCreated {
+			t.Fatalf("request %d: %d", i, c)
+		}
+	}
+	grew := int64(peak.Load()) - int64(base.HeapInuse)
+	t.Logf("%d requests of %d bytes, each rendering 8 MB: the heap grew by %d MiB at its peak", requests, len(body), grew>>20)
+	if grew > 400<<20 {
+		t.Errorf("the heap grew by %d MiB", grew>>20)
+	}
+}
+
+// stallingProxy forwards TCP connections to target until stall is called; then it stops
+// forwarding in both directions and holds the connections open: a Postgres that stalls, as
+// a paused container does. A refused port would fail at once and prove nothing.
+func stallingProxy(t *testing.T, target string) (addr string, stall func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	var stalled atomic.Bool
+	pipe := func(dst, src net.Conn) {
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := src.Read(buf)
+			for stalled.Load() {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", target)
+			if err != nil {
+				_ = c.Close()
+				continue
+			}
+			t.Cleanup(func() { _ = c.Close(); _ = up.Close() })
+			go pipe(up, c)
+			go pipe(c, up)
+		}
+	}()
+	return ln.Addr().String(), func() { stalled.Store(true) }
+}
+
+// architecture §8: a request's database work has a deadline. A statement timeout is
+// enforced by Postgres, so a Postgres that stalls held the request until it woke up, and a
+// client got no answer at all after 40 s (session 6's review, F5).
+func TestARequestEndsAtItsDeadlineWhenPostgresStalls(t *testing.T) {
+	e := testkit.Setup(t)
+	u, err := url.Parse(e.DatabaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, stall := stallingProxy(t, u.Host)
+	u.Host = proxy
+	pool, err := store.Connect(context.Background(), u.String(), DatabaseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	const deadline = 500 * time.Millisecond
+	srv := httptest.NewServer(NewHandler(observability.NewLogger(io.Discard, "api", "error"), Options{
+		Health: Health{Postgres: pool.Ping, Redis: ok}, Pool: pool, MaxAttempts: 6, DatabaseDeadline: deadline,
+	}))
+	t.Cleanup(srv.Close)
+	a := apiEnv{Env: e, url: srv.URL}
+	id := a.post(t, "/v1/notifications", sms("x")).json(t)["id"].(string)
+	stall()
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, c := range []struct{ method, path, body string }{
+		{"GET", "/v1/notifications/" + id, ""},
+		{"POST", "/v1/notifications", `{"recipient":"+905551234567","channel":"sms","content":"y"}`},
+		{"GET", "/v1/notifications", ""},
+	} {
+		req, _ := http.NewRequestWithContext(context.Background(), c.method, srv.URL+c.path, strings.NewReader(c.body))
+		began := time.Now()
+		resp, err := client.Do(req)
+		took := time.Since(began)
+		if err != nil {
+			t.Errorf("%s %s: no answer after %s: %v", c.method, c.path, took.Round(time.Millisecond), err)
+			continue
+		}
+		_ = resp.Body.Close()
+		t.Logf("%s %s: %d after %s", c.method, c.path, resp.StatusCode, took.Round(time.Millisecond))
+		if resp.StatusCode != http.StatusInternalServerError || took > deadline+time.Second {
+			t.Errorf("%s %s: %d after %s, want 500 within the deadline of %s", c.method, c.path, resp.StatusCode, took, deadline)
+		}
+	}
+}
+
+// An answer is encoded before its status is written: one that cannot be encoded is a 500,
+// never a 2xx without a body (session 6's review, F4).
+func TestAnAnswerThatCannotBeEncodedIsA500(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]any{"at": time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)})
+	if rec.Code != http.StatusInternalServerError || rec.Body.Len() == 0 {
+		t.Errorf("%d with %d bytes, want a 500 with the error form", rec.Code, rec.Body.Len())
+	}
+}
+
+// A repeat of a create answers the stored row as the status endpoint does, with its attempt
+// history (session 6's review, F6).
+func TestARepeatedCreateAnswersWithItsAttemptHistory(t *testing.T) {
+	a := newAPI(t)
+	body := sms("x")
+	body["idempotencyKey"] = "repeat-1"
+	id := a.post(t, "/v1/notifications", body).json(t)["id"].(string)
+	if _, err := a.Pool.Exec(context.Background(), `INSERT INTO delivery_attempts
+		(notification_id, attempt_number, started_at, duration_ms, status_code, outcome)
+		VALUES ($1, 1, now(), 5, 503, 'retry'), ($1, 2, now(), 5, 202, 'sent')`, id); err != nil {
+		t.Fatal(err)
+	}
+	repeat := a.post(t, "/v1/notifications", body)
+	got := a.get(t, "/v1/notifications/"+id)
+	if repeat.code != http.StatusOK || !bytes.Equal(repeat.raw, got.raw) {
+		t.Errorf("repeat %d %s\nstatus %s", repeat.code, repeat.raw, got.raw)
+	}
+}
+
+// The key of a single notification is a field of its body. A header was ignored, and two
+// requests with the same header made two notifications (session 6's review, F9).
+func TestAnIdempotencyKeyHeaderOnASingleCreateIsRefused(t *testing.T) {
+	a := newAPI(t)
+	r := a.post(t, "/v1/notifications", sms("x"), "Idempotency-Key", "k1")
+	if r.code != http.StatusBadRequest || fmt.Sprint(r.errorFields(t)) != "[Idempotency-Key]" {
+		t.Errorf("%d %s", r.code, r.raw)
+	}
+	if c := count(t, a, `SELECT count(*) FROM notifications`); c != 0 {
+		t.Errorf("%d rows", c)
 	}
 }

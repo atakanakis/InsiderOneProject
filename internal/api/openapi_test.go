@@ -18,6 +18,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
+	"github.com/atakanakis/InsiderOneProject/internal/store"
 	"github.com/atakanakis/InsiderOneProject/internal/testkit"
 )
 
@@ -67,10 +68,11 @@ func specOperations(t *testing.T) map[string][]int {
 // openAPIServer is the real handler on a real HTTP server, and a second one whose Postgres
 // check fails, for the 503 of /readyz.
 type openAPIServer struct {
-	t      *testing.T
-	url    string
-	downTo string
-	exec   func(sql string, args ...any)
+	t        *testing.T
+	url      string
+	downTo   string
+	brokenTo string // the real handler on a database pool that is closed: every query fails
+	exec     func(sql string, args ...any)
 }
 
 const testAPIKey = "test-key-0123456789"
@@ -326,6 +328,34 @@ var openAPIScenarios = map[string]func(s *openAPIServer) int{
 	"GET /docs 200":         func(s *openAPIServer) int { return s.anonymous("GET", "/docs", "") },
 }
 
+// broken sends one request with the API key to the server whose database fails.
+func (s *openAPIServer) broken(method, path, body string) int {
+	code, _ := s.send(s.brokenTo, method, path, body, "X-API-Key", testAPIKey)
+	return code
+}
+
+// The 500 of every /v1 operation: a request that passes validation reaches a database that
+// fails.
+func init() {
+	id := uuid.NewString()
+	for name, run := range map[string]func(s *openAPIServer) int{
+		"POST /v1/notifications 500":             func(s *openAPIServer) int { return s.broken("POST", "/v1/notifications", smsJSON) },
+		"POST /v1/notifications/batch 500":       func(s *openAPIServer) int { return s.broken("POST", "/v1/notifications/batch", batchJSON("hello")) },
+		"GET /v1/notifications/{id} 500":         func(s *openAPIServer) int { return s.broken("GET", "/v1/notifications/"+id, "") },
+		"GET /v1/notifications 500":              func(s *openAPIServer) int { return s.broken("GET", "/v1/notifications", "") },
+		"POST /v1/notifications/{id}/cancel 500": func(s *openAPIServer) int { return s.broken("POST", "/v1/notifications/"+id+"/cancel", "") },
+		"POST /v1/notifications/{id}/retry 500":  func(s *openAPIServer) int { return s.broken("POST", "/v1/notifications/"+id+"/retry", "") },
+		"GET /v1/batches/{id} 500":               func(s *openAPIServer) int { return s.broken("GET", "/v1/batches/"+id, "") },
+		"POST /v1/templates 500": func(s *openAPIServer) int {
+			return s.broken("POST", "/v1/templates", `{"name": "t", "channel": "sms", "body": "hi"}`)
+		},
+		"GET /v1/templates 500":        func(s *openAPIServer) int { return s.broken("GET", "/v1/templates", "") },
+		"GET /v1/templates/{name} 500": func(s *openAPIServer) int { return s.broken("GET", "/v1/templates/t", "") },
+	} {
+		openAPIScenarios[name] = run
+	}
+}
+
 // architecture §8: every path, method and status code of the specification is produced by
 // the real server, and every route of the server is in the specification.
 func TestOpenAPIMatchesTheServer(t *testing.T) {
@@ -377,6 +407,15 @@ func TestOpenAPIMatchesTheServer(t *testing.T) {
 	t.Cleanup(up.Close)
 	down := httptest.NewServer(NewHandler(log, Options{Health: Health{Postgres: failing, Redis: ok}}))
 	t.Cleanup(down.Close)
+	closed, err := store.Connect(context.Background(), env.DatabaseURL, DatabaseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	broken := httptest.NewServer(NewHandler(log, Options{
+		Health: Health{Postgres: closed.Ping, Redis: ok}, Pool: closed, APIKeys: []string{testAPIKey}, MaxAttempts: 6,
+	}))
+	t.Cleanup(broken.Close)
 
 	names := make([]string, 0, len(listed))
 	for name := range listed {
@@ -389,7 +428,7 @@ func TestOpenAPIMatchesTheServer(t *testing.T) {
 			if !ok {
 				t.Fatalf("no scenario produces %s", name)
 			}
-			s := &openAPIServer{t: t, url: up.URL, downTo: down.URL, exec: func(sql string, args ...any) {
+			s := &openAPIServer{t: t, url: up.URL, downTo: down.URL, brokenTo: broken.URL, exec: func(sql string, args ...any) {
 				t.Helper()
 				if _, err := env.Pool.Exec(context.Background(), sql, args...); err != nil {
 					t.Fatalf("setup: %v", err)

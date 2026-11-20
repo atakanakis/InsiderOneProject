@@ -993,3 +993,32 @@ func TestACorrelationIDOutsideItsBoundIsNotSent(t *testing.T) {
 		t.Errorf("a correlation id of 64 characters arrived as %q", got)
 	}
 }
+
+// The provider URL can hold a secret: a webhook.site path is the credential that opens every
+// message sent to it. Go's *url.Error quotes the URL, and the error of a send was stored as
+// the row's last_error, logged by the worker and shown by the API (session 6's review, F2).
+// Sends that get no response, to a closed port and to a server that closes the connection,
+// must not quote any part of it.
+func TestASendErrorDoesNotQuoteTheURL(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := ln.Addr().String()
+	_ = ln.Close()
+	srv := testkit.Recorder(t, recorder.Options{Respond: func(recorder.Request) recorder.Response {
+		return recorder.Response{Close: true}
+	}})
+	for _, host := range []string{closedPort, strings.TrimPrefix(srv.URL, "http://")} {
+		u := "http://user:s3cret@" + host + "/hooks/secret-token-abc?sig=signature-xyz"
+		r := newClient(t, testOptions(u)).Send(bg(t), message(domain.SMS), allow)
+		if r.Responded || r.Err == nil {
+			t.Fatalf("%s: %+v, want an error and no response", host, r)
+		}
+		for _, secret := range []string{"secret-token-abc", "signature-xyz", "s3cret", "user", "/hooks"} {
+			if strings.Contains(r.Err.Error(), secret) {
+				t.Errorf("%s: the error quotes %q: %v", host, secret, r.Err)
+			}
+		}
+	}
+}

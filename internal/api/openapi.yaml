@@ -49,6 +49,7 @@ paths:
               schema: { $ref: "#/components/schemas/Notification" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "409": { $ref: "#/components/responses/IdempotencyConflict" }
         "413": { $ref: "#/components/responses/BodyTooLarge" }
     get:
@@ -89,6 +90,7 @@ paths:
                   nextCursor: { type: string }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
 
   /v1/notifications/batch:
     post:
@@ -130,6 +132,7 @@ paths:
               schema: { $ref: "#/components/schemas/BatchCreated" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "409": { $ref: "#/components/responses/IdempotencyConflict" }
         "413": { $ref: "#/components/responses/BodyTooLarge" }
 
@@ -147,6 +150,7 @@ paths:
               schema: { $ref: "#/components/schemas/Notification" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/notifications/{id}/cancel:
@@ -164,6 +168,7 @@ paths:
               schema: { $ref: "#/components/schemas/StatusChange" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/WrongStatus" }
 
@@ -182,6 +187,7 @@ paths:
               schema: { $ref: "#/components/schemas/StatusChange" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/WrongStatus" }
 
@@ -199,6 +205,7 @@ paths:
               schema: { $ref: "#/components/schemas/BatchSummary" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/templates:
@@ -227,6 +234,7 @@ paths:
               schema: { $ref: "#/components/schemas/Template" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "409":
           description: A template with this name and another channel or body exists (`template_exists`).
           content:
@@ -254,6 +262,7 @@ paths:
                   nextCursor: { type: string }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
 
   /v1/templates/{name}:
     get:
@@ -271,6 +280,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Template" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /healthz:
@@ -389,6 +399,14 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    Internal:
+      description: |
+        The database failed or did not answer within the request's deadline of 5 s
+        (`internal`). Whether a write that was cut off committed is not known; retry with an
+        idempotency key.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
     Channel:
@@ -404,12 +422,13 @@ components:
       type: string
       minLength: 1
       maxLength: 128
-      pattern: '^[\x20-\x7E]+$'
-      description: 1 to 128 printable ASCII characters.
+      pattern: '^[\x21-\x7E]+$'
+      description: 1 to 128 printable ASCII characters, no space.
     TemplateName:
       type: string
       minLength: 1
       maxLength: 64
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
     Recipient:
       type: string
       minLength: 1
@@ -601,8 +620,9 @@ components:
       type: object
       required: [error]
       description: |
-        The one form of every error from `/v1`. A message never quotes a value from the
-        request. The whole body is at most 64 KiB.
+        The one form of every error a `/v1` handler writes (a path or method the API does not
+        have is the router's plain-text 404 or 405). A message never quotes a value from the
+        request; a name from the request is cut to 64 bytes. The whole body is at most 64 KiB.
       properties:
         error:
           type: object
@@ -611,7 +631,7 @@ components:
             code:
               type: string
               enum: [invalid_json, validation_failed, body_too_large, not_found,
-                     idempotency_conflict, wrong_status, template_exists, unauthorized]
+                     idempotency_conflict, wrong_status, template_exists, unauthorized, internal]
             message: { type: string, maxLength: 300 }
             fields:
               type: array

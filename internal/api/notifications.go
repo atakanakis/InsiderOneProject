@@ -41,6 +41,8 @@ type Options struct {
 	APIKeys     []string         // empty: no authentication
 	MaxAttempts int              // a new row's max_attempts and the budget of /retry; 0 means 6
 	Events      events.Publisher // nil: events.Discard
+	// DatabaseDeadline bounds the database work of a request; 0 means DatabaseDeadline.
+	DatabaseDeadline time.Duration
 }
 
 //go:embed openapi.yaml
