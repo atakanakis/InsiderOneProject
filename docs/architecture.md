@@ -179,6 +179,9 @@ RETURNING ...
 - The claim is called once per priority, highest first, by the dispatcher (section 6). Each
   call is a complete statement. Rows returned by one call are started before the next call is
   made, so there is no combined result that a later failure could drop.
+- The rows come back from `RETURNING` in no particular order; `Claim` sorts the at most `n`
+  rows by `ready_at` in Go, so the statement keeps the plan above, with no sort in the
+  database.
 - The `id = ANY(ARRAY(...))` form is deliberate. The design review measured the more common
   `id IN (SELECT ...)` form under a forced generic plan (the plan a cached prepared statement
   can switch to): it scanned the whole table, 293 ms on 2 million rows. The `ANY(ARRAY(...))`
@@ -199,17 +202,28 @@ If the update matches no row, the result is stale: the lease expired and the rea
 the row back. The attempt row is still kept as history, and nothing else changes. There is no
 exception to this rule, for any kind of result. A final status stays final.
 
+A result is `sent`, `failed` or "retry in d". A retry on the last allowed attempt
+(`attempts >= max_attempts`) is stored as `failed`. The update decides this from the row's
+own counters, in the same statement, so no caller can get it wrong. The attempt row's
+`started_at` is `now()` minus the duration the caller measured: Go passes the duration, not
+the start time.
+
 Finish returns the row's new status, or "stale". The caller publishes a status event only when
-the status really changed.
+the status really changed. If the reply to a Finish is lost and the caller writes the same
+result again, the second write finds the row no longer `processing` and returns "stale"; the
+status is stored, and only its event is missing (events are best-effort, section 9).
 
 **Reap** returns `processing` rows whose lease has expired to `pending`, or to `failed` when
-`attempts` has reached `max_attempts`. It takes a bounded batch with `SKIP LOCKED`, so every
-worker can run it. It does not change `attempts`.
+`attempts` has reached `max_attempts`. It takes a bounded batch with `SKIP LOCKED`, in the same
+`id = ANY(ARRAY(...))` form as the claim, so every worker can run it. It does not change
+`attempts`, and it keeps `ready_at`, so a returned row takes its old place in the queue. It
+returns the ids and new statuses, for the status events.
 
 **Cancel** sets `cancelled` only `WHERE status IN ('scheduled', 'pending', 'retrying')`. A row
-that is being sent cannot be cancelled; the API answers 409.
+that is being sent cannot be cancelled; the API answers 409. Cancel tells "no such row" apart
+from "not in a cancellable status", and returns the status it found.
 
-**Requeue** (`POST /retry`) moves a `failed` row to `pending` and sets
+**Requeue** (`POST /retry`) moves a `failed` row to `pending`, due now, and sets
 `max_attempts = attempts + the default budget`. It does not reset `attempts`, which keeps the
 attempt number unique.
 
@@ -217,9 +231,11 @@ attempt number unique.
 durations ("retry in 4 s"), never timestamps. One clock, so worker clock drift cannot reorder
 the queue.
 
-**Queue writes are not cancelled by shutdown.** Claim, Finish and Reap run on a context that
-ignores the stop signal and has its own timeout. A claim that is interrupted half-way could
-otherwise leave rows `processing` with nobody holding them.
+**Queue writes are not cancelled by shutdown.** All five operations run on a context that
+ignores the caller's cancellation (`context.WithoutCancel`, so the correlation id stays) and
+has its own timeout (10 s). A claim that is interrupted half-way could otherwise leave rows
+`processing` with nobody holding them. Cancel and Requeue follow the same rule: one rule for
+every queue write is simpler than a list of exceptions, and both are one short statement.
 
 **Known behaviours.**
 - If the reply to a claim is lost after the statement committed (a dropped connection), the
