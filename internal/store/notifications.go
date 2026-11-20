@@ -142,10 +142,10 @@ const notificationColumns = `id, batch_id, recipient, channel, content, priority
 // The status and ready_at of a new row are decided by Postgres's clock (rule 7): a scheduledAt
 // in the future waits for it, anything else is due now.
 const createSQL = `INSERT INTO notifications (id, recipient, channel, content, priority, status,
-	max_attempts, ready_at, idempotency_key, request_hash, correlation_id)
+	max_attempts, ready_at, idempotency_key, request_hash, correlation_id, traceparent)
 VALUES ($1, $2, $3, $4, $5,
 	CASE WHEN $6::timestamptz > now() THEN 'scheduled' ELSE 'pending' END,
-	$7, GREATEST(COALESCE($6::timestamptz, now()), now()), NULLIF($8, ''), $9, $10)
+	$7, GREATEST(COALESCE($6::timestamptz, now()), now()), NULLIF($8, ''), $9, $10, $11)
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING ` + notificationColumns
 
@@ -166,7 +166,8 @@ func scanNotification(row pgx.Row) (Notification, []byte, error) {
 // first commits, then inserts nothing and reads the first row.
 func (s *Notifications) Create(ctx context.Context, n NewNotification) (Notification, bool, error) {
 	row := s.pool.QueryRow(ctx, createSQL, n.ID, n.Recipient, string(n.Channel), n.Content, n.Priority,
-		n.ScheduledAt, s.maxAttempts, n.IdempotencyKey, n.RequestHash, observability.CorrelationID(ctx))
+		n.ScheduledAt, s.maxAttempts, n.IdempotencyKey, n.RequestHash, observability.CorrelationID(ctx),
+		observability.Traceparent(ctx))
 	created, _, err := scanNotification(row)
 	if err == nil {
 		return created, true, nil
@@ -186,10 +187,10 @@ func (s *Notifications) Create(ctx context.Context, n NewNotification) (Notifica
 }
 
 const createBatchItemsSQL = `INSERT INTO notifications (id, batch_id, recipient, channel, content,
-	priority, status, max_attempts, ready_at, correlation_id)
+	priority, status, max_attempts, ready_at, correlation_id, traceparent)
 SELECT i.id, $1, i.recipient, i.channel, i.content, i.priority,
 	CASE WHEN i.scheduled_at > now() THEN 'scheduled' ELSE 'pending' END,
-	$2, GREATEST(COALESCE(i.scheduled_at, now()), now()), $3
+	$2, GREATEST(COALESCE(i.scheduled_at, now()), now()), $3, $10
 FROM unnest($4::uuid[], $5::text[], $6::text[], $7::text[], $8::smallint[], $9::timestamptz[])
 	AS i(id, recipient, channel, content, priority, scheduled_at)`
 
@@ -226,7 +227,7 @@ func (s *Notifications) CreateBatch(ctx context.Context, b NewBatch) (uuid.UUID,
 			priorities[i], scheduled[i] = int16(it.Priority), it.ScheduledAt
 		}
 		if _, err := tx.Exec(ctx, createBatchItemsSQL, b.ID, s.maxAttempts, observability.CorrelationID(ctx),
-			ids, recipients, channels, contents, priorities, scheduled); err != nil {
+			ids, recipients, channels, contents, priorities, scheduled, observability.Traceparent(ctx)); err != nil {
 			return fmt.Errorf("create batch items: %w", err)
 		}
 		return nil

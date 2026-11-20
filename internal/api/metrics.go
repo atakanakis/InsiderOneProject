@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,22 +38,19 @@ func NewMetrics() *observability.APIMetrics {
 	return observability.NewAPIMetrics(observability.NewRegistry())
 }
 
-// measured counts a request under its method, its route pattern and its status code. The
-// method of a request that is not one of observability.HTTPMethods is "other", and a path
-// the router has no pattern for is "unmatched": no label takes a value from the request.
-func measured(m *observability.APIMetrics, r *http.Request, code int, took time.Duration) {
-	method := r.Method
+// labelsOf returns a routed request's method and route pattern as label values. A method
+// that is not one of observability.HTTPMethods is "other", and a path the router has no
+// pattern for is "unmatched": no label takes a value from the request.
+func labelsOf(r *http.Request) (method, route string) {
+	method = r.Method
 	if !slices.Contains(observability.HTTPMethods, method) {
 		method = "other"
 	}
-	route := r.Pattern
+	route = r.Pattern
 	if route == "" {
 		route = "unmatched"
 	}
-	m.Requests.WithLabelValues(method, route, strconv.Itoa(code)).Inc()
-	if code != http.StatusSwitchingProtocols { // a WebSocket lasts as long as its client stays
-		m.Duration.WithLabelValues(method, route).Observe(took.Seconds())
-	}
+	return method, route
 }
 
 // cached is a figure read from Postgres, reused for FiguresTTL. One read at a time: a caller

@@ -42,6 +42,9 @@ type Config struct {
 	// MetricsAddr (METRICS_ADDR): where the worker serves /metrics (architecture §10). The
 	// API serves it on API_ADDR.
 	MetricsAddr string
+	// TracingEndpoint (OTEL_EXPORTER_OTLP_ENDPOINT): the base URL of an OTLP over HTTP
+	// collector; empty, tracing is off (architecture §10).
+	TracingEndpoint string
 }
 
 // Worker is the timing budget of architecture §13. The comment on each field is its
@@ -73,14 +76,15 @@ type Worker struct {
 func Load(getenv func(string) string) (Config, error) {
 	p := parser{getenv: getenv}
 	c := Config{
-		DatabaseURL: p.str("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
-		RedisURL:    p.str("REDIS_URL", "redis://localhost:6379/0"),
-		ProviderURL: p.str("PROVIDER_URL", "http://localhost:9090/send"),
-		APIAddr:     p.str("API_ADDR", ":8080"),
-		LogLevel:    p.oneOf("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
-		APIKeys:     p.list("API_KEYS"),
-		MaxAttempts: p.integer("MAX_ATTEMPTS", 6),
-		MetricsAddr: p.str("METRICS_ADDR", ":9100"),
+		DatabaseURL:     p.str("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
+		RedisURL:        p.str("REDIS_URL", "redis://localhost:6379/0"),
+		ProviderURL:     p.str("PROVIDER_URL", "http://localhost:9090/send"),
+		APIAddr:         p.str("API_ADDR", ":8080"),
+		LogLevel:        p.oneOf("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
+		APIKeys:         p.list("API_KEYS"),
+		MaxAttempts:     p.integer("MAX_ATTEMPTS", 6),
+		MetricsAddr:     p.str("METRICS_ADDR", ":9100"),
+		TracingEndpoint: p.str("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
 	for i, k := range c.APIKeys {
 		if len(k) < MinAPIKeyLen {

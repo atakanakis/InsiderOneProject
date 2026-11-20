@@ -51,6 +51,16 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	// Status events (architecture §9): the publisher and the subscription each have their own
 	// Redis client, so neither holds a connection the other or the readiness check needs.
 	metrics := api.NewMetrics()
+	tracing, stopTracing, err := observability.Tracing(ctx, cfg.TracingEndpoint, "notifications-api", log)
+	if err != nil {
+		log.Error("tracing", "error", err)
+		return 2
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = stopTracing(stopCtx)
+	}()
 	publishClient, err := redisclient.New(cfg.RedisURL)
 	if err != nil {
 		log.Error("redis url", "error", err)
@@ -77,6 +87,7 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		Events:      publisher,
 		Metrics:     metrics,
 		Hub:         hub,
+		Tracing:     tracing,
 	}))
 	srv.RegisterOnShutdown(hub.Close) // every WebSocket is closed with 1001
 	errc := make(chan error, 1)

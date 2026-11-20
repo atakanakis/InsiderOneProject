@@ -8,11 +8,16 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
@@ -67,6 +72,9 @@ func NewHandler(log *slog.Logger, o Options) http.Handler {
 	if o.Hub == nil {
 		o.Hub = NewHub(HubOptions{Metrics: o.Metrics})
 	}
+	if o.Tracing == nil {
+		o.Tracing = noop.NewTracerProvider()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_ = writeJSON(w, http.StatusOK, map[string]string{"status": "ok"}) // a map of strings always encodes
@@ -75,7 +83,7 @@ func NewHandler(log *slog.Logger, o Options) http.Handler {
 		ready(w, r, log, h)
 	})
 	register(mux, log, o)
-	return correlate(log, o.Metrics, mux)
+	return correlate(log, o.Metrics, o.Tracing.Tracer("api"), mux)
 }
 
 // NewServer returns an HTTP server with the request bounds of architecture §8.
@@ -136,21 +144,32 @@ func ready(w http.ResponseWriter, r *http.Request, log *slog.Logger, h Health) {
 // correlate accepts the client's X-Correlation-ID when it is within the bound of
 // architecture §8, and otherwise creates one. The id is put in the context, so every log
 // line of the request carries it, and is sent back in the response. The request is counted
-// under its route pattern, which the router sets (architecture §10).
-func correlate(log *slog.Logger, m *observability.APIMetrics, next http.Handler) http.Handler {
+// under its route pattern, which the router sets, and has a span, the child of its
+// traceparent header when it has one (architecture §10).
+func correlate(log *slog.Logger, m *observability.APIMetrics, tracer trace.Tracer, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(correlationHeader)
 		if !observability.ValidCorrelationID(id) {
 			id = observability.NewCorrelationID()
 		}
 		ctx := observability.WithCorrelationID(r.Context(), id)
+		ctx, span := tracer.Start(observability.FromHeaders(ctx, propagation.HeaderCarrier(r.Header)), r.Method,
+			trace.WithSpanKind(trace.SpanKindServer))
 		w.Header().Set(correlationHeader, id)
 		began := time.Now()
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
 		routed := r.WithContext(ctx)
 		next.ServeHTTP(sw, routed)
 		took := time.Since(began)
-		measured(m, routed, sw.code, took)
+		method, route := labelsOf(routed)
+		m.Requests.WithLabelValues(method, route, strconv.Itoa(sw.code)).Inc()
+		if sw.code != http.StatusSwitchingProtocols { // a WebSocket lasts as long as its client stays
+			m.Duration.WithLabelValues(method, route).Observe(took.Seconds())
+		}
+		span.SetName(route)
+		span.SetAttributes(attribute.String("http.request.method", r.Method), attribute.String("http.route", route),
+			attribute.Int("http.response.status_code", sw.code))
+		span.End()
 		log.DebugContext(ctx, "request", "method", r.Method, "path", r.URL.Path,
 			"status", sw.code, "duration_ms", took.Milliseconds())
 	})

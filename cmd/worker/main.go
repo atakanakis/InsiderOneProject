@@ -84,6 +84,16 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		IdleConns: budget.IdleConns, IdleConnTimeout: budget.IdleConnTimeout,
 	}
 	queue := store.NewQueue(pool)
+	tracing, stopTracing, err := observability.Tracing(ctx, cfg.TracingEndpoint, "notifications-worker", log)
+	if err != nil {
+		log.Error("tracing", "error", err)
+		return 2
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = stopTracing(stopCtx)
+	}()
 	reg := observability.NewRegistry()
 	metrics := observability.NewWorkerMetrics(reg)
 	// The publisher has its own Redis client: a publish never holds a connection the rate
@@ -110,7 +120,7 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 			Channel: ch, Slots: budget.Slots, ClaimBatch: budget.ClaimBatch, Lease: budget.Lease,
 			PauseBusy: budget.PauseBusy, PauseIdle: budget.PauseIdle, BreakerOpen: budget.BreakerOpen,
 			Retry:    dispatch.RetryPolicy{Base: budget.BackoffBase, Cap: budget.BackoffCap, Soon: time.Second},
-			Provider: providerOptions, Log: log, Events: publisher, Metrics: metrics,
+			Provider: providerOptions, Log: log, Events: publisher, Metrics: metrics, Tracing: tracing,
 		}, queue, limiter)
 		if err != nil {
 			log.Error("dispatcher", "channel", ch, "error", err)

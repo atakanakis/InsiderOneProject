@@ -20,7 +20,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/events"
@@ -68,6 +70,7 @@ type Dispatcher struct {
 	limiter  Limiter
 	provider *provider.Client // its own, built by New: no provider can skip the send gate (rule 9)
 	breaker  *Breaker
+	tracer   trace.Tracer
 	slots    chan struct{} // one token per send in flight
 	waiting  atomic.Int64  // rows claimed and not yet back from the gate
 	inflight sync.WaitGroup
@@ -97,12 +100,15 @@ func New(o Options, q Queue, l Limiter) (*Dispatcher, error) {
 	if o.Metrics == nil {
 		o.Metrics = observability.NewWorkerMetrics(prometheus.NewRegistry())
 	}
+	if o.Tracing == nil {
+		o.Tracing = noop.NewTracerProvider()
+	}
 	c, err := provider.New(o.Provider)
 	if err != nil {
 		return nil, fmt.Errorf("dispatch: %w", err)
 	}
 	d := &Dispatcher{o: o, queue: q, limiter: l, provider: c, breaker: NewBreaker(o.BreakerOpen, time.Now),
-		slots: make(chan struct{}, o.Slots), claims: observability.NewEvery(logPeriod),
+		tracer: o.Tracing.Tracer("worker"), slots: make(chan struct{}, o.Slots), claims: observability.NewEvery(logPeriod),
 		limits: observability.NewEvery(logPeriod), writes: observability.NewEvery(logPeriod)}
 	o.Metrics.Watch(o.Channel, func() int { return int(d.breaker.State()) }, func() int { return len(d.slots) })
 	return d, nil
@@ -188,6 +194,11 @@ func (d *Dispatcher) handle(ctx context.Context, row store.Claimed, probe bool, 
 	defer func() { <-d.slots }()
 	defer wait.leave()
 	ctx = observability.WithCorrelationID(ctx, row.CorrelationID)
+	// The delivery span joins the trace of the request that created the row (architecture §10).
+	ctx, span := d.tracer.Start(observability.WithTraceparent(ctx, row.Traceparent), "deliver",
+		trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attribute.String("notification.id", row.ID.String()),
+			attribute.String("notification.channel", string(row.Channel)), attribute.Int("notification.attempt", row.Attempt)))
+	defer span.End()
 	// Publish never waits (architecture §9).
 	d.o.Events.Publish(ctx, events.Event{ID: row.ID, BatchID: row.BatchID, Status: domain.Processing})
 	var gate gateTimes // set by the gate, on this goroutine (architecture §7, property 1)
@@ -200,6 +211,11 @@ func (d *Dispatcher) handle(ctx context.Context, row store.Claimed, probe bool, 
 	})
 	verdict := Classify(result)
 	d.measure(gate, verdict)
+	span.SetAttributes(attribute.String("notification.outcome", outcomeLabel(verdict.Outcome)),
+		attribute.Int("http.response.status_code", result.StatusCode))
+	if gate.permitted {
+		span.AddEvent("permit", trace.WithTimestamp(gate.ended))
+	}
 	d.breaker.Report(probe, verdict.Lesson)
 	d.finish(ctx, row, result, verdict)
 }
