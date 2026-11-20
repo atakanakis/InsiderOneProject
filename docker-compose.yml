@@ -58,6 +58,10 @@ services:
   api:
     <<: *app
     command: ["/app/api"]
+    environment:
+      <<: *env
+      # Empty: no authentication. API_KEYS=key1,key2 make up: every /v1 request needs one.
+      API_KEYS: ${API_KEYS:-}
     ports: ["8080:8080"]
     depends_on:
       migrate: { condition: service_completed_successfully }

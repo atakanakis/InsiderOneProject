@@ -56,7 +56,8 @@ make down        # stop and delete the data
 ```
 
 The specification is at <http://localhost:8080/openapi.yaml>, with a viewer at
-<http://localhost:8080/docs>. With `API_KEYS=key1,key2` set, every `/v1` request needs
+<http://localhost:8080/docs>. Started with `API_KEYS=key1,key2 make up` (or the variable in a
+`.env` file), the API asks every `/v1` request for one of the keys, in
 `Authorization: Bearer <key>` or `X-API-Key: <key>`.
 
 The mock provider can fail on purpose, to watch retries and the circuit breaker:

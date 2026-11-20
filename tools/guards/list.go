@@ -233,7 +233,7 @@ var guards = []Guard{
 	},
 	{
 		Name: "api: request header time bound", File: "internal/api/health.go",
-		Old: "ReadHeaderTimeout: headerTimeout,", New: "ReadHeaderTimeout: 0,",
+		Old: "ReadHeaderTimeout: t.header,", New: "ReadHeaderTimeout: 0,",
 		Package: "./internal/api", Test: "TestSlowRequestHeadersAreCutOff",
 	},
 
