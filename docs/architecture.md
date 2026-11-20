@@ -439,9 +439,8 @@ TCP and TLS handshakes. Only the request write and the network remain.
 ```go
 GotConn: func(info httptrace.GotConnInfo) {
     if err := gate(gateCtx); err != nil {    // limiter.Wait, bounded by the gate budget
-        refused.Store(true)
-        info.Conn.Close()                    // nothing can be written on this connection
-        cancel()                             // end the request
+        r.Refusal = err
+        info.Conn.Close()                    // the write that follows fails: nothing is sent
     }
 }
 ```
@@ -449,20 +448,30 @@ GotConn: func(info httptrace.GotConnInfo) {
 Five properties make "one send, one connection, one permit, at most one write" true:
 
 1. **The hook runs before the write.** `GotConn` is called on the caller's goroutine before the
-   transport hands the request to its write loop.
-2. **A refused request is stopped by closing its connection, then cancelling.** Cancelling
-   alone is not enough: the write loop does not look at the context
-   ([experiment 01](experiments/01-gate-refusal.md)).
+   transport hands the request to its write loop. (Go 1.27.4, `net/http/transport.go`:
+   `getConn` calls `trace.GotConn` at line 1632, after the connection is ready; `roundTrip`
+   calls `getConn` at line 714 and only then `pconn.roundTrip`, which hands the request to
+   the write loop at line 3063.)
+2. **A refused request is stopped by closing its connection.** Cancelling instead is not
+   enough: the write loop does not look at the context
+   ([experiment 01](experiments/01-gate-refusal.md)). The first draft closed the connection
+   and then cancelled. Session 4 measured the cancel as adding nothing: through the real
+   client, with the close alone, 0 of 20,000 refused sends reached the server (two runs of
+   the A1 test of section 12, 10,000 each); without the close, 5, 5 and 8 of 10,000 did. The cancel was removed (CLAUDE.md, rule 11): a closed connection makes the
+   transport's write fail, and the send returns that error.
 3. **The transport never replays a request.** Go replays a request on a new connection when a
    reused connection turns out to be dead, and it treats a request with an `Idempotency-Key`
    header as safe to replay. A replay would be a second write inside one attempt. The client
    sets `req.GetBody = nil`, which turns replays off; a dead connection then becomes an
    ordinary failed attempt, and the retry is the queue's decision. (Measured in the design
    review: with the default, the server received the request twice while the client saw one
-   success.)
+   success. In Go 1.27.4 a request with a body is replayable only when `GetBody` is set,
+   `net/http/request.go` line 1562, and the "nothing was written" retry needs it too,
+   `transport.go` line 871.)
 4. **HTTP/1.1 only**, set through `Transport.Protocols`, so one connection carries one
    request and closing it cannot hurt another. A test checks the protocol against a TLS server
-   that offers HTTP/2.
+   that offers HTTP/2. (Go would also leave HTTP/2 off for a transport with its own dialer,
+   `transport.go` line 489; the explicit setting does not depend on that default.)
 5. **Redirects are not followed.** Go's client follows a 301, 302 or 303 by sending a `GET`
    without the body on a second connection, and the final 200 would look like a delivery
    (measured in the design review: two permits, and `sent` for a message the provider never
@@ -473,6 +482,29 @@ Five properties make "one send, one connection, one permit, at most one write" t
 waiting at the gate, writing and reading the response. The gate waits on a child of that
 context limited to the gate budget (5 s). `http.Client.Timeout` is not used, because the hook
 cannot see it. Dial and TLS handshake have their own shorter timeouts (3 s each).
+
+**The provider client in detail** (`internal/provider`, session 4).
+
+- `Send(ctx, message, gate) Result`. The request is the assignment's: `POST` to
+  `PROVIDER_URL` with the JSON body `{"to", "channel", "content"}`, `Content-Type:
+  application/json`, the notification id as `Idempotency-Key`, and `X-Correlation-ID` when the
+  notification has one.
+- `Send` puts the send timeout on the caller's context; that is the one deadline. The gate's
+  context is a child of it, limited to the gate budget, so a gate still waiting when the send's
+  deadline passes stops and takes no permit afterwards.
+- The hook's state needs no lock: it runs on the goroutine that called `Do` (property 1), and
+  `Send` reads it after `Do` returns.
+- **`Result` carries what was observed, and nothing else:** whether a response arrived, its
+  status, its `Retry-After` (seconds or an HTTP date, read on arrival; absent or malformed is
+  0; above one day is one day, so the duration cannot overflow), the `messageId` of a 2xx JSON
+  body, and the start of the body; the gate's error when it refused (`ErrNoPermitInTime` or a
+  limiter error, which `Classify` tells apart); whether the connection was reused; the error
+  when no response arrived; the duration. It holds no verdict. What it means for the row is
+  decided by `Classify` (section 6), in session 5.
+- No proxy: a send goes straight to the provider, as it does in every measurement here.
+- **Bounds.** The client reads at most 64 KiB of response headers (Go's default is 10 MiB,
+  `transport.go` line 340) and at most 4 KiB of a response body. A longer body is cut, and
+  its connection is closed instead of being read to the end.
 
 **The connection pool** keeps as many idle connections as there are slots; with Go's default
 of 2 the review measured 686 new connections in 10 s and 6% less throughput. Idle connections
@@ -615,6 +647,7 @@ known enum values. Errors name the field.
 | Metrics window | 1 hour |
 | Database time per API request | Statement timeout of 5 s |
 | Rate-limit window in Redis (section 7) | At most `limit` permits per channel, also with workers of different settings; both keys expire one window after the last permit (TestTheWindowHoldsAtMostTheLimitAndExpires, TestWorkersWithDifferentSettingsAreRefused) |
+| Provider response read by the worker (section 7) | Headers 64 KiB; body 4 KiB, the rest not read |
 | Text stored from a delivery result (section 5) | Error and outcome 1 KiB, provider message id 256 bytes, valid UTF-8 (TestFinishStoresTextAtItsBound, TestFinishStoresAnyErrorTextWithinItsBound) |
 | WebSocket | 1000 connections per API instance; a client that cannot keep up is disconnected |
 | `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged (TestCorrelationIDBound, TestCorrelationIDIsAcceptedOrReplaced) |
