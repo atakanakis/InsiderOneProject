@@ -231,11 +231,14 @@ func TestColumnChecksAcceptExactlyTheDomainValues(t *testing.T) {
 		}
 	}
 	bad := map[string]error{
-		"status 'done'":   insertNotification(c, e.Pool, "sms", "done", 0, nil),
-		"channel 'fax'":   insertNotification(c, e.Pool, "fax", "pending", 0, nil),
-		"priority 3":      insertNotification(c, e.Pool, "sms", "pending", 3, nil),
-		"priority -1":     insertNotification(c, e.Pool, "sms", "pending", -1, nil),
-		"template 'fax'":  func() error { _, err := e.Pool.Exec(c, `INSERT INTO templates (name, channel, body) VALUES ('x', 'fax', 'b')`); return err }(),
+		"status 'done'": insertNotification(c, e.Pool, "sms", "done", 0, nil),
+		"channel 'fax'": insertNotification(c, e.Pool, "fax", "pending", 0, nil),
+		"priority 3":    insertNotification(c, e.Pool, "sms", "pending", 3, nil),
+		"priority -1":   insertNotification(c, e.Pool, "sms", "pending", -1, nil),
+		"template 'fax'": func() error {
+			_, err := e.Pool.Exec(c, `INSERT INTO templates (name, channel, body) VALUES ('x', 'fax', 'b')`)
+			return err
+		}(),
 		"status 'SENT'":   insertNotification(c, e.Pool, "sms", "SENT", 0, nil),
 		"channel 'Email'": insertNotification(c, e.Pool, "Email", "pending", 0, nil),
 	}

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+
+  test:
+    # Unit and integration tests; testcontainers starts Postgres and Redis on the runner's
+    # Docker daemon.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Test (race detector)
+        run: make test
+      - name: Every test named in docs/ exists
+        run: make check-docs
+
+  guards:
+    # Each guard is disabled in turn; its named test must fail (CLAUDE.md, rule 13).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Guards
+        run: make guards
+      - name: The tree is unchanged after the mutations
+        run: git diff --exit-code
+
+  compose:
+    # The stack starts with one command, and the API answers its health endpoints.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start the stack
+        run: docker compose up --build -d --wait api worker mockprovider
+      - name: Health endpoints
+        run: |
+          curl -sf localhost:8080/healthz
+          curl -sf localhost:8080/readyz
+          curl -sf localhost:9090/stats
+      - name: The worker stops cleanly
+        run: |
+          docker compose stop worker
+          test "$(docker compose ps -a worker --format '{{.ExitCode}}')" = 0
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v

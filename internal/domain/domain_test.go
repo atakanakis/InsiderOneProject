@@ -76,7 +76,7 @@ func TestPrioritiesAreOrderedHighestFirst(t *testing.T) {
 		t.Fatalf("Priorities = %v", Priorities)
 	}
 	// The claim orders by the stored number, so a higher priority must have a smaller one.
-	if !(High < Normal && Normal < Low) || High != 0 || Low != 2 {
+	if High >= Normal || Normal >= Low || High != 0 || Low != 2 {
 		t.Fatalf("stored values: high %d, normal %d, low %d; want 0, 1, 2", High, Normal, Low)
 	}
 }

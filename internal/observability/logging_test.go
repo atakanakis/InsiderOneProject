@@ -92,7 +92,7 @@ func TestCorrelationIDBound(t *testing.T) {
 	if id := NewCorrelationID(); !ValidCorrelationID(id) {
 		t.Errorf("NewCorrelationID() = %q is not valid", id)
 	}
-	if NewCorrelationID() == NewCorrelationID() {
+	if a, b := NewCorrelationID(), NewCorrelationID(); a == b {
 		t.Error("two new correlation ids are equal")
 	}
 }

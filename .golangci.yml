@@ -1,0 +1,32 @@
+version: "2"
+
+linters:
+  # Defaults (errcheck, govet, ineffassign, staticcheck, unused) plus checks that catch real
+  # bugs in this kind of code: leaked bodies and rows, wrong error comparisons, HTTP requests
+  # without a context, security smells. Carried over from the first version.
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+  settings:
+    gosec:
+      excludes:
+        - G404 # math/rand is fine for retry jitter
+  exclusions:
+    presets: [std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose]
+      - path: ^tools/
+        linters: [gosec]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/atakanakis/InsiderOneProject]
