@@ -172,7 +172,11 @@ WHERE id = ANY(ARRAY(
 RETURNING ...
 ```
 
-- `SKIP LOCKED`: two workers never take the same row and never wait for each other.
+- The row lock (`FOR UPDATE`) and the status filter keep two workers from taking the same
+  row: a row another claim has just taken is locked, and once that claim commits it is no
+  longer waiting (TestConcurrentClaimsNeverTakeTheSameRow). `SKIP LOCKED` makes a claim pass
+  over a locked row instead of waiting for it, so claims never wait for each other or for a
+  Finish or Cancel in progress (TestClaimSkipsRowsLockedByAnotherTransaction).
 - For a fixed channel and priority the index is ordered by `ready_at`, so the database reads
   due rows in order and stops after `n`. Rows that are not due yet lie past the end of the
   range and are never read, however many there are.
@@ -212,10 +216,12 @@ own counters, in the same statement, so no caller can get it wrong
 the duration the caller measured: Go passes the duration, not the start time
 (TestFinishStoresEachResultOnTheDatabaseClock).
 
-The text a result stores is bounded: the error 1 KiB, the provider's message id 256 bytes, cut
-at a character boundary, with invalid UTF-8 replaced and NUL removed. Postgres refuses both in
-`text`, and a result write that fails every time would get the row sent again after its lease
-(TestFinishStoresAnyErrorTextWithinItsBound).
+The text a result stores is bounded (section 8): the error and the outcome 1 KiB, the
+provider's message id 256 bytes, cut at a character boundary, with invalid UTF-8 replaced and
+NUL removed. Postgres refuses both in `text`, and a result write that fails every time would
+get the row sent again after its lease (TestFinishStoresAnyErrorTextWithinItsBound,
+TestFinishStoresTextAtItsBound). A long input is cut before it is cleaned, so its size costs
+nothing.
 
 Finish returns the row's new status, or "stale". The caller publishes a status event only when
 the status really changed. If the reply to a Finish is lost and the caller writes the same
@@ -224,14 +230,18 @@ status is stored, and only its event is missing (events are best-effort, section
 
 **Reap** returns `processing` rows whose lease has expired to `pending`, or to `failed` when
 `attempts` has reached `max_attempts`. It takes a bounded batch with `SKIP LOCKED`, in the same
-`id = ANY(ARRAY(...))` form as the claim, so every worker can run it. It does not change
+`id = ANY(ARRAY(...))` form as the claim, so every worker can run it, and reapers pass over
+each other's rows (TestReapSkipsRowsLockedByAnotherTransaction). It does not change
 `attempts`, and it keeps `ready_at`, so a returned row takes its old place in the queue. It
-returns the ids and new statuses, for the status events.
+sets `last_error` to "lease expired". It writes no attempt row: only Finish writes one, so an
+attempt lost with its worker shows in the history as a missing attempt number. It returns the
+ids and new statuses, for the status events.
 
 **Cancel** sets `cancelled` only `WHERE status IN ('scheduled', 'pending', 'retrying')`. A row
 that is being sent cannot be cancelled; the API answers 409. Cancel tells "no such row" apart
 from "not in a cancellable status", and returns the status it found
-(TestCancelOnlyFromWaitingStatuses). A cancelled row is final: a late result, the reaper, a
+(TestCancelOnlyFromWaitingStatuses). It locks the row before the update, in one transaction,
+so the status it reports is the one the update refused; Requeue does the same. A cancelled row is final: a late result, the reaper, a
 claim and a requeue all leave it alone (TestACancelledRowCannotBeRevived).
 
 **Requeue** (`POST /retry`) moves a `failed` row to `pending`, due now, and sets
@@ -530,6 +540,7 @@ known enum values. Errors name the field.
 | List page | 100 items; items are summaries without `content` |
 | Metrics window | 1 hour |
 | Database time per API request | Statement timeout of 5 s |
+| Text stored from a delivery result (section 5) | Error and outcome 1 KiB, provider message id 256 bytes, valid UTF-8 (TestFinishStoresTextAtItsBound, TestFinishStoresAnyErrorTextWithinItsBound) |
 | WebSocket | 1000 connections per API instance; a client that cannot keep up is disconnected |
 | `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged (TestCorrelationIDBound, TestCorrelationIDIsAcceptedOrReplaced) |
 
@@ -585,12 +596,12 @@ the session that builds the part.
 | # | Invariant | Enforced in | Tests so far |
 |---|---|---|---|
 | I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | |
-| I2 | A row is never claimed by a second worker while its lease is valid | `SKIP LOCKED` and the status filter in Claim | TestConcurrentClaimsNeverTakeTheSameRow (32 claimers, 2,000 rows), TestClaimTakesExactlyTheClaimableStatuses |
+| I2 | A row is never claimed by a second worker while its lease is valid | The row lock and the status filter in Claim; `SKIP LOCKED` so that claims do not wait | TestConcurrentClaimsNeverTakeTheSameRow (32 claimers, 2,000 rows), TestClaimTakesExactlyTheClaimableStatuses, TestClaimSkipsRowsLockedByAnotherTransaction |
 | I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish | The database part: TestAnAttemptNumberIsRecordedOnce. The `WHERE` of Finish: TestFinishFromAStaleAttemptChangesNothing, TestFinishOnARowThatIsNoLongerProcessingChangesNothing, TestRepeatedFinishAddsNoSecondAttemptRow |
-| I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | Reap: TestReapReturnsExpiredRowsToPendingOrFailed, TestTwoReapersAtOnceReturnEachRowOnce. The single exit: session 5. |
+| I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | Reap: TestReapReturnsExpiredRowsToPendingOrFailed, TestTwoReapersAtOnceReturnEachRowOnce, TestReapSkipsRowsLockedByAnotherTransaction. The single exit: session 5. |
 | I5 | An accepted notification is never lost: it ends as `sent`, `failed` or `cancelled` | I4 + retries + the `failed` state | |
 | I6 | A provider response always decides the verdict | `Classify` | |
-| I7 | `attempts` only goes up. Each claim is one attempt, and no attempt number is used twice. | Claim; Requeue raises `max_attempts` | TestAttemptsNeverGoDown (600 random steps of all five operations), TestRequeueRaisesMaxAttemptsByTheBudget |
+| I7 | `attempts` only goes up. Each claim is one attempt, and no attempt number is used twice. | Claim; Requeue raises `max_attempts` | TestAttemptsNeverGoDown (600 random steps of all five operations on six rows; a row that becomes final is replaced, the seed changes per run and is logged, and the test fails if any operation never took effect), TestRequeueRaisesMaxAttemptsByTheBudget |
 | I8 | One send makes one connection, takes one permit and writes at most one request | Provider client (section 7, properties 1 to 5) | |
 | I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule | The queue's part: TestClaimsInPriorityTurnTakeHigherPrioritiesFirst, TestClaimTakesOnlyItsChannelAndPriority. The loop: session 5. |
 | I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash | The database part: TestIdempotencyKeysAreUniqueInTheDatabase. The request hash: session 6. |
