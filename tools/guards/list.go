@@ -507,7 +507,7 @@ var guards = []Guard{
 	{
 		Name: "ratelimit: a script error is not a permit", File: "internal/ratelimit/ratelimit.go",
 		Old: "return 0, err // fail closed", New: "return 0, nil // fail closed",
-		Package: "./internal/ratelimit", Test: "TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails",
+		Package: "./internal/ratelimit", Test: "TestAvailableFailsWhenTheTakeScriptWould",
 	},
 	{
 		Name: "ratelimit: an unreachable Redis is not a permit", File: "internal/ratelimit/ratelimit.go",
@@ -531,13 +531,13 @@ var guards = []Guard{
 	},
 	{
 		Name: "ratelimit: Available only reads", File: "internal/ratelimit/ratelimit.go",
-		Old: "#!lua flags=no-writes\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
+		Old: "local used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')", New: "redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])",
 		Package: "./internal/ratelimit", Test: "TestAvailableChangesNothing",
 	},
 	{
-		Name: "ratelimit: Available works when only writes fail", File: "internal/ratelimit/ratelimit.go",
-		Old: "#!lua flags=no-writes\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nlocal used = redis.call('ZCOUNT', KEYS[1], string.format('(%d', now - tonumber(ARGV[2])), '+inf')\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.RunRO(", New: "#!lua\nlocal held = redis.call('GET', KEYS[2])\nif held and held ~= ARGV[1] .. '/' .. ARGV[2] then\n  return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)\nend\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) * 1000000 + tonumber(t[2])\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', string.format('%d', now - tonumber(ARGV[2])))\nlocal used = redis.call('ZCARD', KEYS[1])\nreturn math.max(0, tonumber(ARGV[1]) - used)\n`)\n\n// Available returns the number of free permits of the channel now. It changes nothing; the\n// answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is\n// an error.\nfunc (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {\n\tn, err := readScript.Run(",
-		Package: "./internal/ratelimit", Test: "TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails",
+		Name: "ratelimit: Available fails when Redis refuses writes (session 5's review, F2)", File: "internal/ratelimit/ratelimit.go",
+		Old: "var readScript = redis.NewScript(`#!lua\n", New: "var readScript = redis.NewScript(`#!lua flags=no-writes\n",
+		Package: "./internal/ratelimit", Test: "TestAvailableFailsWhenTheTakeScriptWould",
 	},
 	{
 		Name: "ratelimit: a refused call adds nothing", File: "internal/ratelimit/ratelimit.go",
@@ -795,7 +795,7 @@ var guards = []Guard{
 	{
 		Name: "classify: a limiter error is a failure", File: "internal/dispatch/classify.go",
 		Old: "case r.Refusal != nil && !errors.Is(r.Refusal, ratelimit.ErrNoPermitInTime):", New: "case false && r.Refusal != nil && !errors.Is(r.Refusal, ratelimit.ErrNoPermitInTime):",
-		Package: "./internal/dispatch", Test: "TestABrokenTakeScriptOpensTheBreakerAndFailsNoRowWithoutASend",
+		Package: "./internal/dispatch", Test: "TestClassifyDecidesEveryRowOfTheVerdictTable",
 	},
 	{
 		Name: "classify: no permit in time teaches nothing", File: "internal/dispatch/classify.go",
@@ -894,7 +894,7 @@ var guards = []Guard{
 	},
 	{
 		Name: "provider: a connection closed idle is reported", File: "internal/provider/provider.go",
-		Old: "r.ClosedIdle = r.Refusal == nil && closedIdle(err)", New: "r.ClosedIdle = false && closedIdle(err)",
+		Old: "r.ClosedIdle = r.Refusal == nil && r.ConnReused && closedIdle(err)", New: "r.ClosedIdle = false && r.ConnReused && closedIdle(err)",
 		Package: "./internal/provider", Test: "TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle",
 	},
 	{
@@ -916,5 +916,20 @@ var guards = []Guard{
 		Name: "worker: a reaper runs", File: "cmd/worker/main.go",
 		Old: "running.Go(func() { reaper.Run(ctx) })", New: "_ = reaper",
 		Package: "./cmd/worker", Test: "TestAKilledWorkersRowComesBackThroughTheReaper",
+	},
+	{
+		Name: "provider: ClosedIdle only on a reused connection (session 5's review, F1)", File: "internal/provider/provider.go",
+		Old: "r.ClosedIdle = r.Refusal == nil && r.ConnReused && closedIdle(err)", New: "r.ClosedIdle = r.Refusal == nil && closedIdle(err)",
+		Package: "./internal/provider", Test: "TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle",
+	},
+	{
+		Name: "provider: New's error does not quote the URL", File: "internal/provider/provider.go",
+		Old: "return nil, errors.New(\"provider: the URL is not an absolute http or https URL with a host\")", New: "return nil, fmt.Errorf(\"provider: %q is not an absolute http or https URL with a host\", o.URL)",
+		Package: "./internal/provider", Test: "TestNewRefusesAURLThatIsNotAbsoluteHTTP",
+	},
+	{
+		Name: "worker: logs only the provider's host", File: "cmd/worker/main.go",
+		Old: "log.Info(\"worker started\", \"provider\", providerHost(cfg.ProviderURL),", New: "log.Info(\"worker started\", \"provider\", cfg.ProviderURL, \"host\", providerHost(cfg.ProviderURL),",
+		Package: "./cmd/worker", Test: "TestTheWorkerLogsOnlyTheProvidersHost",
 	},
 }
