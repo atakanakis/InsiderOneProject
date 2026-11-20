@@ -123,6 +123,22 @@ func TestRecorderStampsBeforeTheBodyIsRead(t *testing.T) {
 	}
 }
 
+// The recorder is the instrument of the rate-limit tests, so nothing the test does with the
+// records may move a stamp: a reader that holds the lock delays the handler, not the stamp.
+func TestRecorderStampIsNotDelayedByReaders(t *testing.T) {
+	const hold = 300 * time.Millisecond
+	s := start(t, Options{})
+	s.Recorder.mu.Lock() // the records' lock, not the server's connection lock
+	go func() { time.Sleep(hold); s.Recorder.mu.Unlock() }()
+	sent := time.Now()
+	if _, err := post(t, s.Client(), s.URL, message); err != nil {
+		t.Fatal(err)
+	}
+	if lag := s.Requests()[0].Arrived.Sub(sent); lag > 100*time.Millisecond {
+		t.Fatalf("stamped %s after sending, while a reader held the lock for %s", lag, hold)
+	}
+}
+
 func TestRecorderInjectsStatusCodesAndHeaders(t *testing.T) {
 	script := []Response{
 		{Status: 503},
@@ -265,7 +281,7 @@ func TestRecorderRefusesABodyOverItsBound(t *testing.T) {
 }
 
 func TestRecorderKeepsOnlyTheLastRequestsWhenBounded(t *testing.T) {
-	s := start(t, Options{MaxKept: 3, DropBodies: true})
+	s := start(t, Options{MaxKept: 3, Lean: true})
 	for range 5 {
 		if _, err := post(t, s.Client(), s.URL, message); err != nil {
 			t.Fatal(err)
@@ -275,8 +291,8 @@ func TestRecorderKeepsOnlyTheLastRequestsWhenBounded(t *testing.T) {
 	if len(got) != 3 || got[0].Seq != 2 || got[2].Seq != 4 || s.Received() != 5 {
 		t.Fatalf("kept %d (first seq %d), received %d", len(got), got[0].Seq, s.Received())
 	}
-	if got[0].Body != nil || got[0].Channel != "sms" {
-		t.Errorf("DropBodies: body %q, channel %q", got[0].Body, got[0].Channel)
+	if got[0].Body != nil || got[0].Header != nil || got[0].Channel != "sms" {
+		t.Errorf("Lean: body %q, header %v, channel %q", got[0].Body, got[0].Header, got[0].Channel)
 	}
 }
 

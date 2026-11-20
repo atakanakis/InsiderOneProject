@@ -61,8 +61,9 @@ type Options struct {
 	MaxBody int64
 	// MaxKept, when positive, keeps only the most recent requests. Received still counts all.
 	MaxKept int
-	// DropBodies keeps the channel of each request but not its body.
-	DropBodies bool
+	// Lean keeps neither the body nor the headers of a request, only its stamp, connection,
+	// method, path and channel. It bounds what a long-running mock provider holds.
+	Lean bool
 
 	// TLS serves HTTPS, offering HTTP/2 and HTTP/1.1. Only used by Start.
 	TLS bool
@@ -90,12 +91,14 @@ func New(opts Options) *Recorder {
 
 // ServeHTTP stamps the request, reads its body, records it, then answers as Respond says.
 func (rec *Recorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// The stamp comes first, before the body is read and before any injected delay. It is
-	// taken under the lock so that stamps increase with Seq.
+	// The stamp comes first: before the lock (a reader of the records may hold it), before
+	// the body is read and before any injected delay. Seq is the order in which requests
+	// took the lock, so it can differ from the order of the stamps by the time two requests
+	// wait for the lock; analysis sorts by Arrived.
+	arrived := time.Now()
 	rec.mu.Lock()
 	seq := rec.next
 	rec.next++
-	arrived := time.Now()
 	rec.mu.Unlock()
 
 	body, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, rec.opts.MaxBody))
@@ -104,8 +107,8 @@ func (rec *Recorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Proto: r.Proto, Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(),
 		Body: body, Channel: channelOf(body),
 	}
-	if rec.opts.DropBodies {
-		req.Body = nil
+	if rec.opts.Lean {
+		req.Body, req.Header = nil, nil
 	}
 	rec.record(req)
 
@@ -157,20 +160,27 @@ func (rec *Recorder) record(req Request) {
 	defer rec.mu.Unlock()
 	rec.requests = append(rec.requests, req)
 	if max := rec.opts.MaxKept; max > 0 && len(rec.requests) > 2*max {
+		// Keep the most recent by Seq: a request with a slow body is recorded late.
+		bySeq(rec.requests)
 		rec.requests = slices.Clone(rec.requests[len(rec.requests)-max:])
 	}
 }
 
-// Requests returns the recorded requests in arrival order.
+// Requests returns the kept requests in Seq order. It copies under the lock and sorts after,
+// so that a request arriving meanwhile waits for a copy, not for a sort.
 func (rec *Recorder) Requests() []Request {
 	rec.mu.Lock()
-	defer rec.mu.Unlock()
 	out := slices.Clone(rec.requests)
-	slices.SortFunc(out, func(a, b Request) int { return a.Seq - b.Seq })
+	rec.mu.Unlock()
+	bySeq(out)
 	if max := rec.opts.MaxKept; max > 0 && len(out) > max {
 		out = out[len(out)-max:]
 	}
 	return out
+}
+
+func bySeq(rs []Request) {
+	slices.SortFunc(rs, func(a, b Request) int { return a.Seq - b.Seq })
 }
 
 // Received returns how many requests have arrived, including any no longer kept.

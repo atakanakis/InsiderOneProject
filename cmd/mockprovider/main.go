@@ -4,7 +4,7 @@
 //
 //	POST /<any path>  a message; answered with {"messageId", "status": "accepted", "timestamp"}
 //	GET  /stats       requests received, and the most that arrived in any one-second window,
-//	                  per channel, over the last 100,000 requests
+//	                  per channel, over the requests kept (at least the last 100,000)
 //	POST /reset       forget everything
 //	GET  /healthz
 //
@@ -28,7 +28,8 @@ import (
 	"github.com/atakanakis/InsiderOneProject/internal/recorder"
 )
 
-// kept bounds the memory of the mock provider: it keeps this many requests, without bodies.
+// kept bounds the memory of the mock provider: it holds at most twice this many requests
+// between trims, each without body or headers, and headers are bounded at 64 KiB.
 const kept = 100_000
 
 func main() {
@@ -57,6 +58,7 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		Addr:              addr,
 		Handler:           newHandler(latency),
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    60 << 10, // 64 KiB with Go's 4 KiB of slack
 		ConnContext:       recorder.ConnContext,
 	}
 	errc := make(chan error, 1)
@@ -78,9 +80,9 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 
 func newHandler(latency time.Duration) http.Handler {
 	rec := recorder.New(recorder.Options{
-		MaxKept:    kept,
-		DropBodies: true,
-		Respond:    func(recorder.Request) recorder.Response { return recorder.Response{Delay: latency} },
+		MaxKept: kept,
+		Lean:    true,
+		Respond: func(recorder.Request) recorder.Response { return recorder.Response{Delay: latency} },
 	})
 	mux := http.NewServeMux()
 	mux.Handle("POST /", rec)
