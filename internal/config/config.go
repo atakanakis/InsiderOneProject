@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -29,6 +30,12 @@ type Config struct {
 	ProviderURL string // PROVIDER_URL
 	APIAddr     string // API_ADDR
 	LogLevel    string // LOG_LEVEL: debug, info, warn or error
+	// APIKeys (API_KEYS, separated by commas): when set, every /v1 request needs one
+	// (architecture §8).
+	APIKeys []string
+	// MaxAttempts (MAX_ATTEMPTS): a new row's max_attempts and the budget of /retry. The API
+	// reads it, so it is a shared setting, not part of the worker's timing budget.
+	MaxAttempts int
 }
 
 // Worker is the timing budget of architecture §13. The comment on each field is its
@@ -51,7 +58,6 @@ type Worker struct {
 	PauseBusy           time.Duration // PAUSE_BUSY: pause when there is no room
 	PauseIdle           time.Duration // PAUSE_IDLE: pause when there is nothing to claim
 	ReaperTick          time.Duration // REAPER_TICK
-	MaxAttempts         int           // MAX_ATTEMPTS
 	BackoffBase         time.Duration // BACKOFF_BASE: first retry delay, doubled each time
 	BackoffCap          time.Duration // BACKOFF_CAP
 }
@@ -66,6 +72,11 @@ func Load(getenv func(string) string) (Config, error) {
 		ProviderURL: p.str("PROVIDER_URL", "http://localhost:9090/send"),
 		APIAddr:     p.str("API_ADDR", ":8080"),
 		LogLevel:    p.oneOf("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
+		APIKeys:     p.list("API_KEYS"),
+		MaxAttempts: p.integer("MAX_ATTEMPTS", 6),
+	}
+	if c.MaxAttempts <= 0 {
+		p.errs = append(p.errs, fmt.Errorf("MAX_ATTEMPTS must be positive, got %d", c.MaxAttempts))
 	}
 	return c, errors.Join(p.errs...)
 }
@@ -92,7 +103,6 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 		PauseBusy:           p.duration("PAUSE_BUSY", 20*time.Millisecond),
 		PauseIdle:           p.duration("PAUSE_IDLE", 200*time.Millisecond),
 		ReaperTick:          p.duration("REAPER_TICK", 5*time.Second),
-		MaxAttempts:         p.integer("MAX_ATTEMPTS", 6),
 		BackoffBase:         p.duration("BACKOFF_BASE", 2*time.Second),
 		BackoffCap:          p.duration("BACKOFF_CAP", 2*time.Minute),
 	}
@@ -162,7 +172,6 @@ func (w Worker) numbers() []named {
 		{"PAUSE_BUSY", int64(w.PauseBusy)},
 		{"PAUSE_IDLE", int64(w.PauseIdle)},
 		{"REAPER_TICK", int64(w.ReaperTick)},
-		{"MAX_ATTEMPTS", int64(w.MaxAttempts)},
 		{"BACKOFF_BASE", int64(w.BackoffBase)},
 		{"BACKOFF_CAP", int64(w.BackoffCap)},
 	}
@@ -178,6 +187,17 @@ func (p *parser) str(name, def string) string {
 		return v
 	}
 	return def
+}
+
+// list splits a comma-separated value; empty entries are dropped.
+func (p *parser) list(name string) []string {
+	var out []string
+	for _, v := range strings.Split(p.getenv(name), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (p *parser) oneOf(name, def string, allowed ...string) string {

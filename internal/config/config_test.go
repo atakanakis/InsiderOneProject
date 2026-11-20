@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -55,7 +56,7 @@ func TestDefaultsAreTheTimingBudget(t *testing.T) {
 		GateBudget: 5 * time.Second, Lease: 60 * time.Second, BreakerOpen: 30 * time.Second,
 		ShutdownTimeout: 25 * time.Second, StopGracePeriod: 30 * time.Second, Slots: 50, IdleConns: 50, IdleConnTimeout: 10 * time.Second,
 		ClaimBatch: 10, PauseBusy: 20 * time.Millisecond, PauseIdle: 200 * time.Millisecond,
-		ReaperTick: 5 * time.Second, MaxAttempts: 6, BackoffBase: 2 * time.Second, BackoffCap: 2 * time.Minute,
+		ReaperTick: 5 * time.Second, BackoffBase: 2 * time.Second, BackoffCap: 2 * time.Minute,
 	}
 	if got := defaults(t); got != want {
 		t.Fatalf("defaults\n got %+v\nwant %+v", got, want)
@@ -139,7 +140,6 @@ func TestNonPositiveSettingsAreRefused(t *testing.T) {
 		"PAUSE_BUSY":            func(w *Worker) { w.PauseBusy = 0 },
 		"PAUSE_IDLE":            func(w *Worker) { w.PauseIdle = 0 },
 		"REAPER_TICK":           func(w *Worker) { w.ReaperTick = 0 },
-		"MAX_ATTEMPTS":          func(w *Worker) { w.MaxAttempts = 0 },
 		"BACKOFF_BASE":          func(w *Worker) { w.BackoffBase = 0 },
 		"BACKOFF_CAP":           func(w *Worker) { w.BackoffCap = 0 },
 	}
@@ -168,12 +168,13 @@ func TestEveryBrokenRelationIsReported(t *testing.T) {
 func TestLoadReadsEverySettingFromTheEnvironment(t *testing.T) {
 	c, err := Load(env(map[string]string{
 		"DATABASE_URL": "postgres://db", "REDIS_URL": "redis://r", "PROVIDER_URL": "http://p/send",
-		"API_ADDR": ":1", "LOG_LEVEL": "debug",
+		"API_ADDR": ":1", "LOG_LEVEL": "debug", "API_KEYS": " k1, ,k2 ", "MAX_ATTEMPTS": "16",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (Config{DatabaseURL: "postgres://db", RedisURL: "redis://r", ProviderURL: "http://p/send", APIAddr: ":1", LogLevel: "debug"}); c != want {
+	if want := (Config{DatabaseURL: "postgres://db", RedisURL: "redis://r", ProviderURL: "http://p/send", APIAddr: ":1", LogLevel: "debug",
+		APIKeys: []string{"k1", "k2"}, MaxAttempts: 16}); !reflect.DeepEqual(c, want) {
 		t.Fatalf("Load\n got %+v\nwant %+v", c, want)
 	}
 	w, err := LoadWorker(env(map[string]string{
@@ -181,7 +182,7 @@ func TestLoadReadsEverySettingFromTheEnvironment(t *testing.T) {
 		"TLS_HANDSHAKE_TIMEOUT": "4ms", "GATE_BUDGET": "5ms", "LEASE": "6m", "BREAKER_OPEN": "7s",
 		"SHUTDOWN_TIMEOUT": "8s", "STOP_GRACE_PERIOD": "19s", "SLOTS": "9", "IDLE_CONNS": "10",
 		"IDLE_CONN_TIMEOUT": "11s", "CLAIM_BATCH": "12", "PAUSE_BUSY": "13ms", "PAUSE_IDLE": "14ms",
-		"REAPER_TICK": "15s", "MAX_ATTEMPTS": "16", "BACKOFF_BASE": "17s", "BACKOFF_CAP": "18m",
+		"REAPER_TICK": "15s", "BACKOFF_BASE": "17s", "BACKOFF_CAP": "18m",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +193,7 @@ func TestLoadReadsEverySettingFromTheEnvironment(t *testing.T) {
 		GateBudget: 5 * time.Millisecond, Lease: 6 * time.Minute, BreakerOpen: 7 * time.Second,
 		ShutdownTimeout: 8 * time.Second, StopGracePeriod: 19 * time.Second, Slots: 9, IdleConns: 10,
 		IdleConnTimeout: 11 * time.Second, ClaimBatch: 12, PauseBusy: 13 * time.Millisecond,
-		PauseIdle: 14 * time.Millisecond, ReaperTick: 15 * time.Second, MaxAttempts: 16,
+		PauseIdle: 14 * time.Millisecond, ReaperTick: 15 * time.Second,
 		BackoffBase: 17 * time.Second, BackoffCap: 18 * time.Minute,
 	}
 	if w != want {
@@ -241,5 +242,18 @@ func TestComposeGivesTheWorkerItsStopGracePeriod(t *testing.T) {
 	}
 	if want := defaults(t).StopGracePeriod; def != want {
 		t.Fatalf("Compose default %s, config default %s", def, want)
+	}
+}
+
+// The API reads MAX_ATTEMPTS for a new row and the budget of /retry; a budget of 0 would
+// make every requeued row fail without a send.
+func TestMaxAttemptsMustBePositive(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		if _, err := Load(env(map[string]string{"MAX_ATTEMPTS": v})); err == nil || !strings.Contains(err.Error(), "MAX_ATTEMPTS must be positive") {
+			t.Errorf("MAX_ATTEMPTS=%s: %v", v, err)
+		}
+	}
+	if c, err := Load(env(map[string]string{})); err != nil || c.MaxAttempts != 6 {
+		t.Errorf("default: %d %v", c.MaxAttempts, err)
 	}
 }

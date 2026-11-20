@@ -52,7 +52,7 @@ func get(t *testing.T, h http.Handler, path string, header ...string) answer {
 }
 
 func handler(log *bytes.Buffer, postgres, redis Check, timeout time.Duration) http.Handler {
-	return NewHandler(observability.NewLogger(log, "api", "debug"), Health{Postgres: postgres, Redis: redis, Timeout: timeout})
+	return NewHandler(observability.NewLogger(log, "api", "debug"), Options{Health: Health{Postgres: postgres, Redis: redis, Timeout: timeout}})
 }
 
 func TestHealthzAnswersWhileDependenciesAreDown(t *testing.T) {

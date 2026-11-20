@@ -1,5 +1,6 @@
-// Package api holds the HTTP handlers and middleware (architecture §8). Session 1 has the
-// health endpoints and the correlation id; the notification endpoints come in session 6.
+// Package api holds the HTTP handlers and middleware (architecture §8): the health endpoints
+// and the correlation id (session 1), and the notification, batch and template endpoints
+// (session 6, notifications.go).
 package api
 
 import (
@@ -50,7 +51,8 @@ type Health struct {
 }
 
 // NewHandler returns the API's HTTP handler.
-func NewHandler(log *slog.Logger, h Health) http.Handler {
+func NewHandler(log *slog.Logger, o Options) http.Handler {
+	h := o.Health
 	if h.Timeout <= 0 {
 		h.Timeout = ReadinessTimeout
 	}
@@ -61,6 +63,7 @@ func NewHandler(log *slog.Logger, h Health) http.Handler {
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		ready(w, r, log, h)
 	})
+	register(mux, log, o)
 	return correlate(log, mux)
 }
 

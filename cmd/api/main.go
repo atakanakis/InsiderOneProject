@@ -1,4 +1,4 @@
-// Command api serves the HTTP API. In session 1 it answers /healthz and /readyz.
+// Command api serves the HTTP API of architecture §8.
 package main
 
 import (
@@ -47,9 +47,11 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	}
 	defer func() { _ = rdb.Close() }()
 
-	srv := api.NewServer(cfg.APIAddr, api.NewHandler(log, api.Health{
-		Postgres: pool.Ping,
-		Redis:    api.RedisCheck(rdb),
+	srv := api.NewServer(cfg.APIAddr, api.NewHandler(log, api.Options{
+		Health:      api.Health{Postgres: pool.Ping, Redis: api.RedisCheck(rdb)},
+		Pool:        pool,
+		APIKeys:     cfg.APIKeys,
+		MaxAttempts: cfg.MaxAttempts,
 	}))
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
