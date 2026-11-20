@@ -297,12 +297,12 @@ func (d *Dispatcher) run(ctx context.Context) {        // d serves one channel
 
 func (d *Dispatcher) start(row Notification) {         // runs on the loop's goroutine
     d.slots.Take()
-    d.breaker.Started()                  // marks the probe when the breaker is half-open
+    probe := d.breaker.Started()         // marks the probe when the breaker is half-open
     wait := d.waiting.Enter()            // "claimed, no permit yet"
-    go d.handle(row, wait)
+    go d.handle(row, probe, wait)
 }
 
-func (d *Dispatcher) handle(row Notification, wait *Waiting) {
+func (d *Dispatcher) handle(row Notification, probe bool, wait *Waiting) {
     defer d.slots.Release()
     defer wait.Leave()                   // safe to call twice
     result := d.provider.Send(sendCtx, messageOf(row), func(ctx context.Context) error {
@@ -310,8 +310,8 @@ func (d *Dispatcher) handle(row Notification, wait *Waiting) {
         wait.Leave()
         return err
     })
-    verdict := Classify(result, row)     // what happens to the row, and what the breaker learns
-    d.breaker.Report(verdict)
+    verdict := Classify(result)          // what happens to the row, and what the breaker learns
+    d.breaker.Report(probe, verdict.Lesson)
     if status, ok := d.queue.Finish(row, verdict); ok {  // retried until answered
         d.events.Publish(row.ID, status)
     }
@@ -357,12 +357,37 @@ probe can be forgotten.
 | Response 2xx | `sent` | success |
 | Response 400, 413 or 422: the provider rejected this message | `failed` | success: the provider answered |
 | Any other response (5xx, 429, 408, 401, 403, 404, a redirect, ...) | retry (`Retry-After` honoured) | failure |
-| No response (could not connect, timeout, connection reset) | retry | failure |
 | Refused at the send gate because the limiter returned an error | retry in about 1 s | failure |
 | Refused at the send gate because no permit came free within the gate budget | retry in about 1 s | nothing |
+| No response, because the provider closed the kept-alive connection before the request was written | retry in about 1 s | nothing |
+| No response otherwise (could not connect, timeout, connection reset) | retry | failure |
 
 - A **response always wins.** The table is read top to bottom: if a response arrived, the
-  response decides, whatever else happened to the request.
+  response decides, whatever else happened to the request. A refusal comes before "no
+  response", because a refused send also has no response: its connection was closed by the
+  gate.
+- **"No response" covers three things** (session 4's review, F3 and F7), and each has its
+  answer:
+  1. *The provider did not answer:* it refused the connection, did not answer within the
+     send timeout, or reset the connection after the request was written. The channel may be
+     broken: retry, and the breaker counts a failure.
+  2. *The provider closed a kept-alive connection on which nothing had been written yet.*
+     The send took the connection from the pool and waited at the gate; meanwhile the
+     provider's keep-alive ran out (section 7, the connection pool). Go reports this case
+     with its own error, "http: server closed idle connection" (`transport.go` line 1090,
+     set when the read loop sees the connection end while no request is on it, line 2660).
+     The provider client reports it as `Result.ClosedIdle`. Nothing reached the provider, so
+     nothing is learned about its health: retry soon, and the breaker learns nothing. A
+     provider that is really down also fails new connections, and those count. The attempt
+     is spent, as for every refusal (rule 4); how often this happens is bounded by the
+     relation of section 13 and counted by a metric in session 7.
+  3. *The request was never made,* because it could not be built. This case is removed
+     rather than classified. The URL is the same for every message, so `provider.New` refuses
+     a URL that is not an absolute `http` or `https` URL, and a message has no other part
+     that can make a request invalid: the body is JSON, the `Idempotency-Key` is a UUID, and
+     `X-Correlation-ID` is sent only when it is within its bound (section 8). Without this,
+     a broken URL would fail every message and a newline in a correlation id would be
+     retried as a provider failure.
 - The second and third rows separate two questions. "Is something wrong with this message?"
   ends the message. "Is something wrong with the channel?" (a provider that is down, a wrong
   URL, an expired credential) is retried and counts against the breaker, so a broken
@@ -373,7 +398,13 @@ probe can be forgotten.
   keep rows away from a gate that has no room, and limiter errors open the breaker.
 
 **Retries** use exponential backoff with jitter (2 s, 4 s, 8 s, ... capped at 2 minutes;
-6 attempts by default).
+6 attempts by default). After attempt `k` failed, the ceiling is `min(cap, base × 2^(k−1))`
+and the delay is drawn between half the ceiling and the ceiling, so retries of rows that
+failed together spread out and a delay never exceeds the cap. A response's `Retry-After`
+is honoured when it asks for longer, up to the same cap: a provider cannot park a message
+for a day. "Retry in about 1 s" is a delay drawn between 1 s and 2 s: about one window, so
+the permit that was missing has come free (TestRetryDelaysDoubleWithJitterUpToTheCap,
+TestRetryAfterIsHonouredUpToTheCap).
 
 **Circuit breaker**, one per dispatcher. It has three states and three calls.
 
@@ -383,11 +414,35 @@ probe can be forgotten.
 - *Half-open:* `Allow()` returns 1 while no probe is marked, otherwise 0.
 
 `Allow()` only reads. `Started()` is called when a row really starts, and in the half-open
-state it marks that row as the probe. `Report()` clears the mark: a success closes the
-breaker, a failure opens it again, and "nothing" leaves it half-open for the next row. If a
-claim finds no row, nothing was marked, so nothing can be left hanging. Because every started
-row reaches `Report()` (the single exit), the probe cannot be lost, and because the mark is
-set on the loop's own goroutine, there cannot be two.
+state it marks that row as the probe and says so; `handle` passes that answer to `Report()`.
+`Report()` clears the mark: a success closes the breaker, a failure opens it again, and
+"nothing" leaves it half-open for the next row. If a claim finds no row, nothing was marked,
+so nothing can be left hanging. Because every started row reaches `Report()` (the single
+exit), the probe cannot be lost, and because the mark is set on the loop's own goroutine,
+there cannot be two. In the closed state every report counts. In the open and half-open
+states only the probe's report counts: a row that started before the breaker opened and
+reports while it is open teaches nothing that the opening did not already say
+(TestTheHalfOpenBreakerLetsExactlyOneRowThrough, TestAClaimThatFindsNothingLeavesNoProbe,
+TestARefusedProbeLeavesTheBreakerHalfOpen).
+
+**The pieces of the loop** (`internal/dispatch`, session 5).
+
+- `room` reads the four limits cheapest first and stops at the first 0, so an open breaker
+  or a full worker does not ask Redis. An error from `Available` (Redis unreachable, a worker
+  with other settings) is room 0, logged. The read uses the loop's context with no shorter
+  deadline: against an unreachable Redis it takes about 3.5 s (session 3), the loop claims
+  nothing meanwhile, and the rows in flight run on their own goroutines, so nothing else
+  waits for it.
+- Slots and the waiting mark are the dispatcher's own: a channel's dispatcher has at most
+  `SLOTS` sends in flight and at most one claim batch claimed and not yet permitted.
+- `handle` runs on a context that keeps the loop's values and ignores its cancellation
+  (`context.WithoutCancel`), so a shutdown cancels neither the send nor the result write. The
+  context carries the correlation id, so every log line about the row has it.
+- The provider client is `*provider.Client`, not an interface: the dispatcher cannot be given
+  a provider that skips the send gate (rule 9). The queue and the limiter are interfaces,
+  so that tests can wrap the real ones to inject stalls and failures and to stamp permits.
+- Status events go through a narrow `events.Publisher` interface; session 5 uses one that
+  drops them, session 7 the Redis one.
 
 The open time is longer than the longest possible send, so no result from before the breaker
 opened can arrive while it is probing. While the breaker is open, an outage uses attempts only
@@ -395,12 +450,19 @@ through probes: one row per open period per worker.
 
 **A lost result write.** If writing the result fails after a send, the write is retried with
 backoff until the database answers: either the result is stored, or the row is no longer this
-worker's (stale). The retries stop after one lease length at the latest. If the result was
-never stored, the reaper returns the row and it is sent again.
+worker's (stale). The delays start at 100 ms and double up to 5 s. The retries stop after one
+lease length at the latest, counted from the end of the send. If the result was never stored,
+the reaper returns the row and it is sent again (TestAFailedResultWriteIsRetriedAndNotSentAgain).
 
 **Shutdown.** On a stop signal the loop stops claiming and waits for the rows in flight. A send
 in flight is not cancelled; it finishes within the send timeout. If the shutdown timeout
-passes first, the worker exits and the rows it still held come back through the reaper.
+passes first, the worker exits and the rows it still held come back through the reaper
+(TestShutdownWaitsForSendsInFlightAndDoesNotCancelThem).
+
+**The reaper** runs once per worker, every `REAPER_TICK`. It calls Reap (section 5) in
+batches of 100 until a batch comes back short, and publishes a status event for each row it
+returned. Every worker runs one; `SKIP LOCKED` keeps them off each other's rows
+(TestAKilledWorkersRowComesBackThroughTheReaper).
 
 **At-least-once.** A notification can reach the provider twice in three cases:
 
@@ -510,8 +572,13 @@ that hangs needs an address that drops packets, which a test on one machine cann
   status, its `Retry-After` (seconds or an HTTP date, read on arrival; absent or malformed is
   0; above one day is one day, so the duration cannot overflow), the `messageId` of a 2xx JSON
   body, and the start of the body; the gate's error when it refused (`ErrNoPermitInTime` or a
-  limiter error, which `Classify` tells apart); whether the connection was reused; the error
-  when no response arrived; the duration. It holds no verdict. What it means for the row is
+  limiter error, which `Classify` tells apart); whether the connection was reused; whether
+  the provider closed the kept-alive connection before the request was written
+  (`ClosedIdle`, Go's "server closed idle connection", added in session 5); the error when no
+  response arrived; the duration. It holds no verdict.
+- `New` refuses a URL that is not an absolute `http` or `https` URL with a host, and `Send`
+  sets `X-Correlation-ID` only when the id is within its bound (section 8), so no message can
+  make a request that cannot be built (section 6, "no response" case 3; session 5). What it means for the row is
   decided by `Classify` (section 6), in session 5 (TestTheResultCarriesWhatWasObserved).
 - No proxy: a send goes straight to the provider, as it does in every measurement here.
 - **Bounds.** The client reads at most 64 KiB of response headers (Go's default is 10 MiB,
