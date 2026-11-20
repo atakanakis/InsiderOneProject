@@ -59,7 +59,7 @@ it (`6062021`).
 |---|---|---|
 | Tests | 137 test functions (120 after session 3, 17 new); all pass with the race detector | `make test`; count: `grep -rh '^func Test' --include='*_test.go' . \| grep -v TestMain \| wc -l` |
 | Lint | 0 issues | `make lint` |
-| Guards | 132 guards (111 of sessions 1 to 3, 21 of the provider client). Locally, before the review: 130 of 130 real, 8 min 44 s; after it, the provider's 21 of 21. The whole list after the review: see "CI" | `time make guards`; `go run ./tools/guards -only provider` |
+| Guards | 132 guards (111 of sessions 1 to 3, 21 of the provider client). Locally, before the review: 130 of 130 real, 8 min 44 s; after it, the provider's 21 of 21. The whole list after the review, in CI on Linux: 132 of 132 real, 0 failed (see "CI") | `time make guards`; `go run ./tools/guards -only provider` |
 | Test names in the documents | all exist | `make check-docs` |
 | A1: refused sends through the real client | 0 of 10,000 (5,000 new, 5,000 after an allowed send, 3,800 to 4,800 of them on a reused connection) reached the recorder; now 2,500 per half | `go test -count=1 -v -run TestARefusedSendNeverReachesTheProvider ./internal/provider` |
 | A1 without the close, the cancel still there | 5, 5 and 8 of 10,000 reached it; with neither, all of them | the same, with the close removed by hand |
@@ -121,5 +121,9 @@ All in [architecture.md](../architecture.md):
 
 ## CI
 
-CI on `6062021` (the I1 test's fix), run 44732001124: lint, test, guards and compose all
-succeeded. The run on the session's last commit is recorded in the commit that follows it.
+CI on `44e454b`, run 44730514192: the test job failed (review F1). CI on `6062021` (the I1
+test's fix), run 44732001124: all four jobs succeeded. CI on the session's last code and
+document commit, "docs: session 4 is done, session 5 is next", run 44734084083: lint, test,
+guards and compose all succeeded; the guards job printed `132 guards, 132 real, 0 failed`
+(`gh run watch 44734084083 --exit-status`, and `--log` of the guards job). The commit that
+adds this section changes only this file.
