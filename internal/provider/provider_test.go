@@ -580,7 +580,7 @@ func TestTheResultCarriesWhatWasObserved(t *testing.T) {
 	}
 	for v, want := range map[string]time.Duration{
 		"7": 7 * time.Second, "0": 0, "-3": 0, "soon": 0, "": 0,
-		"99999999999999999999": MaxRetryAfter, "9999999999": MaxRetryAfter,
+		"99999999999999999999": MaxRetryAfter, "9999999999": MaxRetryAfter, "-99999999999999999999": 0,
 	} {
 		if r := send(retry(v), allow); r.StatusCode != http.StatusServiceUnavailable || r.RetryAfter != want {
 			t.Errorf("Retry-After %q: %v, want %v", v, r.RetryAfter, want)
