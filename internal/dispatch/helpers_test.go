@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -119,13 +118,14 @@ func (a *accepted) of(id string) int {
 	return a.counts[id]
 }
 
+// twice returns the ids the provider accepted more than once.
 func (a *accepted) twice() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var ids []string
 	for id, n := range a.counts {
 		if n > 1 {
-			ids = append(ids, fmt.Sprintf("%s (%d times)", id, n))
+			ids = append(ids, id)
 		}
 	}
 	return ids

@@ -9,7 +9,13 @@ package dispatch
 //     arrived more than the margin after its permit may add one);
 //   - I5: every notification ended as sent, failed or cancelled;
 //   - no notification was accepted by the provider twice, and every sent notification was
-//     accepted;
+//     accepted; within the limits of architecture §6, "at-least-once": a notification may be
+//     accepted once more for each of its attempts that ended without a response, because
+//     the provider may have processed a request whose answer was lost (case 3). The test's
+//     own fault makes that happen: the provider closes "idle" connections from outside, and
+//     Go's server marks a connection active only after it has read the whole request
+//     (net/http server.go, lines 2079 to 2082), so a request can be read, handled and
+//     accepted on a connection that is closed under it;
 //   - I4: every claim reached Finish (an attempt row for every attempt, no expired lease).
 //
 // The faults: claims that return late, result writes that fail before they commit and
@@ -167,11 +173,11 @@ func runScenario(t *testing.T, sc scenario) {
 	const limit, margin, perChannel = 40, 50 * time.Millisecond, 150
 	channels := []domain.Channel{domain.SMS, domain.Email}
 	t.Logf("scenario: %s", sc)
-	var received, peak, late, twice int
+	var received, peak, late, twice, case3 int
 	allFinal := false
 	defer func() {
-		t.Logf("FAULT_RESULT seed=%d received=%d peak=%d late=%d limit=%d accepted_twice=%d all_final=%v passed=%v",
-			sc.seed, received, peak, late, limit, twice, allFinal, !t.Failed())
+		t.Logf("FAULT_RESULT seed=%d received=%d peak=%d late=%d limit=%d accepted_twice=%d of_them_case3=%d all_final=%v passed=%v",
+			sc.seed, received, peak, late, limit, twice, case3, allFinal, !t.Failed())
 	}()
 
 	e := testkit.Setup(t)
@@ -242,7 +248,19 @@ func runScenario(t *testing.T, sc scenario) {
 	}
 	for _, id := range acc.twice() {
 		twice++
-		t.Errorf("the provider accepted %s (%s)", id, sc)
+		outcomes := attemptOutcomes(t, e.Pool, uuid.MustParse(id))
+		noResponse := 0
+		for _, o := range outcomes {
+			if o == "no response" {
+				noResponse++
+			}
+		}
+		if acc.of(id) > 1+noResponse {
+			t.Errorf("the provider accepted %s %d times; its attempts %v explain at most %d (%s)", id, acc.of(id), outcomes, 1+noResponse, sc)
+			continue
+		}
+		case3++
+		t.Logf("at-least-once case 3: the provider accepted %s %d times; attempts %v", id, acc.of(id), outcomes)
 	}
 	rows, err := e.Pool.Query(bg(t), `SELECT id FROM notifications WHERE status = 'sent'`)
 	if err != nil {
