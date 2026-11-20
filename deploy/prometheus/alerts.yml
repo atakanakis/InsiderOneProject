@@ -1,0 +1,92 @@
+# Alert rules of the notification service (docs/architecture.md, section 10).
+#
+# Every rule has a promtool test with a case where it fires and one where it does not
+# (alerts_test.yml), and names only metrics and label values that the binaries export
+# (go test ./tools/alertcheck). The API and every worker export the same figures from
+# Postgres, so those are combined with max, never sum. A failure that must last is a short
+# rate held for the whole "for". What an operator does is in the comment above each rule.
+groups:
+  - name: notifications
+    rules:
+      # The provider fails for this channel (architecture section 6); rows wait with their
+      # attempts. Check the provider, PROVIDER_URL and its credentials.
+      - alert: NotificationsBreakerOpen
+        expr: max by (channel) (notifications_breaker_state) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.channel }}: a worker's breaker has not been closed for 5 minutes"
+
+      # Delivery is stalled or far behind. Check that workers run, the breaker, the rate limit
+      # and the queue's depth.
+      - alert: NotificationsOldestDueRowTooOld
+        expr: max by (channel) (notifications_queue_oldest_due_age_seconds) > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.channel }}: the oldest due notification has waited {{ $value | humanizeDuration }}"
+
+      # More dispatchers per channel than the gate serves within its budget, or Redis is slow
+      # (architecture section 13). Each refusal costs an attempt.
+      - alert: NotificationsGateRefusals
+        expr: sum by (channel) (rate(notifications_attempts_total{outcome=~"no_permit_in_time|limiter_error"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.channel }}: {{ $value | humanize }} sends per second refused at the send gate"
+
+      # Messages are rejected by the provider or run out of attempts. Read last_error of the
+      # failed notifications; POST /v1/notifications/{id}/retry requeues them.
+      - alert: NotificationsFailedShareHigh
+        expr: |
+          sum by (channel) (rate(notifications_finished_total{status="failed"}[15m]))
+            / sum by (channel) (rate(notifications_finished_total{status=~"sent|failed"}[15m]))
+            > 0.1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.channel }}: {{ $value | humanizePercentage }} of finished notifications failed"
+
+      # Postgres refuses writes or does not answer. A row whose result is not stored is
+      # returned by the reaper after its lease and sent again (architecture section 6).
+      - alert: NotificationsResultWritesFailing
+        expr: sum(rate(notifications_worker_errors_total{operation="result_write"}[1m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Workers cannot store delivery results"
+
+      # Redis is down, refuses writes or does not answer (architecture section 7). Nothing is
+      # claimed or sent until it is back.
+      - alert: NotificationsRateLimitUnavailable
+        expr: sum(rate(notifications_worker_errors_total{operation="rate_limit"}[1m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Workers cannot read the rate limit; nothing is claimed"
+
+      # The provider's keep-alive is shorter than IDLE_CONN_TIMEOUT + GATE_BUDGET (architecture
+      # section 13). Lower IDLE_CONN_TIMEOUT.
+      - alert: NotificationsProviderClosesIdleConnections
+        expr: sum by (channel) (rate(notifications_attempts_total{outcome="closed_idle"}[15m])) > 0.05
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.channel }}: the provider closes connections while sends wait at the gate"
+
+      # Redis is down or slow for the publishers. Delivery is not affected; WebSocket clients
+      # miss changes (architecture section 9).
+      - alert: NotificationsEventsDropped
+        expr: sum(rate(notifications_events_dropped_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Status events are being dropped"

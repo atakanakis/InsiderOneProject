@@ -1,0 +1,192 @@
+# promtool tests of alerts.yml: every rule has a case where it fires and a case where it does
+# not. Run with: make alerts (promtool check rules, then promtool test rules).
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: NotificationsBreakerOpen
+    interval: 1m
+    input_series:
+      # One worker's sms breaker opens and probes for 10 minutes; another worker's stays closed.
+      - series: 'notifications_breaker_state{channel="sms", instance="w1", job="worker"}'
+        values: '0 1 1 2 1 1 1 2 1 1 1'
+      - series: 'notifications_breaker_state{channel="sms", instance="w2", job="worker"}'
+        values: '0x10'
+      # email opens and closes again, never for 5 minutes in a row.
+      - series: 'notifications_breaker_state{channel="email", instance="w1", job="worker"}'
+        values: '0 1 1 0 1 1 0 1 1 0 0'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: NotificationsBreakerOpen
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: NotificationsBreakerOpen
+        exp_alerts:
+          - exp_labels: { severity: page, channel: sms }
+            exp_annotations:
+              summary: "sms: a worker's breaker has not been closed for 5 minutes"
+
+  - name: NotificationsOldestDueRowTooOld
+    interval: 1m
+    input_series:
+      # Two API instances report the same figure from Postgres: sms grows by 60 s a minute.
+      - series: 'notifications_queue_oldest_due_age_seconds{channel="sms", instance="api1", job="api"}'
+        values: '0+60x12'
+      - series: 'notifications_queue_oldest_due_age_seconds{channel="sms", instance="api2", job="api"}'
+        values: '0+60x12'
+      # email has a row due for 4 minutes, then delivers it.
+      - series: 'notifications_queue_oldest_due_age_seconds{channel="email", instance="api1", job="api"}'
+        values: '0 60 120 180 240 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: NotificationsOldestDueRowTooOld
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: NotificationsOldestDueRowTooOld
+        exp_alerts:
+          - exp_labels: { severity: page, channel: sms }
+            exp_annotations:
+              summary: "sms: the oldest due notification has waited 12m 0s"
+
+  - name: NotificationsGateRefusals
+    interval: 1m
+    input_series:
+      # sms: 12 refusals a minute (0.2 per second); email: 3 a minute (0.05 per second).
+      - series: 'notifications_attempts_total{channel="sms", outcome="no_permit_in_time", instance="w1", job="worker"}'
+        values: '0+12x20'
+      - series: 'notifications_attempts_total{channel="email", outcome="limiter_error", instance="w1", job="worker"}'
+        values: '0+3x20'
+      - series: 'notifications_attempts_total{channel="email", outcome="sent", instance="w1", job="worker"}'
+        values: '0+600x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NotificationsGateRefusals
+        exp_alerts: []
+      # rate() over 5 minutes reaches 0.1 at about 3 minutes; then 10 minutes pending.
+      - eval_time: 16m
+        alertname: NotificationsGateRefusals
+        exp_alerts:
+          - exp_labels: { severity: ticket, channel: sms }
+            exp_annotations:
+              summary: "sms: 200m sends per second refused at the send gate"
+
+  - name: NotificationsFailedShareHigh
+    interval: 1m
+    input_series:
+      # sms: 20 failed and 60 sent a minute (25% failed); email: 1 failed and 60 sent (1.6%).
+      - series: 'notifications_finished_total{channel="sms", status="failed", instance="w1", job="worker"}'
+        values: '0+20x40'
+      - series: 'notifications_finished_total{channel="sms", status="sent", instance="w1", job="worker"}'
+        values: '0+60x40'
+      - series: 'notifications_finished_total{channel="sms", status="retrying", instance="w1", job="worker"}'
+        values: '0+100x40'
+      - series: 'notifications_finished_total{channel="email", status="failed", instance="w1", job="worker"}'
+        values: '0+1x40'
+      - series: 'notifications_finished_total{channel="email", status="sent", instance="w1", job="worker"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NotificationsFailedShareHigh
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: NotificationsFailedShareHigh
+        exp_alerts:
+          - exp_labels: { severity: ticket, channel: sms }
+            exp_annotations:
+              summary: "sms: 25% of finished notifications failed"
+
+  # The rules on a dependency use rate() over 1 minute, so these series are scraped every 15 s,
+  # as Prometheus scrapes the service.
+  - name: NotificationsResultWritesFailing, sustained
+    interval: 15s
+    input_series:
+      - series: 'notifications_worker_errors_total{operation="result_write", instance="w1", job="worker"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: NotificationsResultWritesFailing
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: NotificationsResultWritesFailing
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "Workers cannot store delivery results"
+
+  - name: NotificationsResultWritesFailing, a single blip
+    interval: 15s
+    input_series:
+      - series: 'notifications_worker_errors_total{operation="result_write", instance="w1", job="worker"}'
+        values: '0 5 5x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NotificationsResultWritesFailing
+        exp_alerts: []
+
+  - name: NotificationsRateLimitUnavailable, sustained
+    interval: 15s
+    input_series:
+      - series: 'notifications_worker_errors_total{operation="rate_limit", instance="w1", job="worker"}'
+        values: '0+75x40'
+      - series: 'notifications_worker_errors_total{operation="claim", instance="w1", job="worker"}'
+        values: '0+75x40'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: NotificationsRateLimitUnavailable
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: NotificationsRateLimitUnavailable
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "Workers cannot read the rate limit; nothing is claimed"
+
+  - name: NotificationsRateLimitUnavailable, a single blip
+    interval: 15s
+    input_series:
+      - series: 'notifications_worker_errors_total{operation="rate_limit", instance="w1", job="worker"}'
+        values: '0 40 40x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NotificationsRateLimitUnavailable
+        exp_alerts: []
+
+  - name: NotificationsProviderClosesIdleConnections
+    interval: 1m
+    input_series:
+      # sms: 6 a minute (0.1 per second); email: 1 a minute.
+      - series: 'notifications_attempts_total{channel="sms", outcome="closed_idle", instance="w1", job="worker"}'
+        values: '0+6x40'
+      - series: 'notifications_attempts_total{channel="email", outcome="closed_idle", instance="w1", job="worker"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NotificationsProviderClosesIdleConnections
+        exp_alerts: []
+      # rate() over 15 minutes reaches 0.05 at about 8 minutes; then 15 minutes pending.
+      - eval_time: 25m
+        alertname: NotificationsProviderClosesIdleConnections
+        exp_alerts:
+          - exp_labels: { severity: ticket, channel: sms }
+            exp_annotations:
+              summary: "sms: the provider closes connections while sends wait at the gate"
+
+  - name: NotificationsEventsDropped
+    interval: 1m
+    input_series:
+      - series: 'notifications_events_dropped_total{reason="redis_error", instance="api1", job="api"}'
+        values: '0+50x20'
+      - series: 'notifications_events_dropped_total{reason="buffer_full", instance="w1", job="worker"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NotificationsEventsDropped
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: NotificationsEventsDropped
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: "Status events are being dropped"
