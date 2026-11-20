@@ -690,13 +690,21 @@ func TestAGateThatWaitsPastTheDeadlineTakesNoPermit(t *testing.T) {
 // I1 at the provider's side: three workers, each with its own Redis client, limiter and
 // provider client, send as fast as their gates allow; the provider never receives more than
 // the limit within one second, by its own arrival stamps.
+//
+// The guarantee holds while every request arrives within the margin of its permit (A4).
+// Section 7's limits table says what happens when some do not: the excess is at most the
+// number of requests that arrived later than the margin. Under -race on a busy CI runner
+// some do (peak 106 in CI run 44730514192), so the test checks the guarantee as section 7
+// states it: the peak may exceed the limit by no more than the late requests, and without
+// the race detector, as make guards runs it, not at all.
 func TestTheProviderReceivesAtMostTheLimitInAnyWindow(t *testing.T) {
 	const limit, workers, sendersPerWorker = 100, 3, 50
-	const run = 3300 * time.Millisecond
+	const margin, run = 50 * time.Millisecond, 3300 * time.Millisecond
 	e := testkit.Setup(t)
-	srv := testkit.Recorder(t, recorder.Options{Lean: true})
+	srv := testkit.Recorder(t, recorder.Options{})
 	stop := time.Now().Add(run)
 	var sent, refused atomic.Int64
+	var permitted sync.Map // message id -> when Wait returned the permit
 	var wg sync.WaitGroup
 	for range workers {
 		rdb, err := redisclient.New(e.RedisURL)
@@ -704,18 +712,24 @@ func TestTheProviderReceivesAtMostTheLimitInAnyWindow(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = rdb.Close() })
-		lim, err := ratelimit.New(rdb, limit, 50*time.Millisecond)
+		lim, err := ratelimit.New(rdb, limit, margin)
 		if err != nil {
 			t.Fatal(err)
 		}
 		o := testOptions(srv.URL)
 		o.IdleConns = sendersPerWorker
 		c := newClient(t, o)
-		gate := func(ctx context.Context) error { return lim.Wait(ctx, domain.SMS) }
 		for range sendersPerWorker {
 			wg.Go(func() {
 				for time.Now().Before(stop) {
-					r := c.Send(bg(t), message(domain.SMS), gate)
+					m := message(domain.SMS)
+					r := c.Send(bg(t), m, func(ctx context.Context) error {
+						if err := lim.Wait(ctx, domain.SMS); err != nil {
+							return err
+						}
+						permitted.Store(m.ID, time.Now())
+						return nil
+					})
 					if r.Refusal != nil {
 						refused.Add(1)
 					} else if r.Responded {
@@ -726,10 +740,23 @@ func TestTheProviderReceivesAtMostTheLimitInAnyWindow(t *testing.T) {
 		}
 	}
 	wg.Wait()
+	late := 0
+	for _, req := range srv.Requests() {
+		id, err := uuid.Parse(req.Header.Get("Idempotency-Key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p, ok := permitted.Load(id); ok && req.Arrived.Sub(p.(time.Time)) > margin {
+			late++
+		}
+	}
 	peak := srv.Peak(time.Second, string(domain.SMS))
-	t.Logf("%d sends answered, %d refused at the gate, peak %d within one second at the provider",
-		sent.Load(), refused.Load(), peak)
-	if peak > limit {
+	t.Logf("%d sends answered, %d refused at the gate, %d arrived later than %v after their permit; peak %d within one second at the provider",
+		sent.Load(), refused.Load(), late, margin, peak)
+	if peak > limit+late {
+		t.Errorf("the provider received %d requests within one second: more than the limit %d plus the %d late requests", peak, limit, late)
+	}
+	if peak > limit && !raceDetector {
 		t.Errorf("the provider received %d requests within one second, limit %d", peak, limit)
 	}
 	if sent.Load() < 2*limit {
