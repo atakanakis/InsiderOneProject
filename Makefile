@@ -1,4 +1,4 @@
-.PHONY: up down logs enqueue status test test-unit lint guards check-docs build
+.PHONY: up down logs e2e status test test-unit lint guards check-docs build
 
 up: ## Build and start the stack: Postgres, Redis, migrate, API, worker, mock provider
 	docker compose up --build -d --wait api worker mockprovider
@@ -11,11 +11,8 @@ logs:
 	docker compose logs -f api worker
 
 N ?= 100
-enqueue: ## Add N pending notifications per channel straight into the database (the API comes in session 6)
-	docker compose exec -T postgres psql -U notifications -q -c "INSERT INTO notifications \
-	  (id, recipient, channel, content, priority, status, max_attempts, ready_at) \
-	  SELECT gen_random_uuid(), '+905551234567', c, 'hello', (i % 3), 'pending', 6, now() \
-	  FROM generate_series(1, $(N)) AS i, unnest(ARRAY['sms', 'email', 'push']) AS c"
+e2e: ## Send N notifications per channel through the API and wait until all are sent
+	go run ./tools/e2e -n $(N)
 
 status: ## Count the notifications by status
 	docker compose exec -T postgres psql -U notifications -c \

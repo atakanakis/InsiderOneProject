@@ -2,7 +2,7 @@
 #
 #   API            http://localhost:8080/healthz, http://localhost:8080/readyz
 #   Mock provider  http://localhost:9090/stats
-#   Workers        two (WORKER_REPLICAS); make enqueue adds rows, make status counts them
+#   Workers        two (WORKER_REPLICAS); make e2e sends through the API, make status counts
 #
 # Every setting of internal/config can be set in an optional .env file.
 

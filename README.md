@@ -4,12 +4,13 @@ A service that accepts notification requests (SMS, email, push) over an HTTP API
 them to an external provider, with a rate limit of 100 messages per second per channel,
 priorities, retries and live status tracking. Written in Go, with PostgreSQL and Redis.
 
-> **Status: build in progress.** The stack starts with two workers, and the workers deliver:
-> the queue (Postgres), the rate limiter (Redis), the provider client with its send gate,
-> and the dispatcher with its circuit breaker and reaper are built and tested, the last
-> under random faults. The API endpoints do not exist yet (session 6): until then rows are
-> added straight into the database with `make enqueue`. This README says only what exists;
-> the table below is updated at the end of every session.
+> **Status: build in progress.** The stack starts with an API and two workers, and a
+> notification sent to the API is delivered: the API (validation, idempotency, templates,
+> bounds on every input and output), the queue (Postgres), the rate limiter (Redis), the
+> provider client with its send gate, and the dispatcher with its circuit breaker and reaper
+> are built and tested, the last under random faults. Status events, WebSocket, metrics and
+> tracing come in session 7. This README says only what exists; the table below is updated at
+> the end of every session.
 
 | # | Session | Status |
 |---|---|---|
@@ -19,8 +20,8 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 | 3 | Rate limiter | done ([record](docs/sessions/03-ratelimit.md)) |
 | 4 | Provider client and the send gate | done ([record](docs/sessions/04-provider.md)) |
 | 5 | Dispatcher, breaker, reaper; fault tests | done ([record](docs/sessions/05-dispatcher.md)) |
-| 6 | API | next |
-| 7 | Events, WebSocket, metrics, tracing, alerts | |
+| 6 | API | done ([record](docs/sessions/06-api.md)) |
+| 7 | Events, WebSocket, metrics, tracing, alerts | next |
 | 8 | Hardening: independent review, soak, load test | |
 | 9 | Walkthrough and final documents | |
 
@@ -30,13 +31,33 @@ Needs Docker and Go 1.27.
 
 ```sh
 make up          # Postgres, Redis, migrations, API, two workers, mock provider
-curl localhost:8080/healthz    # {"status":"ok"}
 curl localhost:8080/readyz     # {"postgres":"ok","redis":"ok","status":"ready"}
-make enqueue N=1000            # 1000 notifications per channel, straight into the database
-make status                    # notifications by status: all sent after about 10 s
+
+# One notification. 201 with the notification; the same request with the same key again is a
+# 200 with the same one, and the key with another request is a 409.
+curl -s localhost:8080/v1/notifications -d '{"recipient":"+905551234567","channel":"sms",
+  "content":"Your code is 4242","priority":"high","idempotencyKey":"order-42"}'
+curl -s localhost:8080/v1/notifications/<id>     # status, with the attempt history
+
+# A template, and a batch of up to 1000 that uses it, retried safely under one key.
+curl -s localhost:8080/v1/templates -d '{"name":"welcome","channel":"email","body":"Hi {{.name}}!"}'
+curl -s localhost:8080/v1/notifications/batch -H 'Idempotency-Key: signup-2026-11-20' -d '{"notifications":[
+  {"recipient":"ada@example.com","channel":"email","template":"welcome","variables":{"name":"Ada"}},
+  {"recipient":"+905551234567","channel":"sms","content":"later","scheduledAt":"2030-01-01T09:00:00Z"}]}'
+curl -s localhost:8080/v1/batches/<batchId>      # a count per status
+curl -s 'localhost:8080/v1/notifications?status=sent&channel=email&limit=100'   # pages: &cursor=<nextCursor>
+curl -s -X POST localhost:8080/v1/notifications/<id>/cancel   # only scheduled, pending, retrying
+curl -s -X POST localhost:8080/v1/notifications/<id>/retry    # only failed; MAX_ATTEMPTS more attempts
+
+make e2e N=1000                # 1000 per channel through the API; waits until every one is sent
+make status                    # notifications by status, straight from Postgres
 curl localhost:9090/stats      # what the mock provider received; at most 100 per channel in any second
 make down        # stop and delete the data
 ```
+
+The specification is at <http://localhost:8080/openapi.yaml>, with a viewer at
+<http://localhost:8080/docs>. With `API_KEYS=key1,key2` set, every `/v1` request needs
+`Authorization: Bearer <key>` or `X-API-Key: <key>`.
 
 The mock provider can fail on purpose, to watch retries and the circuit breaker:
 
