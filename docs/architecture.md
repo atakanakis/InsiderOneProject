@@ -457,8 +457,10 @@ Five properties make "one send, one connection, one permit, at most one write" t
    ([experiment 01](experiments/01-gate-refusal.md)). The first draft closed the connection
    and then cancelled. Session 4 measured the cancel as adding nothing: through the real
    client, with the close alone, 0 of 20,000 refused sends reached the server (two runs of
-   the A1 test of section 12, 10,000 each); without the close, 5, 5 and 8 of 10,000 did. The cancel was removed (CLAUDE.md, rule 11): a closed connection makes the
-   transport's write fail, and the send returns that error.
+   the A1 test of section 12, 10,000 each); with the cancel and no close, 5, 5 and 8 of
+   10,000 did, and with neither, every one of them (session 4's review, F5). The cancel was
+   removed (CLAUDE.md, rule 11): a closed connection makes the transport's write fail, and the
+   send returns that error.
 3. **The transport never replays a request.** Go replays a request on a new connection when a
    reused connection turns out to be dead, and it treats a request with an `Idempotency-Key`
    header as safe to replay. A replay would be a second write inside one attempt. The client
@@ -482,9 +484,14 @@ Five properties make "one send, one connection, one permit, at most one write" t
 waiting at the gate, writing and reading the response. The gate waits on a child of that
 context limited to the gate budget (5 s). `http.Client.Timeout` is not used, because the hook
 cannot see it. Dial and TLS handshake have their own shorter timeouts (3 s each).
-Each part in turn outlasting the send timeout ends the send at the deadline
-(TestOneDeadlineCoversConnectGateWriteAndResponse); the TLS handshake timeout ends a slow
-handshake first (TestTheTLSHandshakeHasItsOwnTimeout). The dial timeout has no test: a dial
+Each part in turn outlasting the send timeout ends the send at the deadline: the connection,
+the gate, the write, the response's headers and its body
+(TestOneDeadlineCoversConnectGateWriteAndResponse). One response would escape it: to a
+`101 Switching Protocols`, Go's transport hands the raw connection to the caller as the body
+(`transport.go` line 2732), and the request's context no longer closes it, so reading that
+body waited as long as the provider kept the connection open (session 4's review, F2). The
+client reads a body only from a final response (status 200 or more); a 101 is closed unread
+and is "any other response". The TLS handshake timeout ends a slow handshake first (TestTheTLSHandshakeHasItsOwnTimeout). The dial timeout has no test: a dial
 that hangs needs an address that drops packets, which a test on one machine cannot rely on.
 
 **The provider client in detail** (`internal/provider`, session 4).
@@ -508,16 +515,25 @@ that hangs needs an address that drops packets, which a test on one machine cann
   decided by `Classify` (section 6), in session 5 (TestTheResultCarriesWhatWasObserved).
 - No proxy: a send goes straight to the provider, as it does in every measurement here.
 - **Bounds.** The client reads at most 64 KiB of response headers (Go's default is 10 MiB,
-  `transport.go` line 340) and at most 4 KiB of a response body. A longer body is cut, and
-  its connection is closed instead of being read to the end
+  `transport.go` line 340) and keeps at most 4 KiB of a response body. When the client
+  closes a longer body, the transport itself discards up to 256 KiB more of it, for at most
+  50 ms, in its own goroutine, and keeps the connection only if that reaches the end
+  (`transport.go` lines 2420 to 2448); otherwise the connection is closed. So the client's
+  memory is bounded by 4 KiB and its time by the send's deadline; the provider can make the
+  transport read at most 256 KiB more (session 4's review, F6)
   (TestResponseHeadersOverTheBoundAreNotAResponse, TestTheResponseBodyIsReadUpToItsBound).
 
 **The connection pool** keeps as many idle connections as there are slots; with Go's default
 of 2 the review measured 686 new connections in 10 s and 6% less throughput. Idle connections
 are dropped after 10 s (TestTheClientKeepsAnIdleConnectionForEverySlot,
 TestIdleConnectionsAreDroppedAfterTheIdleTimeout). A connection that the provider closes while a request waits on it at
-the gate fails that attempt (nothing is replayed, property 3); the short idle time keeps this
-rare, and it is counted in a metric.
+the gate fails that attempt (nothing is replayed, property 3), and the permit is spent. The
+time at the gate is idle time for the provider too: a connection idle for up to 10 s, then
+held up to the gate budget (5 s), reaches the provider's keep-alive timeout if that is under
+15 s (Node's default is 5 s). Session 4's reviewer reproduced it: a provider with a 2 s
+keep-alive, a connection idle 1.5 s, a gate wait of 1 s, no response (review F3). This is the
+client's own doing, not the provider's failure; the third relation below states it, session 5
+decides how `Classify` counts it, and session 7 counts it in a metric.
 
 The limiter **fails closed**: when a permit cannot be taken, nothing is sent. When Redis is
 unreachable `Available()` fails too, so nothing is even claimed. When only the permit script
@@ -710,7 +726,7 @@ the session that builds the part.
 
 | # | Invariant | Enforced in | Tests so far |
 |---|---|---|---|
-| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | The limiter's part (A6): TestNoWindowHoldsMoreThanTheLimit, TestAPermitIsRefusedAtTheLimit, TestChannelsHaveSeparateWindows. At the provider's side, through the real client and limiter: TestTheProviderReceivesAtMostTheLimitInAnyWindow (3 workers with their own Redis client, limiter and provider client, 150 senders, limit 100, 3.3 s: at most 100 requests within any second by the provider's arrival stamps, in 8 of 8 runs; `go test -race -count=6 -v -run TestTheProviderReceivesAtMostTheLimitInAnyWindow ./internal/provider` gave 6 of them). Through the dispatcher: session 5. |
+| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | The limiter's part (A6): TestNoWindowHoldsMoreThanTheLimit, TestAPermitIsRefusedAtTheLimit, TestChannelsHaveSeparateWindows. At the provider's side, through the real client and limiter: TestTheProviderReceivesAtMostTheLimitInAnyWindow (3 workers with their own Redis client, limiter and provider client, 150 senders, limit 100, 3.3 s: peak 100 within one second by the provider's arrival stamps in 8 local runs, 6 of them from `go test -race -count=6 -v -run TestTheProviderReceivesAtMostTheLimitInAnyWindow ./internal/provider`). I1 at the provider holds only while A4 holds: under `-race` on the CI runner the provider saw 106 within one second (CI run 44730514192), because requests arrived more than the margin after their permit, the case of section 7's limits table. The test therefore checks the guarantee as that table states it: the peak exceeds the limit by at most the number of requests that arrived later than the margin, and, without the race detector, not at all (session 4's review, F1). Through the dispatcher: session 5. |
 | I2 | A row is never claimed by a second worker while its lease is valid | The row lock and the status filter in Claim; `SKIP LOCKED` so that claims do not wait | TestConcurrentClaimsNeverTakeTheSameRow (32 claimers, 2,000 rows), TestClaimTakesExactlyTheClaimableStatuses, TestClaimSkipsRowsLockedByAnotherTransaction |
 | I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish | The database part: TestAnAttemptNumberIsRecordedOnce. The `WHERE` of Finish: TestFinishFromAStaleAttemptChangesNothing, TestFinishOnARowThatIsNoLongerProcessingChangesNothing, TestRepeatedFinishAddsNoSecondAttemptRow |
 | I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | Reap: TestReapReturnsExpiredRowsToPendingOrFailed, TestTwoReapersAtOnceReturnEachRowOnce, TestReapSkipsRowsLockedByAnotherTransaction. The single exit: session 5. |
@@ -731,10 +747,10 @@ client. The test kit does not contain a fake provider that could skip the send g
 
 | # | Assumption | Status |
 |---|---|---|
-| A1 | Closing the connection in `GotConn` stops a refused request from reaching the server. Cancelling alone does not. | **Measured** before the design was fixed: cancel alone let 13 of 40,000 refused requests through; close and cancel, 0 of 40,000 ([experiment 01](experiments/01-gate-refusal.md)). **Permanent test** (session 4): TestARefusedSendNeverReachesTheProvider, through the real client: 5,000 refused sends on new connections and 5,000 after an allowed send, of which 3,800 to 4,800 per run ran on a reused connection; 0 reached the recording server. Without the close (the cancel already gone), 5, 5 and 8 of 10,000 reached it; the cancel was removed after the close alone gave 0 of 20,000 (section 7, property 2; `go test -count=1 -v -run TestARefusedSendNeverReachesTheProvider ./internal/provider`). Because a leak is rare, a second test checks the order directly: when the client's hook returns, the connection is already closed (TestARefusedSendsConnectionIsClosedBeforeTheTransportGoesOn, on HTTP and TLS, new and reused). 5,000 per half because each refused send leaves a client port in TIME_WAIT; 20,000 ran out of ports on macOS. |
+| A1 | Closing the connection in `GotConn` stops a refused request from reaching the server. Cancelling alone does not. | **Measured** before the design was fixed: cancel alone let 13 of 40,000 refused requests through; close and cancel, 0 of 40,000 ([experiment 01](experiments/01-gate-refusal.md)). **Permanent test** (session 4): TestARefusedSendNeverReachesTheProvider, through the real client: 5,000 refused sends on new connections and 5,000 after an allowed send, of which 3,800 to 4,800 per run ran on a reused connection; 0 reached the recording server. With the cancel and no close, 5, 5 and 8 of 10,000 reached it; with neither, all of them (review F5). The cancel was removed after the close alone gave 0 of 20,000 (section 7, property 2; `go test -count=1 -v -run TestARefusedSendNeverReachesTheProvider ./internal/provider`). These runs had 5,000 per half; the test now has 2,500, because each refused send leaves a client port in TIME_WAIT for 30 s on macOS, which has about 16,000: 20,000 ran out of ports, and two runs of 10,000 within 30 s did too (review F4). Because a leak is rare, a second test checks the order directly: when the client's hook returns, the connection is already closed (TestARefusedSendsConnectionIsClosedBeforeTheTransportGoesOn, on HTTP and TLS, new and reused). Both count every request that reached the recorder, not only those whose body was readable. |
 | A2 | With `GetBody = nil` the transport never replays a request, so one send is one `GotConn` and at most one write | **Measured** by the design reviewer (one hook call, one request received). **Permanent test** (session 4): TestADeadReusedConnectionIsNotReplayed. The provider closes the kept-alive connection while the send waits at the gate: one gate call, nothing received, an error. With `GetBody` left as Go sets it, the gate ran twice in one send (two permits) and the client saw a 202 for a request whose first write was lost (`go test -count=1 -v -run TestADeadReusedConnectionIsNotReplayed ./internal/provider`, mutation by hand; `make guards` checks it). |
 | A3 | The claim reads the index in order with no sort and no full scan, under a custom plan and under a generic plan, also with many tied `ready_at` values and many rows that are not due yet | **Measured** by the second design reviewer on the final query: 2.8 million rows, 1 million of them future high-priority rows; 0.15 to 0.59 ms under both plans; a claim that finds nothing due reads 3 index pages. **Permanent test** (session 2): TestClaimPlanReadsTheIndexInOrder, on 300,000 rows (50,000 due with one `ready_at`, 200,000 not due, 50,000 finished). Under both plans: one ordered index scan, no sort, no sequential or bitmap scan of the claim index; a claim of 10 reads 4 index pages in 0.13 to 0.31 ms, a claim that finds nothing reads 3 pages in 0.03 ms (`go test -count=1 -v -run TestClaimPlanReadsTheIndexInOrder ./internal/store`). With the rejected `IN (SELECT ...)` form the generic plan is a sequential scan with a hash join, 32.5 ms (the same test, mutation applied by `make guards`). |
-| A4 | The time from permit to arrival at the provider varies by less than the 50 ms margin, on new and on reused connections | **Measured** (session 4) at the recording server on one machine, with the real limiter: TestPermitToArrivalStaysWithinTheMargin. 40 senders for 2 s at the limit of 100 per second over TLS; half use a fresh client per send, whose handshake the server holds back 100 ms, half share one client. The time is from `Wait` returning to the arrival stamp, both on the worker's monotonic clock; Redis's reply to the take script is not inside it. Four runs without the race detector: new connections median 0.15 to 0.42 ms, maximum 2.3 to 9.9 ms; reused, median 0.06 to 0.16 ms, maximum 3.0 to 6.6 ms (`go test -count=4 -v -run TestPermitToArrivalStaysWithinTheMargin ./internal/provider`). With `-race`, six runs: maxima 14 to 41 ms on new and 10 to 29 ms on reused connections (the same with `-race -count=6`): the race detector slows the client and the server on the same CPUs. So the test asserts the margin only without the race detector, which is how `make guards` runs it, in CI too. Not measured: the network between a worker and a real provider, and a worker under CPU starvation (section 7, limits). Through the dispatcher: session 5. |
+| A4 | The time from permit to arrival at the provider varies by less than the 50 ms margin, on new and on reused connections | **Measured** (session 4) at the recording server on one machine, with the real limiter: TestPermitToArrivalStaysWithinTheMargin. 40 senders for 2 s at the limit of 100 per second over TLS; half use a fresh client per send, whose handshake the server holds back 100 ms, half share one client. The time is from `Wait` returning to the arrival stamp, both on the worker's monotonic clock; Redis's reply to the take script is not inside it. Four runs without the race detector: new connections median 0.15 to 0.42 ms, maximum 2.3 to 9.9 ms; reused, median 0.06 to 0.16 ms, maximum 3.0 to 6.6 ms (`go test -count=4 -v -run TestPermitToArrivalStaysWithinTheMargin ./internal/provider`). With `-race`, six runs: maxima 14 to 41 ms on new and 10 to 29 ms on reused connections (the same with `-race -count=6`): the race detector slows the client and the server on the same CPUs. So the test asserts the margin only without the race detector, which is how `make guards` runs it, in CI too. Session 4's reviewer, with 14 busy processes on 8 CPUs and `-race`, measured 71.7 ms on reused connections: under CPU starvation A4 does not hold, which is the "frozen worker" case of section 7's limits table. Not measured: the network between a worker and a real provider. Through the dispatcher: session 5. |
 | A5 | With the claim batch rule, the wait at the gate stays near one window plus `10 × W / 100` seconds and nothing is refused, for up to 12 workers; throughput stays near the top speed | Simulated in the design review (93 to 96 sends per second, no refusals, worst wait 2.04 s at 12 workers), with waiters served in order. Session 3's reviewer modelled it with the real limiter, which serves waiters in no order, and every worker keeping 10 rows waiting: worst waits of 3.16 s and 2.12 s at 12 workers, no refusals; refusals from 24 workers (section 6). To measure on the real system in session 5. |
 | A6 | The sliding-window script grants at most the limit per window under concurrent callers | **Permanent test** (session 3): TestNoWindowHoldsMoreThanTheLimit. 200 callers on 4 Redis clients, half waiting in `Wait`, half asking once at random moments, limit 100, margin 50 ms, for 3.3 s: 400 permits, at most 100 in any window of 1,050,000 µs on the permits' own Redis times (`go test -count=1 -v -run TestNoWindowHoldsMoreThanTheLimit ./internal/ratelimit`). With the window's lower bound moved 2 ms early, it fails in 3 of 3 runs. |
 
@@ -788,6 +804,9 @@ metrics:
   channel; session 3's review measured refusals from 24 workers with the real limiter
   (section 6). The real limit is measured in session 5 (A5); the metric for refusals at the
   gate shows when it is crossed.
+- `IDLE_CONN_TIMEOUT + GATE_BUDGET` should stay under the provider's keep-alive timeout;
+  otherwise some sends find their connection closed by the provider while they wait at the
+  gate (section 7, the connection pool). The worker does not know the provider's timeout.
 
 ## 14. Code layout
 
