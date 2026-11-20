@@ -50,4 +50,6 @@ An earlier run of 3,000 per row gave 2, 1, 0 and 0.
   provider would receive one request without a permit, and would receive the same message
   again when the refused attempt is retried (with the same idempotency key). Nothing would be
   lost.
-- Session 4 turns this into a permanent test of the real provider client.
+- Session 4 turned this into a permanent test of the real provider client
+  (TestARefusedSendNeverReachesTheProvider, architecture §12, A1). Through that client the
+  close alone was enough: 0 of 20,000 refused sends arrived, so the cancel was removed.
