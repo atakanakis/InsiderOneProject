@@ -135,6 +135,7 @@ Indexes, each for one query:
 |---|---|
 | `(channel, priority, ready_at) WHERE status IN ('scheduled', 'pending', 'retrying')` | The claim |
 | `(locked_until) WHERE status = 'processing'` | The reaper |
+| `delivery_attempts (started_at)`, BRIN (migration 5, session 7) | The attempts of a recent window, for `GET /v1/metrics` (section 10). Attempt rows are only inserted, in time order, so a BRIN index is a few pages. |
 | `(created_at DESC, id)`, `(batch_id)` | List and batch queries. The list is ordered `created_at DESC, id ASC`, the order of the index; its cursor compares `(created_at, id)` in that mixed order. (Noted in session 1's review, for session 6.) |
 
 Migrations are versioned, append-only files run by a one-shot `migrate` command.
@@ -235,7 +236,9 @@ each other's rows (TestReapSkipsRowsLockedByAnotherTransaction). It does not cha
 `attempts`, and it keeps `ready_at`, so a returned row takes its old place in the queue. It
 sets `last_error` to "lease expired". It writes no attempt row: only Finish writes one, so an
 attempt lost with its worker shows in the history as a missing attempt number. It returns the
-ids and new statuses, for the status events.
+ids, new statuses, batch ids and correlation ids, for the status events and the log
+(section 9, section 10). Claim, Cancel and Requeue return the batch id too, from the same
+statement (session 7).
 
 **Cancel** sets `cancelled` only `WHERE status IN ('scheduled', 'pending', 'retrying')`. A row
 that is being sent cannot be cancelled; the API answers 409. Cancel tells "no such row" apart
@@ -310,6 +313,7 @@ func (d *Dispatcher) start(row Notification) {         // runs on the loop's gor
 func (d *Dispatcher) handle(row Notification, probe bool, wait *Waiting) {
     defer d.slots.Release()
     defer wait.Leave()                   // safe to call twice
+    d.events.Publish(row.ID, processing) // never waits (section 9)
     result := d.provider.Send(sendCtx, messageOf(row), func(ctx context.Context) error {
         err := d.limiter.Wait(ctx, d.channel)          // the send gate, section 7
         wait.Leave()
@@ -400,7 +404,8 @@ probe can be forgotten.
      whole queue into `failed` with the breaker closed (review F1;
      TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle). The attempt
      is spent, as for every refusal (rule 4); how often this happens is bounded by the
-     relation of section 13 and counted by a metric in session 7.
+     relation of section 13 and counted in `notifications_attempts_total{outcome="closed_idle"}`
+     (section 10).
   3. *The request was never made,* because it could not be built. This case is removed
      rather than classified. The URL is the same for every message, so `provider.New` refuses
      a URL that is not an absolute `http` or `https` URL, and a message has no other part
@@ -467,8 +472,12 @@ TestARefusedProbeLeavesTheBreakerHalfOpen).
   each, which made 993 connections for 2,362 requests to a slow provider (session 5's review,
   F5). The queue and the limiter are interfaces, so that tests can wrap the real ones to
   inject stalls and failures and to stamp permits.
-- Status events go through a narrow `events.Publisher` interface; session 5 uses one that
-  drops them, session 7 the Redis one.
+- Status events go through a narrow `events.Publisher` interface whose `Publish` never waits
+  and never fails (section 9). `handle` publishes `processing` when it starts, and the new
+  status when `Finish` changed the row. Session 5 used one that dropped them; session 7 the
+  Redis one.
+- The measurements (section 10) are made in `handle`, in the gate and after `Finish`, where
+  the values are known; each is an increment in memory. The loop has none.
 
 The open time is longer than the longest possible send, so no result from before the breaker
 opened can arrive while it is probing. While the breaker is open, an outage uses attempts only
@@ -648,7 +657,8 @@ held up to the gate budget (5 s), reaches the provider's keep-alive timeout if t
 15 s (Node's default is 5 s). Session 4's reviewer reproduced it: a provider with a 2 s
 keep-alive, a connection idle 1.5 s, a gate wait of 1 s, no response (review F3). This is the
 client's own doing, not the provider's failure; the third relation below states it, session 5
-decides how `Classify` counts it, and session 7 counts it in a metric.
+decides how `Classify` counts it, and `notifications_attempts_total{outcome="closed_idle"}`
+counts it (section 10).
 
 The limiter **fails closed**: when a permit cannot be taken, nothing is sent. When Redis is
 unreachable `Available()` fails too, so nothing is even claimed. When Redis refuses writes (a
@@ -797,9 +807,12 @@ and it counts towards the breaker.
   409. `GET /v1/templates` lists names and channels in name order, 100 per page, with a
   cursor; `GET /v1/templates/{name}` returns one with its body.
 
-An id that is not a UUID is a 400. Every status change the API makes (create, cancel, retry)
-is handed to the narrow `events.Publisher` of section 9 after it is committed; until session
-7 adds the Redis publisher, the binary gives it `events.Discard`.
+An id that is not a UUID is a 400. Every status change the API makes (create, batch, cancel,
+retry) is handed to the `events.Publisher` of section 9 after it is committed; publishing
+never makes an answer wait (TestTheAPIAnswersWhileRedisHangs).
+
+- **Metrics** (`GET /v1/metrics?window=5m`) and the **WebSocket** (`GET /v1/ws`) are
+  described in sections 10 and 9.
 
 **There is no service layer.** The handlers call `domain` for validation and rendering and
 `store` for SQL. Section 14 listed an `internal/service` package for use cases; every use case
@@ -906,12 +919,14 @@ time is a quota, left out (section 16).
 | List page | 100 items; items are summaries without `content` |
 | Template list page | 100 names, without bodies |
 | Attempt history in a status answer | The last 100 attempts, with the total count (`/retry` can add attempts without end) |
-| Metrics window | 1 hour |
+| Metrics window | `1m`, `5m`, `15m` or `1h`; any other value is a 400; computed at most once per 5 s per window (TestTheMetricsEndpointReportsTheRecentWindow, TestTheMetricsEndpointIsComputedOncePerFiveSeconds) |
 | Database time per API request | A deadline of 5 s on the request, and a statement timeout of 5 s; cancel and retry 10 s (TestARequestEndsAtItsDeadlineWhenPostgresStalls, TestAPIDatabaseSessionsHaveAFiveSecondStatementTimeout) |
 | Rate-limit window in Redis (section 7) | At most `limit` permits per channel, also with workers of different settings; both keys expire one window after the last permit (TestTheWindowHoldsAtMostTheLimitAndExpires, TestWorkersWithDifferentSettingsAreRefused) |
 | Provider response read by the worker (section 7) | Headers 64 KiB; body 4 KiB, the rest not read (TestResponseHeadersOverTheBoundAreNotAResponse, TestTheResponseBodyIsReadUpToItsBound) |
 | Text stored from a delivery result (section 5) | Error and outcome 1 KiB, provider message id 256 bytes, valid UTF-8 (TestFinishStoresTextAtItsBound, TestFinishStoresAnyErrorTextWithinItsBound) |
-| WebSocket | 1000 connections per API instance; a client that cannot keep up is disconnected |
+| WebSocket | 1000 connections per API instance; 256 messages waiting per client, then it is disconnected; 5 s to write a message; no data message from the client; a ping every 30 s, answered within 10 s; 1 to 100 notification ids and at most 10 batch ids. The table and tests are in section 9 |
+| Status event read from Redis | 1 KiB; a larger or malformed event is dropped (TestAMalformedOrOversizedEventIsDropped) |
+| Status events waiting to be published | 4,096 per process; more are dropped and counted (TestPublishNeverBlocksWhenRedisHangs) |
 | `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged (TestCorrelationIDBound, TestCorrelationIDIsAcceptedOrReplaced) |
 
 **Readiness.** The API needs only Postgres to accept and answer requests: it writes rows, and
@@ -935,6 +950,8 @@ separated by commas), every `/v1` request needs one of them, in `Authorization: 
 `X-API-Key`; otherwise 401 (TestAPIKeysAreRequiredWhenConfigured). The scheme `Bearer` is
 matched in any case, as RFC 9110 says. The keys are compared in
 constant time, each against every configured key. `/healthz`, `/readyz`, `/docs` and `/openapi.yaml` stay open.
+So does `/metrics`, which Prometheus scrapes: its labels hold no data from requests (section
+10). `/v1/metrics` and `/v1/ws` need a key like every `/v1` path.
 
 **OpenAPI.** `GET /openapi.yaml` serves the specification, embedded in the binary; `GET /docs`
 a viewer. Every path, method and status code in it is produced by the real server in a test,
@@ -950,19 +967,218 @@ Events are best-effort. An event can be lost (a client was disconnected, Redis r
 a lost event never affects delivery. The database is the truth; a client can always ask for
 the current status.
 
+**The event** is `{"id", "batchId", "status"}`, JSON, on the Redis channel
+`notifications:status`. `batchId` is absent for a notification created alone. Every change
+publishes one: the API's create, batch, cancel and retry; the worker's claim (`processing`,
+when `handle` starts), its result (`Finish` returned "changed") and the reaper's returns. So
+the statements that change a status return the row's batch id with its new status (Claim,
+Finish's caller has it from the claim, Reap, Cancel, Requeue; section 5).
+
+**Publishing never waits** (session 7). `Publish` puts the event in a buffer of 4,096 events
+and returns; it never blocks and never fails (`events.Buffer`). One goroutine per process takes
+events from the buffer and sends up to 256 at once to Redis in one pipeline, with a timeout of
+1 s (`events.PublishTimeout`). When the buffer is full the event is dropped; when Redis does not
+answer, the events of that pipeline are dropped. Both are counted
+(`notifications_events_dropped_total{reason}`) and logged at most once per 10 s. So a Redis
+that is down, slow or paused costs the sender nothing: no send, no result write, no API
+answer waits for it (TestPublishNeverBlocksWhenRedisHangs,
+TestLostEventsDoNotAffectDelivery, TestTheAPIAnswersWhileRedisHangs). The worker publishes
+through its own Redis client, so a publish never holds a connection the rate limiter needs.
+On shutdown the worker gives the publisher 2 s to send what is buffered, after the sends in
+flight have finished.
+
+**Order.** One process publishes in the order the events were given, and Redis delivers one
+connection's messages in order, so the events that one process publishes about one
+notification arrive in order. Events from two processes have no order: the API's `pending`
+can arrive after the worker's `processing`, when the API's publisher is behind. A client that
+needs the truth asks `GET /v1/notifications/{id}`.
+
+**Subscribing.** Each API instance runs one subscription and hands each event to its hub. The
+subscription waits at most 10 s for a message; after a silent 10 s it sends a `PING` on the
+subscription, and if 10 s more pass with nothing, not even the answer, it closes the
+connection and subscribes again. Any error does the same, after a pause that starts at
+100 ms and doubles up to 5 s. So a Redis that restarts, drops the connection or is paused is
+subscribed to again without anyone's help; the events published meanwhile are lost
+(TestTheSubscriptionComesBackAfterRedisDropsIt, TestTheSubscriptionComesBackAfterAnOutage).
+An event larger than 1 KiB, or one that is not valid JSON with a UUID and a known status, is
+dropped and counted (TestAMalformedOrOversizedEventIsDropped).
+
+**The WebSocket endpoint** is `GET /v1/ws?notificationId=...&batchId=...`, behind the API key
+like every `/v1` path (TestWebSocketNeedsAnAPIKeyWhenConfigured). A client names what it
+wants to follow: 1 to 100 notification ids and at most 10 batch ids, each parameter repeated;
+no id, too many, a value that is not a UUID or another parameter is a 400 before the upgrade
+(TestWebSocketFiltersAreBounded). There is no "every event" stream: each client receives only
+what it named.
+
+When the connection opens, the server sends the current state first and then every change:
+
+1. It adds the client to the hub, so no change from then on is missed.
+2. It reads the current status of each named notification (one query) and the summary of each
+   named batch, and sends them: `{"type": "status", "id", "batchId", "status"}` for a
+   notification and `{"type": "batch", "batchId", "total", "counts"}` for a batch. An id that
+   does not exist is not answered.
+3. Every event of a named notification, or of a notification of a named batch, follows as
+   `{"type": "status", ...}`.
+
+Without step 2 a client could not follow a notification it has just created: the change to
+`sent` can happen before its connection opens, and a batch's id is known only after it was
+created. A change that happens between steps 1 and 2 can arrive twice, and an event that a
+publisher sent late can arrive after a state that already includes it (the order rule above).
+`sent` and `cancelled` are final, so a client that waits for one of them is not misled
+(TestAWebSocketClientGetsTheCurrentStateThenEveryChange).
+
+**The hub** keeps, for each id, the clients that named it. Handing an event to the hub is a map
+lookup and, for each client, a send on that client's queue that never waits. The client's
+own goroutine writes its queue to the connection. Nothing that one client does can make the
+hub, the subscription or another client wait.
+
+**Bounds of a WebSocket connection** (each with its test):
+
+| What | Bound | When it is crossed | Test |
+|---|---|---|---|
+| Connections per API instance | 1000 (`api.MaxWebSockets`) | The next upgrade is a 503 in the error form, before the upgrade | TestWebSocketConnectionsAreBoundedPerInstance |
+| Messages waiting for one client | 256 (`api.WebSocketQueue`) | The client is disconnected (close code 1008, "too slow") and removed from the hub; the API's memory does not grow with what a client does not read | TestASlowWebSocketClientIsDisconnectedAndMemoryStaysBounded |
+| Time to write one message | 5 s | The connection is closed | the same test |
+| Messages from the client | none: the client sends nothing but control frames | The first data message closes the connection (1008), its payload unread; a malformed frame closes it (1002). A control frame is at most 125 bytes (RFC 6455) | TestAWebSocketClientMustNotSendDataMessages |
+| Messages to the client | one event or one batch summary, under 1 KiB each | | the form above |
+| A peer that is gone | a ping every 30 s; no answer within 10 s closes the connection | | TestAWebSocketClientThatDoesNotAnswerPingsIsClosed |
+| A quiet connection | no limit: a client may wait hours for a scheduled notification, as long as it answers pings. The server's request timeouts (section 8) end at the upgrade | | TestAWebSocketOutlivesTheServersRequestTimeouts |
+
+On shutdown the API closes every WebSocket with code 1001 ("going away"); a client reconnects
+to another instance and receives the current state again.
+
 ## 10. Observability
 
-- **Logs:** structured JSON (`log/slog`). The API accepts or creates an `X-Correlation-ID`,
-  stores it on the notification row, and the worker logs it on every line about that
-  notification. One id follows a message from the HTTP request to the provider call.
-- **Metrics:** Prometheus counters and histograms for requests, queue depth per channel and
-  status, the age of the oldest due row, attempts by verdict, provider latency, wait at the
-  send gate, refusals at the gate, breaker state and reaped rows. `GET /v1/metrics` gives the
-  main figures as JSON for a recent window.
-- **Tracing:** OpenTelemetry. The trace context is stored on the row, so the worker's delivery
-  span joins the trace of the API request that created the notification.
-- **Alerts:** a small set of Prometheus rules. Every rule has a `promtool` test, and CI fails
-  when a rule has none. A rule that cannot fire is not shipped.
+### Logs
+
+Structured JSON (`log/slog`). The API accepts or creates an `X-Correlation-ID`, stores it on
+the notification row, and the worker logs it on every line about that notification: the
+claim's row, the attempt, the result, a lost result write, the reaper's return. The provider
+receives the same id in `X-Correlation-ID` (section 7). So one id follows a message from the
+HTTP request to the provider call
+(TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider,
+TestEveryWorkerLineAboutANotificationCarriesItsCorrelationID).
+
+**A failing dependency is counted, not logged per try.** Session 5's reviewer made Postgres
+read-only: the worker wrote a warning for every retry of every result write, 3,200 lines in
+75 s. The same shape existed for a Redis that refuses the rate-limit read: one line per loop,
+every 20 ms per channel. Such failures now increment
+`notifications_worker_errors_total{operation}` (`claim`, `rate_limit`, `result_write`, `reap`)
+and write at most one line per 10 s per operation and dispatcher, with the number of failures
+since the last line and the last error (`observability.Every`). The result that was not stored
+is still counted in `notifications_finished_total{status="not_stored"}`, and the row's own line
+says so at debug level, with its correlation id
+(TestResultWriteFailuresAreCountedAndLoggedSparsely).
+
+### Metrics
+
+Prometheus, at `GET /metrics` on the API (port 8080) and on each worker (`METRICS_ADDR`,
+default `:9100`). Every metric is named `notifications_...`. Labels take values from a fixed
+set only: a channel, a status, an outcome of the verdict table, an operation, an HTTP method,
+a route pattern of the API (`unmatched` for any other path) and a status code. A notification
+id, a recipient, a batch id or any text from a request is never a label
+(TestMetricLabelsHaveBoundedValues). Every series of a fixed set exists from the start with the
+value 0, so `rate()` and `increase()` see the first event, and a rule can name a label value
+before it has happened.
+
+| Figure (as in the requirements) | Metric | Where it is measured |
+|---|---|---|
+| Requests | `notifications_http_requests_total{method, route, code}`, `notifications_http_request_duration_seconds{method, route}` | API, around the router |
+| Queue depth per channel and status | `notifications_queue_depth{channel, status}`, for `scheduled`, `pending`, `retrying`, `processing` | API, from Postgres (below) |
+| Age of the oldest due row | `notifications_queue_oldest_due_age_seconds{channel}`; 0 when nothing is due | API, from Postgres |
+| Attempts by verdict | `notifications_attempts_total{channel, outcome}`: `sent`, `rejected`, `error_response`, `limiter_error`, `no_permit_in_time`, `closed_idle`, `no_response` | Worker, after `Classify` |
+| Refusals at the gate | the same counter, `outcome` `no_permit_in_time` or `limiter_error` | |
+| Connections the provider closed at the gate (sections 7, 13) | the same counter, `outcome="closed_idle"` | |
+| What became of each attempt | `notifications_finished_total{channel, status}`: `sent`, `failed`, `retrying`, `stale`, `not_stored`. Every attempt is counted once here and once in the attempts | Worker, after `Finish` |
+| Provider latency | `notifications_provider_latency_seconds{channel}`: from the permit to the end of the send, for every send that got a permit | Worker, around the gate |
+| Wait at the send gate | `notifications_gate_wait_seconds{channel}`: the time in `limiter.Wait`, for every send that reached the gate | Worker, in the gate |
+| Breaker state | `notifications_breaker_state{channel}`: 0 closed, 1 open, 2 half-open, read when scraped | Worker |
+| Sends in flight | `notifications_sends_in_flight{channel}`, read when scraped (section 13, slots ÷ latency) | Worker |
+| Reaped rows | `notifications_reaped_total{status}`: `pending`, `failed` | Worker, the reaper |
+| A failing dependency | `notifications_worker_errors_total{operation}` | Worker |
+| Status events | `notifications_events_published_total`, `notifications_events_dropped_total{reason}` (`buffer_full`, `redis_error`); on the API `notifications_events_received_total`, `notifications_events_malformed_total`, `notifications_events_subscriptions_total` (each subscription made, the first included) | Both |
+| WebSocket | `notifications_websocket_connections`, `notifications_websocket_refused_total`, `notifications_websocket_closed_total{reason}` (`client`, `slow`, `no_pong`, `data_message`, `write_error`, `shutdown`) | API |
+
+The breaker and sends in flight are read when Prometheus scrapes, because the breaker turns
+half-open by the clock, without a call.
+
+The measurements in the worker add no step that can wait or fail to the delivery path: each
+is an increment or an observation in memory, made where the value is already known (after
+`Classify`, in the gate, after `Finish`). The dispatcher's loop is unchanged.
+
+**The figures from Postgres** (queue depth and the oldest due row) are read by the API, once
+per 5 s at most, whatever the number of scrapes and requests; a scrape within 5 s of the last
+read is answered from it. The depth is one count over the rows in the four statuses, grouped
+by channel and status, through the claim index and the reaper's index; the oldest due row is
+read from the claim index, one probe per channel and priority. The time is Postgres's
+(`now() - ready_at`, rule 7). The read has its own timeout of 2 s; when it fails, the figures
+are left out of that scrape and the failure is logged at most once per 10 s. Every API
+instance exports the same figures, so rules combine them with `max`, never `sum`. The cost on
+a large queue is measured in session 7's record.
+
+**`GET /v1/metrics`** answers the main figures as JSON for a recent window: `window` is one of
+`1m`, `5m` (the default), `15m` and `1h` (the bound of section 8); any other value is a 400.
+Per channel: the queue depth by status and the age of the oldest due row (as above), and from
+the attempts that started within the window, their number by outcome, the number of attempts
+per second, the share that delivered, and the 50th, 95th and 99th percentile of the attempt's
+duration and of the delivery latency (from the notification's creation to the start of the
+attempt that delivered it plus its duration). The attempts are found by a BRIN index on
+`delivery_attempts.started_at` (migration 5): attempt rows are only inserted, in time order,
+so the index is a few pages and needs no maintenance on the queue's path. An answer is
+computed at most once per 5 s per window and API instance, so any number of clients costs
+four queries every 5 s at most (TestTheMetricsEndpointReportsTheRecentWindow,
+TestTheMetricsEndpointIsComputedOncePerFiveSeconds).
+
+### Tracing
+
+OpenTelemetry. Tracing is on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (OTLP over HTTP); it is
+off by default. Off, the process has a tracer that records nothing, starts no goroutine,
+opens no connection and logs nothing (TestTracingIsOffWithoutAnEndpoint).
+
+- The API starts a span for every request (`GET /v1/notifications/{id}`, the route pattern),
+  as a child of the request's `traceparent` header when there is one.
+- Create and batch store the span's context on each row, as a W3C `traceparent` string. With
+  tracing off and no `traceparent` header, the string is empty.
+- The worker starts a delivery span for each attempt as a child of the stored context, so it
+  joins the trace of the request that created the notification
+  (TestTheDeliverySpanJoinsTheAPIRequestsTrace). The span carries the channel, the attempt
+  number, the outcome and the status code, and an event when the permit is taken. A row with
+  no stored context starts a new trace.
+- The worker does not send `traceparent` to the provider; the provider receives the
+  correlation id, as before.
+- When the exporter cannot reach its collector, spans are dropped by the exporter's own
+  bounded queue, and its errors go to the process's log at most once per 10 s.
+
+### Alerts
+
+A small set of Prometheus rules in `deploy/prometheus/alerts.yml`, loaded by the Prometheus of
+the Compose `observability` profile. Each rule says what an operator does about it.
+
+| Alert | Fires when | Means |
+|---|---|---|
+| `NotificationsBreakerOpen` | some worker's breaker of a channel has not been closed for 5 min | The provider fails for that channel (section 6) |
+| `NotificationsOldestDueRowTooOld` | the oldest due row of a channel has waited more than 5 min, for 5 min | Delivery is stalled or far behind |
+| `NotificationsGateRefusals` | more than 0.1 refusals per second at a channel's gate, for 10 min | More dispatchers per channel than the gate serves within its budget, or Redis is slow (section 13) |
+| `NotificationsFailedShareHigh` | more than 10% of a channel's finished attempts end `failed`, for 15 min | Messages are rejected or run out of attempts |
+| `NotificationsResultWritesFailing` | result writes fail, for 2 min | Postgres refuses writes; rows will be sent again after their lease (section 6) |
+| `NotificationsRateLimitUnavailable` | the rate-limit read fails, for 2 min | Redis is down or refuses writes; nothing is claimed (section 7) |
+| `NotificationsProviderClosesIdleConnections` | more than 0.05 attempts per second end `closed_idle`, for 15 min | The provider's keep-alive is shorter than `IDLE_CONN_TIMEOUT + GATE_BUDGET` (section 13) |
+| `NotificationsEventsDropped` | status events are dropped, for 10 min | Redis is down or slow for the publishers; delivery is not affected (section 9) |
+
+Three checks keep a rule from being one that cannot fire (lesson 12):
+
+1. Every rule has a `promtool` test (`deploy/prometheus/alerts_test.yml`) with a case where it
+   fires. `make alerts` runs `promtool check rules` and `promtool test rules`; CI runs them.
+   A rule without a firing case fails `go test ./tools/alertcheck`
+   (TestEveryAlertRuleHasAFiringTest).
+2. Every metric a rule names, and every label value it matches, is exported by the real
+   binaries: the test builds `cmd/api` and `cmd/worker`, runs them against Postgres, Redis and
+   the recording provider, and reads their `/metrics`
+   (TestEveryAlertRuleUsesMetricsTheBinariesExport). CI's compose job runs the same check
+   against the running stack.
+3. Every metric a rule depends on is moved by a named test of the code path that produces it
+   (the tests in the metrics table above, and TestAttemptsAndResultsAreCountedOnce,
+   TestTheBreakerStateIsExportedWhenScraped, TestTheReaperCountsTheRowsItReturns).
 
 ## 11. Invariants
 
@@ -1049,8 +1265,9 @@ metrics:
   `window + claim batch × workers ÷ rate`, which would hold up to about 35 workers per
   channel; session 3's review measured refusals from 24 workers with the real limiter
   (section 6). Session 5 measured about one window (1.05 s) up to 12 dispatchers per channel,
-  with no refusal (A5); above that it is not measured, and the metric for refusals at the gate
-  (session 7) shows when it is crossed.
+  with no refusal (A5); above that it is not measured, and the refusals at the gate
+  (`notifications_attempts_total{outcome="no_permit_in_time"}`, alert
+  `NotificationsGateRefusals`) show when it is crossed.
 - `IDLE_CONN_TIMEOUT + GATE_BUDGET` should stay under the provider's keep-alive timeout;
   otherwise some sends find their connection closed by the provider while they wait at the
   gate (section 7, the connection pool). The worker does not know the provider's timeout.
@@ -1065,9 +1282,9 @@ internal/redisclient   the one place a Redis client is built; context deadlines 
 internal/ratelimit     the Redis sliding window: Available, Wait
 internal/provider      the HTTP client with the send gate; Result
 internal/dispatch      the loop, Classify, retry policy, breaker, reaper
-internal/api           handlers, middleware, WebSocket
-internal/events        publish and subscribe
-internal/observability logging, metrics, tracing
+internal/api           handlers, middleware, the WebSocket hub, /v1/metrics
+internal/events        the event; the Redis publisher that never waits; the subscription
+internal/observability logging (and Every, a log line per period), metrics, tracing
 internal/config        settings and the checks of section 13
 internal/recorder      the recording provider server: stamps each request on arrival,
                        injects responses, latency, slow TLS setup and closed connections
@@ -1075,6 +1292,13 @@ internal/testkit       test database and test Redis (testcontainers, or servers 
                        make guards starts once); starts the recorder
 tools/guards           `make guards`: disables each guard and expects a named test to fail
 tools/testnames        checks that every test named in docs/ exists in the code
+tools/alertcheck       every alert rule has a firing promtool test, and names only metrics
+                       and label values that the binaries export (section 10)
+tools/e2e              notifications through the API of the Compose stack, and a WebSocket
+                       client that follows one of them
+internal/systemtest    tests across the API, Redis and the worker: one correlation id,
+                       one trace, a WebSocket event from a real delivery
+deploy/prometheus      alert rules, their promtool tests, the scrape configuration
 ```
 
 The recording server is its own package, not part of `testkit`, because `cmd/mockprovider`
@@ -1083,6 +1307,8 @@ the testcontainers dependencies into that binary. (Changed in session 1.)
 
 Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on `store`,
 `ratelimit` and `provider`; all of them depend on `domain`; `domain` depends on nothing.
+`api` and `dispatch` also depend on `events` and `observability`, which depend only on
+`domain`.
 (Session 6 removed `internal/service`; section 8 says why.)
 
 ## 15. Requirements coverage
@@ -1100,14 +1326,14 @@ Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on
 | Content validation | Section 8: TestEveryFieldIsValidatedAndNamed, TestRecipientFormatsPerChannel, TestContentIsBoundedPerChannelInCharacters, TestContentAndVariablesMustNotContainNUL | 6 |
 | Idempotency | Sections 6, 8: I10 | 5, 6 |
 | Delivery and retry logic | Section 6 | 4, 5 |
-| Metrics endpoint | Section 10 | 7 |
-| Structured logging with correlation ids | Section 10 | 1, 7 |
+| Metrics endpoint | Section 10: `GET /v1/metrics` (TestTheMetricsEndpointReportsTheRecentWindow) and `GET /metrics` (TestQueueGaugesComeFromTheDatabase, TestAttemptsAndResultsAreCountedOnce, TestMetricLabelsHaveBoundedValues); alerts (TestEveryAlertRuleHasAFiringTest, TestEveryAlertRuleUsesMetricsTheBinariesExport) | 7 |
+| Structured logging with correlation ids | Section 10: TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider, TestEveryWorkerLineAboutANotificationCarriesItsCorrelationID | 1, 7 |
 | Health check | Section 8 | 1 |
 | Bonus: failure handling (breaker, dead-letter state, retry endpoint) | Section 6; `/retry`: TestRetryRequeuesOnlyAFailedNotification | 5, 6 |
 | Bonus: scheduled notifications | Sections 3, 5: TestAScheduledNotificationWaitsUntilItsTime | 2, 6 |
 | Bonus: templates | Section 8: TestTemplatesAreCreatedOnceAndRendered, TestTheRenderedLengthIsMeasuredBeforeRendering | 6 |
-| Bonus: WebSocket updates | Section 9 | 7 |
-| Bonus: distributed tracing | Section 10 | 7 |
+| Bonus: WebSocket updates | Section 9: TestAWebSocketClientGetsTheCurrentStateThenEveryChange, TestAWebSocketClientReceivesTheSentEventOfARealDelivery, the bounds of section 9; CI's compose job (`tools/e2e`) | 7 |
+| Bonus: distributed tracing | Section 10: TestTheDeliverySpanJoinsTheAPIRequestsTrace, TestTracingIsOffWithoutAnEndpoint | 7 |
 | Bonus: GitHub Actions | [Plan](plan.md) | 1 |
 | Docker Compose, OpenAPI, migrations, single-command tests | [Plan](plan.md); OpenAPI: TestOpenAPIMatchesTheServer; the stack end to end through the API: CI's compose job (`tools/e2e`) | 1, 6 |
 
@@ -1124,3 +1350,7 @@ Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on
 | Exactly-once delivery | Not possible across a network call. See "At-least-once" in section 6. |
 | Tenants | The requirements have none. Keys, limits and templates would be scoped per tenant. |
 | Quotas and rate limits per client at the API | Each request is bounded, and rendering is bounded across requests (section 8), but how much one client may store over time is a policy per client, which needs tenants. A gateway in front of the API is the usual place. |
+| Durable status events, or a replay of missed ones | Events are best-effort (section 9): a client that reconnects is sent the current state, which is what a replay would end in. A durable stream (Redis Streams, Kafka) is a second source of truth to keep consistent with Postgres. |
+| A WebSocket stream of every event | Each client names what it follows (section 9). A stream of everything would send 300 events per second to each client, and is a job for a consumer of the Redis channel, not for a public endpoint. |
+| An API key in the WebSocket's query string | Browsers cannot set headers on a WebSocket, but a key in a URL is written to proxy and access logs. The key is a header, as on every `/v1` path; a browser client needs a server of its own in between. |
+| `traceparent` sent to the provider | The provider is outside; the trace ends at the worker's delivery span. The provider receives the correlation id (section 7). |
