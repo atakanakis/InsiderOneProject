@@ -682,4 +682,14 @@ var guards = []Guard{
 		Old: "req.Header.Set(\"Idempotency-Key\", m.ID.String())", New: "_ = m.ID.String()",
 		Package: "./internal/provider", Test: "TestTheRequestHasTheAssignmentsFormat",
 	},
+	{
+		Name: "provider: a 101's connection is not read (review F2)", File: "internal/provider/provider.go",
+		Old: "if resp.StatusCode < http.StatusOK {", New: "if false && resp.StatusCode < http.StatusOK {",
+		Package: "./internal/provider", Test: "TestOneDeadlineCoversConnectGateWriteAndResponse",
+	},
+	{
+		Name: "provider: a Retry-After date in the past is 0", File: "internal/provider/provider.go",
+		Old: "err == nil && t.After(now) {", New: "err == nil {",
+		Package: "./internal/provider", Test: "TestTheResultCarriesWhatWasObserved",
+	},
 }
