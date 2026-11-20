@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"regexp"
@@ -66,7 +67,7 @@ func TestMigrationsAreAppendOnly(t *testing.T) {
 }
 
 func TestMigrateBuildsAnEmptyDatabaseAndIsRepeatable(t *testing.T) {
-	pool, err := store.Connect(ctx(t), testkit.EmptyDatabase(t))
+	pool, err := store.Connect(ctx(t), testkit.EmptyDatabase(t), store.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +208,80 @@ const (
 	fkViolation     = "23503"
 )
 
-// The CHECK constraints accept exactly the values of package domain, so a value the Go code
-// can produce is never refused by the database, and the database refuses anything else.
+var (
+	checkOfColumn = regexp.MustCompile(`^CHECK \(\(\(?([a-z_]+)\)? = ANY \(\(?ARRAY\[(.*)\]`)
+	checkValue    = regexp.MustCompile(`'([^']*)'|(-?[0-9]+)`)
+)
+
+// checkedValues reads the CHECK constraints of a table from the database and returns, for
+// each column with an "IN (...)" check, the values it allows, in order.
+func checkedValues(t *testing.T, pool *pgxpool.Pool, table string) map[string][]string {
+	t.Helper()
+	rows, err := pool.Query(ctx(t), `SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = $1::regclass AND contype = 'c'`, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var def string
+		if err := rows.Scan(&def); err != nil {
+			t.Fatal(err)
+		}
+		m := checkOfColumn.FindStringSubmatch(def)
+		if m == nil {
+			t.Fatalf("%s: a CHECK this test does not understand: %s", table, def)
+		}
+		for _, v := range checkValue.FindAllStringSubmatch(m[2], -1) {
+			out[m[1]] = append(out[m[1]], v[1]+v[2])
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func names[T ~string](xs []T) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = string(x)
+	}
+	return out
+}
+
+// The CHECK constraints allow exactly the values of package domain: the lists are read from
+// the database and compared, so a value added on either side alone turns this red.
+func TestColumnChecksAllowExactlyTheDomainValues(t *testing.T) {
+	e := testkit.Setup(t)
+	var priorities []string
+	for _, p := range domain.Priorities {
+		priorities = append(priorities, fmt.Sprint(int(p)))
+	}
+	want := map[string]map[string][]string{
+		"notifications": {
+			"channel":  names(domain.Channels),
+			"priority": priorities,
+			"status":   names(domain.Statuses),
+		},
+		"templates": {"channel": names(domain.Channels)},
+	}
+	for table, cols := range want {
+		got := checkedValues(t, e.Pool, table)
+		if len(got) != len(cols) {
+			t.Errorf("%s: checked columns %v, want %v", table, got, cols)
+		}
+		for col, values := range cols {
+			if !slices.Equal(got[col], values) {
+				t.Errorf("%s.%s: the database allows %v, package domain has %v", table, col, got[col], values)
+			}
+		}
+	}
+}
+
+// The same constraints, by behaviour: every domain value is stored, and a sample of others
+// is refused with a check violation.
 func TestColumnChecksAcceptExactlyTheDomainValues(t *testing.T) {
 	e := testkit.Setup(t)
 	c := ctx(t)

@@ -29,7 +29,9 @@ services:
     # Inspect with: docker compose exec postgres psql -U notifications
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U notifications"]
+      # Over TCP: during its first start Postgres answers on the Unix socket before it
+      # accepts TCP connections, and migrate connects over TCP once.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U notifications"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -68,13 +70,16 @@ services:
   worker:
     <<: *app
     command: ["/app/worker"]
-    # Architecture §13: longer than the worker's shutdown timeout (25 s), so Docker does not
-    # kill a worker that is still waiting for sends in flight.
-    # TestComposeStopGracePeriodExceedsShutdownTimeout checks this.
-    stop_grace_period: 30s
+    # Architecture §13: the grace period must be longer than the worker's shutdown timeout
+    # (25 s), so Docker does not kill a worker that still waits for sends in flight. The
+    # container's grace period and the worker's STOP_GRACE_PERIOD come from one variable, and
+    # the worker refuses to start when the relation does not hold
+    # (TestComposeGivesTheWorkerItsStopGracePeriod).
+    stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
     environment:
       <<: *env
       PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:9090/send}
+      STOP_GRACE_PERIOD: ${STOP_GRACE_PERIOD:-30s}
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }

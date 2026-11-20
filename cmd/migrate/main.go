@@ -27,7 +27,7 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	pool, err := store.Connect(ctx, cfg.DatabaseURL, store.Options{})
 	if err != nil {
 		log.Error("connect", "error", err)
 		return 1

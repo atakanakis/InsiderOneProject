@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
+	"github.com/atakanakis/InsiderOneProject/internal/redisclient"
+	"github.com/atakanakis/InsiderOneProject/internal/store"
 	"github.com/atakanakis/InsiderOneProject/internal/testkit"
 )
 
@@ -74,9 +76,11 @@ func TestReadyzFailsWhenPostgresIsUnreachable(t *testing.T) {
 	}
 }
 
-func TestReadyzFailsWhenRedisIsUnreachable(t *testing.T) {
+// The API needs only Postgres to accept requests; status events through Redis are
+// best-effort (architecture §8, §9). Redis being down is reported, and the API stays ready.
+func TestReadyzStaysReadyWhenOnlyRedisIsUnreachable(t *testing.T) {
 	a := get(t, handler(&bytes.Buffer{}, ok, failing, time.Second), "/readyz")
-	if a.code != http.StatusServiceUnavailable || a.body["redis"] != "unreachable" || a.body["postgres"] != "ok" {
+	if a.code != http.StatusOK || a.body["status"] != "ready" || a.body["redis"] != "unreachable" || a.body["postgres"] != "ok" {
 		t.Fatalf("got %d %v", a.code, a.body)
 	}
 }
@@ -146,7 +150,8 @@ func TestCorrelationIDIsAcceptedOrReplaced(t *testing.T) {
 	}
 }
 
-// architecture §8: request headers are bounded at 64 KiB.
+// architecture §8: the request line and headers are bounded at 64 KiB together. The test
+// writes raw requests, so it controls every byte, and goes just under and just over.
 func TestRequestHeadersOverTheBoundAreRefused(t *testing.T) {
 	srv := NewServer("127.0.0.1:0", handler(&bytes.Buffer{}, ok, ok, time.Second))
 	ln, err := net.Listen("tcp", srv.Addr)
@@ -155,24 +160,34 @@ func TestRequestHeadersOverTheBoundAreRefused(t *testing.T) {
 	}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
-	url := "http://" + ln.Addr().String() + "/healthz"
 
-	send := func(size int) int {
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
-		req.Header.Set("X-Pad", strings.Repeat("p", size))
-		resp, err := http.DefaultClient.Do(req)
+	status := func(total int) string {
+		head := "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Pad: "
+		end := "\r\n\r\n"
+		req := head + strings.Repeat("p", total-len(head)-len(end)) + end
+		if len(req) != total {
+			t.Fatalf("built %d bytes, want %d", len(req), total)
+		}
+		conn, err := net.Dial("tcp", ln.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = resp.Body.Close()
-		return resp.StatusCode
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := fmt.Fprint(conn, req); err != nil {
+			return "write: " + err.Error()
+		}
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			return "read: " + err.Error()
+		}
+		return strings.TrimSpace(line)
 	}
-	if code := send(MaxHeaderBytes - 1024); code != http.StatusOK {
-		t.Errorf("headers under the bound: %d", code)
+	if got := status(MaxHeaderBytes - 64); !strings.Contains(got, " 200 ") {
+		t.Errorf("%d bytes, under the bound: %q", MaxHeaderBytes-64, got)
 	}
-	// Go's server allows 4 KiB of slack over MaxHeaderBytes, so go clearly past it.
-	if code := send(MaxHeaderBytes + 8<<10); code != http.StatusRequestHeaderFieldsTooLarge {
-		t.Errorf("headers over the bound: %d, want 431", code)
+	if got := status(MaxHeaderBytes + 64); !strings.Contains(got, " 431 ") {
+		t.Errorf("%d bytes, over the bound: %q, want 431", MaxHeaderBytes+64, got)
 	}
 }
 
@@ -205,18 +220,77 @@ func TestSlowRequestHeadersAreCutOff(t *testing.T) {
 	}
 }
 
-// With real dependencies: ready when both answer, unavailable when Redis is unreachable.
+// silentServer accepts TCP connections and never answers: a paused or hung dependency. A
+// refused port fails at once and would prove nothing about the timeout.
+func silentServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.Close() })
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// The real clients, as cmd/api builds them, against dependencies that hang: readyz still
+// answers within its timeout. A fake check that honours its context cannot show this.
+func TestReadyzAnswersWithinItsTimeoutWhenRealClientsHang(t *testing.T) {
+	addr := silentServer(t)
+	pool, err := pgxpool.New(context.Background(), "postgres://x:x@"+addr+"/x?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	rdb, err := redisclient.New("redis://" + addr + "/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	const timeout = 300 * time.Millisecond
+	h := handler(&bytes.Buffer{}, pool.Ping, RedisCheck(rdb), timeout)
+	began := time.Now()
+	a := get(t, h, "/readyz")
+	took := time.Since(began)
+	if a.code != http.StatusServiceUnavailable || a.body["postgres"] != "unreachable" || a.body["redis"] != "unreachable" {
+		t.Fatalf("got %d %v", a.code, a.body)
+	}
+	if took > timeout+500*time.Millisecond {
+		t.Fatalf("answered after %s with a timeout of %s", took, timeout)
+	}
+}
+
 func TestReadyzWithRealPostgresAndRedis(t *testing.T) {
 	e := testkit.Setup(t)
-	deadRedis := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1})
-	t.Cleanup(func() { _ = deadRedis.Close() })
-
-	up := handler(&bytes.Buffer{}, e.Pool.Ping, RedisCheck(e.Redis), 2*time.Second)
-	if a := get(t, up, "/readyz"); a.code != http.StatusOK {
-		t.Fatalf("both up: %d %v", a.code, a.body)
+	h := handler(&bytes.Buffer{}, e.Pool.Ping, RedisCheck(e.Redis), 2*time.Second)
+	if a := get(t, h, "/readyz"); a.code != http.StatusOK || a.body["postgres"] != "ok" || a.body["redis"] != "ok" {
+		t.Fatalf("got %d %v", a.code, a.body)
 	}
-	down := handler(&bytes.Buffer{}, e.Pool.Ping, RedisCheck(deadRedis), 2*time.Second)
-	if a := get(t, down, "/readyz"); a.code != http.StatusServiceUnavailable || a.body["redis"] != "unreachable" {
-		t.Fatalf("redis down: %d %v", a.code, a.body)
+}
+
+// architecture §8: the database time of an API request is bounded by a statement timeout
+// of 5 s, set on every session of the API's pool.
+func TestAPIDatabaseSessionsHaveAFiveSecondStatementTimeout(t *testing.T) {
+	e := testkit.Setup(t)
+	pool, err := store.Connect(context.Background(), e.DatabaseURL, DatabaseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var got string
+	if err := pool.QueryRow(context.Background(), `SELECT current_setting('statement_timeout')`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "5s" {
+		t.Fatalf("statement_timeout %s, want 5s", got)
 	}
 }

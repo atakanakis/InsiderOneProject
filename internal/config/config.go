@@ -1,8 +1,10 @@
 // Package config reads the settings of every command from environment variables, and checks
 // the relations of the timing budget in architecture §13.
 //
-// Load only parses. The worker calls Worker.Check before it starts and refuses to start when
-// a relation does not hold; the other commands do not use the worker settings.
+// Load reads the settings every command uses; LoadWorker reads the timing budget, which only
+// the worker uses, so a malformed worker setting cannot stop the API or the migration. The
+// worker calls Worker.Check before it starts and refuses to start when a relation does not
+// hold.
 package config
 
 import (
@@ -20,14 +22,13 @@ const ResultWriteReserve = 30 * time.Second
 // flight before it exits (architecture §13: shutdown timeout ≥ send timeout + 5 s).
 const ShutdownReserve = 5 * time.Second
 
-// Config holds the settings of all commands.
+// Config holds the settings shared by the commands.
 type Config struct {
 	DatabaseURL string // DATABASE_URL
 	RedisURL    string // REDIS_URL
 	ProviderURL string // PROVIDER_URL
 	APIAddr     string // API_ADDR
 	LogLevel    string // LOG_LEVEL: debug, info, warn or error
-	Worker      Worker
 }
 
 // Worker is the timing budget of architecture §13. The comment on each field is its
@@ -42,6 +43,7 @@ type Worker struct {
 	Lease               time.Duration // LEASE
 	BreakerOpen         time.Duration // BREAKER_OPEN
 	ShutdownTimeout     time.Duration // SHUTDOWN_TIMEOUT
+	StopGracePeriod     time.Duration // STOP_GRACE_PERIOD: how long the platform waits after SIGTERM before a kill
 	Slots               int           // SLOTS: concurrent sends per channel per worker
 	IdleConns           int           // IDLE_CONNS: idle connections kept per provider host
 	IdleConnTimeout     time.Duration // IDLE_CONN_TIMEOUT
@@ -54,8 +56,8 @@ type Worker struct {
 	BackoffCap          time.Duration // BACKOFF_CAP
 }
 
-// Load reads every setting with getenv (os.Getenv in the commands). A variable that is
-// unset or empty takes its default. Every malformed value is reported, by name.
+// Load reads the shared settings with getenv (os.Getenv in the commands). A variable that
+// is unset or empty takes its default. Every malformed value is reported, by name.
 func Load(getenv func(string) string) (Config, error) {
 	p := parser{getenv: getenv}
 	c := Config{
@@ -64,29 +66,37 @@ func Load(getenv func(string) string) (Config, error) {
 		ProviderURL: p.str("PROVIDER_URL", "http://localhost:9090/send"),
 		APIAddr:     p.str("API_ADDR", ":8080"),
 		LogLevel:    p.oneOf("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
-		Worker: Worker{
-			RateLimit:           p.integer("RATE_LIMIT", 100),
-			WindowMargin:        p.duration("WINDOW_MARGIN", 50*time.Millisecond),
-			SendTimeout:         p.duration("SEND_TIMEOUT", 15*time.Second),
-			DialTimeout:         p.duration("DIAL_TIMEOUT", 3*time.Second),
-			TLSHandshakeTimeout: p.duration("TLS_HANDSHAKE_TIMEOUT", 3*time.Second),
-			GateBudget:          p.duration("GATE_BUDGET", 5*time.Second),
-			Lease:               p.duration("LEASE", 60*time.Second),
-			BreakerOpen:         p.duration("BREAKER_OPEN", 30*time.Second),
-			ShutdownTimeout:     p.duration("SHUTDOWN_TIMEOUT", 25*time.Second),
-			Slots:               p.integer("SLOTS", 50),
-			IdleConns:           p.integer("IDLE_CONNS", 50),
-			IdleConnTimeout:     p.duration("IDLE_CONN_TIMEOUT", 10*time.Second),
-			ClaimBatch:          p.integer("CLAIM_BATCH", 10),
-			PauseBusy:           p.duration("PAUSE_BUSY", 20*time.Millisecond),
-			PauseIdle:           p.duration("PAUSE_IDLE", 200*time.Millisecond),
-			ReaperTick:          p.duration("REAPER_TICK", 5*time.Second),
-			MaxAttempts:         p.integer("MAX_ATTEMPTS", 6),
-			BackoffBase:         p.duration("BACKOFF_BASE", 2*time.Second),
-			BackoffCap:          p.duration("BACKOFF_CAP", 2*time.Minute),
-		},
 	}
 	return c, errors.Join(p.errs...)
+}
+
+// LoadWorker reads the timing budget of architecture §13 with getenv. It does not check the
+// relations; Worker.Check does.
+func LoadWorker(getenv func(string) string) (Worker, error) {
+	p := parser{getenv: getenv}
+	w := Worker{
+		RateLimit:           p.integer("RATE_LIMIT", 100),
+		WindowMargin:        p.duration("WINDOW_MARGIN", 50*time.Millisecond),
+		SendTimeout:         p.duration("SEND_TIMEOUT", 15*time.Second),
+		DialTimeout:         p.duration("DIAL_TIMEOUT", 3*time.Second),
+		TLSHandshakeTimeout: p.duration("TLS_HANDSHAKE_TIMEOUT", 3*time.Second),
+		GateBudget:          p.duration("GATE_BUDGET", 5*time.Second),
+		Lease:               p.duration("LEASE", 60*time.Second),
+		BreakerOpen:         p.duration("BREAKER_OPEN", 30*time.Second),
+		ShutdownTimeout:     p.duration("SHUTDOWN_TIMEOUT", 25*time.Second),
+		StopGracePeriod:     p.duration("STOP_GRACE_PERIOD", 30*time.Second),
+		Slots:               p.integer("SLOTS", 50),
+		IdleConns:           p.integer("IDLE_CONNS", 50),
+		IdleConnTimeout:     p.duration("IDLE_CONN_TIMEOUT", 10*time.Second),
+		ClaimBatch:          p.integer("CLAIM_BATCH", 10),
+		PauseBusy:           p.duration("PAUSE_BUSY", 20*time.Millisecond),
+		PauseIdle:           p.duration("PAUSE_IDLE", 200*time.Millisecond),
+		ReaperTick:          p.duration("REAPER_TICK", 5*time.Second),
+		MaxAttempts:         p.integer("MAX_ATTEMPTS", 6),
+		BackoffBase:         p.duration("BACKOFF_BASE", 2*time.Second),
+		BackoffCap:          p.duration("BACKOFF_CAP", 2*time.Minute),
+	}
+	return w, errors.Join(p.errs...)
 }
 
 // Check returns an error naming every relation of architecture §13 that does not hold.
@@ -115,6 +125,9 @@ func (w Worker) Check() error {
 	if w.ShutdownTimeout < w.SendTimeout+ShutdownReserve {
 		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT (%s) must be at least SEND_TIMEOUT (%s) + %s", w.ShutdownTimeout, w.SendTimeout, ShutdownReserve))
 	}
+	if w.StopGracePeriod <= w.ShutdownTimeout {
+		errs = append(errs, fmt.Errorf("STOP_GRACE_PERIOD (%s) must be longer than SHUTDOWN_TIMEOUT (%s), or the platform kills the worker while sends are in flight", w.StopGracePeriod, w.ShutdownTimeout))
+	}
 	if w.IdleConns != w.Slots {
 		errs = append(errs, fmt.Errorf("IDLE_CONNS (%d) must equal SLOTS (%d)", w.IdleConns, w.Slots))
 	}
@@ -141,6 +154,7 @@ func (w Worker) numbers() []named {
 		{"LEASE", int64(w.Lease)},
 		{"BREAKER_OPEN", int64(w.BreakerOpen)},
 		{"SHUTDOWN_TIMEOUT", int64(w.ShutdownTimeout)},
+		{"STOP_GRACE_PERIOD", int64(w.StopGracePeriod)},
 		{"SLOTS", int64(w.Slots)},
 		{"IDLE_CONNS", int64(w.IdleConns)},
 		{"IDLE_CONN_TIMEOUT", int64(w.IdleConnTimeout)},

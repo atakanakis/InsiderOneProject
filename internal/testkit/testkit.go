@@ -1,6 +1,6 @@
 // Package testkit starts a real Postgres and a real Redis for integration tests, with
 // testcontainers. A package that uses it calls Main from its TestMain; each test calls Setup.
-// With `go test -short`, no container is started and Setup skips the test.
+// The containers start on the first Setup; with `go test -short`, Setup skips the test.
 //
 // The recording provider server is in package recorder; Recorder below starts one for a test.
 package testkit
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
 	"github.com/atakanakis/InsiderOneProject/internal/recorder"
+	"github.com/atakanakis/InsiderOneProject/internal/redisclient"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
 )
 
@@ -39,70 +41,36 @@ type Env struct {
 	RedisURL    string
 }
 
-var env *Env
+var (
+	enabled  bool // Main ran without -short
+	once     sync.Once
+	env      *Env
+	startErr error
+	cleanups []func()
+)
 
-// Main starts the containers once for the package, migrates the database, runs the tests
-// and removes the containers.
+// Main runs the package's tests. The containers start on the first call of Setup, so a
+// package's unit tests do not wait for Docker, and are removed when the tests end.
 func Main(m *testing.M) {
 	flag.Parse()
-	if testing.Short() {
-		os.Exit(m.Run())
+	enabled = !testing.Short()
+	code := m.Run()
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		cleanups[i]()
 	}
-	os.Exit(run(m))
-}
-
-func run(m *testing.M) int {
-	ctx := context.Background()
-	pg, err := tcpostgres.Run(ctx, PostgresImage,
-		tcpostgres.WithDatabase("notifications"),
-		tcpostgres.WithUsername("test"),
-		tcpostgres.WithPassword("test"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	defer terminate(pg)
-	if err != nil {
-		return fail("start postgres", err)
-	}
-	rc, err := tcredis.Run(ctx, RedisImage)
-	defer terminate(rc)
-	if err != nil {
-		return fail("start redis", err)
-	}
-
-	dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		return fail("postgres url", err)
-	}
-	pool, err := store.Connect(ctx, dsn)
-	if err != nil {
-		return fail("connect postgres", err)
-	}
-	defer pool.Close()
-	if _, err := store.Migrate(ctx, pool); err != nil {
-		return fail("migrate", err)
-	}
-
-	redisURL, err := rc.ConnectionString(ctx)
-	if err != nil {
-		return fail("redis url", err)
-	}
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		return fail("parse redis url", err)
-	}
-	client := redis.NewClient(opts)
-	defer func() { _ = client.Close() }()
-
-	env = &Env{Pool: pool, DatabaseURL: dsn, Redis: client, RedisURL: redisURL}
-	return m.Run()
+	os.Exit(code)
 }
 
 // Setup returns the package's environment with every table and Redis emptied, or skips the
 // test under -short.
 func Setup(t testing.TB) *Env {
 	t.Helper()
-	if env == nil {
+	if !enabled {
 		t.Skip("integration test: needs Docker; skipped with -short")
+	}
+	once.Do(func() { env, startErr = start() })
+	if startErr != nil {
+		t.Fatalf("testkit: %v", startErr)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -113,6 +81,47 @@ func Setup(t testing.TB) *Env {
 		t.Fatalf("empty redis: %v", err)
 	}
 	return env
+}
+
+func start() (*Env, error) {
+	ctx := context.Background()
+	pg, err := tcpostgres.Run(ctx, PostgresImage,
+		tcpostgres.WithDatabase("notifications"),
+		tcpostgres.WithUsername("test"),
+		tcpostgres.WithPassword("test"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	cleanups = append(cleanups, func() { _ = testcontainers.TerminateContainer(pg) })
+	if err != nil {
+		return nil, fmt.Errorf("start postgres: %w", err)
+	}
+	rc, err := tcredis.Run(ctx, RedisImage)
+	cleanups = append(cleanups, func() { _ = testcontainers.TerminateContainer(rc) })
+	if err != nil {
+		return nil, fmt.Errorf("start redis: %w", err)
+	}
+	dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		return nil, fmt.Errorf("postgres url: %w", err)
+	}
+	pool, err := store.Connect(ctx, dsn, store.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	cleanups = append(cleanups, pool.Close)
+	if _, err := store.Migrate(ctx, pool); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	redisURL, err := rc.ConnectionString(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("redis url: %w", err)
+	}
+	client, err := redisclient.New(redisURL)
+	if err != nil {
+		return nil, err
+	}
+	cleanups = append(cleanups, func() { _ = client.Close() })
+	return &Env{Pool: pool, DatabaseURL: dsn, Redis: client, RedisURL: redisURL}, nil
 }
 
 // EmptyDatabase creates a new database with no schema in the test Postgres and returns its
@@ -148,15 +157,4 @@ func Recorder(t testing.TB, opts recorder.Options) *recorder.Server {
 	}
 	t.Cleanup(s.Close)
 	return s
-}
-
-func terminate(c testcontainers.Container) {
-	if c != nil {
-		_ = testcontainers.TerminateContainer(c)
-	}
-}
-
-func fail(what string, err error) int {
-	fmt.Fprintf(os.Stderr, "testkit: %s: %v\n", what, err)
-	return 1
 }

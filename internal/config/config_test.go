@@ -14,11 +14,11 @@ func env(kv map[string]string) func(string) string {
 
 func defaults(t *testing.T) Worker {
 	t.Helper()
-	c, err := Load(env(nil))
+	w, err := LoadWorker(env(nil))
 	if err != nil {
-		t.Fatalf("Load with no environment: %v", err)
+		t.Fatalf("LoadWorker with no environment: %v", err)
 	}
-	return c.Worker
+	return w
 }
 
 // requireRelation checks one relation of architecture §13 at its bound: the value on the
@@ -53,7 +53,7 @@ func TestDefaultsAreTheTimingBudget(t *testing.T) {
 		RateLimit: 100, WindowMargin: 50 * time.Millisecond,
 		SendTimeout: 15 * time.Second, DialTimeout: 3 * time.Second, TLSHandshakeTimeout: 3 * time.Second,
 		GateBudget: 5 * time.Second, Lease: 60 * time.Second, BreakerOpen: 30 * time.Second,
-		ShutdownTimeout: 25 * time.Second, Slots: 50, IdleConns: 50, IdleConnTimeout: 10 * time.Second,
+		ShutdownTimeout: 25 * time.Second, StopGracePeriod: 30 * time.Second, Slots: 50, IdleConns: 50, IdleConnTimeout: 10 * time.Second,
 		ClaimBatch: 10, PauseBusy: 20 * time.Millisecond, PauseIdle: 200 * time.Millisecond,
 		ReaperTick: 5 * time.Second, MaxAttempts: 6, BackoffBase: 2 * time.Second, BackoffCap: 2 * time.Minute,
 	}
@@ -98,6 +98,12 @@ func TestShutdownTimeoutMustCoverSendTimeoutPlusFiveSeconds(t *testing.T) {
 		func(w *Worker) { w.ShutdownTimeout = w.SendTimeout + 5*time.Second - time.Millisecond })
 }
 
+func TestShutdownTimeoutMustEndBeforeTheStopGracePeriod(t *testing.T) {
+	requireRelation(t, "STOP_GRACE_PERIOD",
+		func(w *Worker) { w.ShutdownTimeout = w.StopGracePeriod - time.Millisecond },
+		func(w *Worker) { w.StopGracePeriod = w.ShutdownTimeout })
+}
+
 func TestIdleConnectionsMustEqualSlots(t *testing.T) {
 	requireRelation(t, "IDLE_CONNS",
 		func(w *Worker) { w.Slots, w.IdleConns = 20, 20 },
@@ -123,6 +129,10 @@ func TestNonPositiveSettingsAreRefused(t *testing.T) {
 		"DIAL_TIMEOUT":          func(w *Worker) { w.DialTimeout = 0 },
 		"TLS_HANDSHAKE_TIMEOUT": func(w *Worker) { w.TLSHandshakeTimeout = 0 },
 		"GATE_BUDGET":           func(w *Worker) { w.GateBudget = 0 },
+		"LEASE":                 func(w *Worker) { w.Lease = 0 },
+		"BREAKER_OPEN":          func(w *Worker) { w.BreakerOpen = 0 },
+		"SHUTDOWN_TIMEOUT":      func(w *Worker) { w.ShutdownTimeout = 0 },
+		"STOP_GRACE_PERIOD":     func(w *Worker) { w.StopGracePeriod = 0 },
 		"SLOTS":                 func(w *Worker) { w.Slots, w.IdleConns, w.ClaimBatch = 0, 0, 0 },
 		"IDLE_CONN_TIMEOUT":     func(w *Worker) { w.IdleConnTimeout = 0 },
 		"CLAIM_BATCH":           func(w *Worker) { w.ClaimBatch = 0 },
@@ -159,65 +169,77 @@ func TestLoadReadsEverySettingFromTheEnvironment(t *testing.T) {
 	c, err := Load(env(map[string]string{
 		"DATABASE_URL": "postgres://db", "REDIS_URL": "redis://r", "PROVIDER_URL": "http://p/send",
 		"API_ADDR": ":1", "LOG_LEVEL": "debug",
-		"RATE_LIMIT": "7", "WINDOW_MARGIN": "1ms", "SEND_TIMEOUT": "2s", "DIAL_TIMEOUT": "3ms",
-		"TLS_HANDSHAKE_TIMEOUT": "4ms", "GATE_BUDGET": "5ms", "LEASE": "6m", "BREAKER_OPEN": "7s",
-		"SHUTDOWN_TIMEOUT": "8s", "SLOTS": "9", "IDLE_CONNS": "10", "IDLE_CONN_TIMEOUT": "11s",
-		"CLAIM_BATCH": "12", "PAUSE_BUSY": "13ms", "PAUSE_IDLE": "14ms", "REAPER_TICK": "15s",
-		"MAX_ATTEMPTS": "16", "BACKOFF_BASE": "17s", "BACKOFF_CAP": "18m",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{
-		DatabaseURL: "postgres://db", RedisURL: "redis://r", ProviderURL: "http://p/send",
-		APIAddr: ":1", LogLevel: "debug",
-		Worker: Worker{
-			RateLimit: 7, WindowMargin: time.Millisecond, SendTimeout: 2 * time.Second,
-			DialTimeout: 3 * time.Millisecond, TLSHandshakeTimeout: 4 * time.Millisecond,
-			GateBudget: 5 * time.Millisecond, Lease: 6 * time.Minute, BreakerOpen: 7 * time.Second,
-			ShutdownTimeout: 8 * time.Second, Slots: 9, IdleConns: 10, IdleConnTimeout: 11 * time.Second,
-			ClaimBatch: 12, PauseBusy: 13 * time.Millisecond, PauseIdle: 14 * time.Millisecond,
-			ReaperTick: 15 * time.Second, MaxAttempts: 16, BackoffBase: 17 * time.Second,
-			BackoffCap: 18 * time.Minute,
-		},
-	}
-	if c != want {
+	if want := (Config{DatabaseURL: "postgres://db", RedisURL: "redis://r", ProviderURL: "http://p/send", APIAddr: ":1", LogLevel: "debug"}); c != want {
 		t.Fatalf("Load\n got %+v\nwant %+v", c, want)
+	}
+	w, err := LoadWorker(env(map[string]string{
+		"RATE_LIMIT": "7", "WINDOW_MARGIN": "1ms", "SEND_TIMEOUT": "2s", "DIAL_TIMEOUT": "3ms",
+		"TLS_HANDSHAKE_TIMEOUT": "4ms", "GATE_BUDGET": "5ms", "LEASE": "6m", "BREAKER_OPEN": "7s",
+		"SHUTDOWN_TIMEOUT": "8s", "STOP_GRACE_PERIOD": "19s", "SLOTS": "9", "IDLE_CONNS": "10",
+		"IDLE_CONN_TIMEOUT": "11s", "CLAIM_BATCH": "12", "PAUSE_BUSY": "13ms", "PAUSE_IDLE": "14ms",
+		"REAPER_TICK": "15s", "MAX_ATTEMPTS": "16", "BACKOFF_BASE": "17s", "BACKOFF_CAP": "18m",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Worker{
+		RateLimit: 7, WindowMargin: time.Millisecond, SendTimeout: 2 * time.Second,
+		DialTimeout: 3 * time.Millisecond, TLSHandshakeTimeout: 4 * time.Millisecond,
+		GateBudget: 5 * time.Millisecond, Lease: 6 * time.Minute, BreakerOpen: 7 * time.Second,
+		ShutdownTimeout: 8 * time.Second, StopGracePeriod: 19 * time.Second, Slots: 9, IdleConns: 10,
+		IdleConnTimeout: 11 * time.Second, ClaimBatch: 12, PauseBusy: 13 * time.Millisecond,
+		PauseIdle: 14 * time.Millisecond, ReaperTick: 15 * time.Second, MaxAttempts: 16,
+		BackoffBase: 17 * time.Second, BackoffCap: 18 * time.Minute,
+	}
+	if w != want {
+		t.Fatalf("LoadWorker\n got %+v\nwant %+v", w, want)
 	}
 }
 
 func TestLoadNamesEveryMalformedValue(t *testing.T) {
-	_, err := Load(env(map[string]string{"LEASE": "sixty", "SLOTS": "1.5", "LOG_LEVEL": "loud"}))
-	if err == nil {
-		t.Fatal("malformed values accepted")
+	_, err := LoadWorker(env(map[string]string{"LEASE": "sixty", "SLOTS": "1.5"}))
+	if err == nil || !strings.Contains(err.Error(), "LEASE") || !strings.Contains(err.Error(), "SLOTS") {
+		t.Errorf("LoadWorker: %v, want both LEASE and SLOTS named", err)
 	}
-	for _, name := range []string{"LEASE", "SLOTS", "LOG_LEVEL"} {
-		if !strings.Contains(err.Error(), name) {
-			t.Errorf("error does not name %s: %v", name, err)
-		}
+	if _, err := Load(env(map[string]string{"LOG_LEVEL": "loud"})); err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {
+		t.Errorf("Load: %v, want LOG_LEVEL named", err)
 	}
 }
 
-// Architecture §13: the container's stop grace period must be longer than the shutdown
-// timeout, or Docker kills the worker while it is still waiting for sends in flight. A
-// single worker cannot check this, so this test reads docker-compose.yml.
-func TestComposeStopGracePeriodExceedsShutdownTimeout(t *testing.T) {
+// The API and the migration share the .env file with the worker. A malformed worker setting
+// must not stop them: it is the worker's to refuse.
+func TestSharedSettingsIgnoreMalformedWorkerSettings(t *testing.T) {
+	if _, err := Load(env(map[string]string{"LEASE": "sixty", "SLOTS": "many"})); err != nil {
+		t.Fatalf("Load refused a worker setting: %v", err)
+	}
+}
+
+// Architecture §13: docker-compose.yml takes the container's stop_grace_period and the
+// worker's STOP_GRACE_PERIOD from one variable with one default, so the worker checks the
+// grace period the platform really gives it, whatever a .env file says.
+func TestComposeGivesTheWorkerItsStopGracePeriod(t *testing.T) {
 	compose, err := os.ReadFile("../../docker-compose.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`(?m)^\s+stop_grace_period:\s*(\S+)`).FindAllSubmatch(compose, -1)
-	if len(m) != 1 {
-		t.Fatalf("want exactly one stop_grace_period (the worker's), found %d", len(m))
+	grace := regexp.MustCompile(`(?m)^\s+stop_grace_period:\s*(\S+)\s*$`).FindAllSubmatch(compose, -1)
+	passed := regexp.MustCompile(`(?m)^\s+STOP_GRACE_PERIOD:\s*(\S+)\s*$`).FindAllSubmatch(compose, -1)
+	if len(grace) != 1 || len(passed) != 1 {
+		t.Fatalf("want one stop_grace_period (the worker's) and one STOP_GRACE_PERIOD; found %d and %d", len(grace), len(passed))
 	}
-	grace, err := time.ParseDuration(string(m[0][1]))
+	m := regexp.MustCompile(`^\$\{STOP_GRACE_PERIOD:-([0-9a-z]+)\}$`).FindSubmatch(grace[0][1])
+	if m == nil || string(passed[0][1]) != string(grace[0][1]) {
+		t.Fatalf("stop_grace_period %q and STOP_GRACE_PERIOD %q must both be ${STOP_GRACE_PERIOD:-<default>}", grace[0][1], passed[0][1])
+	}
+	def, err := time.ParseDuration(string(m[1]))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(compose), "SHUTDOWN_TIMEOUT") {
-		t.Fatal("docker-compose.yml overrides SHUTDOWN_TIMEOUT; compare against that value instead")
-	}
-	if shutdown := defaults(t).ShutdownTimeout; grace <= shutdown {
-		t.Fatalf("stop_grace_period %s is not longer than SHUTDOWN_TIMEOUT %s", grace, shutdown)
+	if want := defaults(t).StopGracePeriod; def != want {
+		t.Fatalf("Compose default %s, config default %s", def, want)
 	}
 }

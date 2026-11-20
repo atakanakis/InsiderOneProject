@@ -11,11 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	"github.com/atakanakis/InsiderOneProject/internal/api"
 	"github.com/atakanakis/InsiderOneProject/internal/config"
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
+	"github.com/atakanakis/InsiderOneProject/internal/redisclient"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
 )
 
@@ -35,18 +34,17 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(connectCtx, cfg.DatabaseURL)
+	pool, err := store.Connect(connectCtx, cfg.DatabaseURL, api.DatabaseOptions)
 	if err != nil {
 		log.Error("connect postgres", "error", err)
 		return 1
 	}
 	defer pool.Close()
-	ropts, err := redis.ParseURL(cfg.RedisURL)
+	rdb, err := redisclient.New(cfg.RedisURL)
 	if err != nil {
 		log.Error("redis url", "error", err)
 		return 2
 	}
-	rdb := redis.NewClient(ropts)
 	defer func() { _ = rdb.Close() }()
 
 	srv := api.NewServer(cfg.APIAddr, api.NewHandler(log, api.Health{
