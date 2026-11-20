@@ -173,7 +173,8 @@ func correlate(log *slog.Logger, m *observability.APIMetrics, tracer trace.Trace
 		span.SetAttributes(attribute.String("http.request.method", r.Method), attribute.String("http.route", route),
 			attribute.Int("http.response.status_code", sw.code))
 		span.End()
-		log.DebugContext(ctx, "request", "method", r.Method, "path", r.URL.Path,
+		// One line per request at info, with the correlation id (architecture §10).
+		log.InfoContext(ctx, "request", "method", r.Method, "path", r.URL.Path,
 			"status", sw.code, "duration_ms", took.Milliseconds())
 	})
 }

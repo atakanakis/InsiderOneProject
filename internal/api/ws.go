@@ -336,10 +336,29 @@ func (s *server) stream(conn *websocket.Conn, f *follower, first []any) string {
 		case <-ping.C:
 			pctx, pcancel := context.WithTimeout(ctx, o.PongTimeout)
 			err := conn.Ping(pctx)
+			timedOut := pctx.Err() != nil
 			pcancel()
-			if err != nil {
+			if err == nil {
+				continue
+			}
+			// A client that hung up while the ping was out is the client's doing: its reader
+			// has already returned. Only a peer that is still connected and silent is
+			// no_pong (session 7's review, F8).
+			select {
+			case data := <-read:
+				if data {
+					return "data_message"
+				}
+				return "client"
+			default:
+			}
+			if timedOut {
 				return "no_pong"
 			}
+			if <-read { // the connection ended under the ping; the reader returns now
+				return "data_message"
+			}
+			return "client"
 		}
 	}
 }
@@ -426,9 +445,16 @@ func sameOrigin(r *http.Request) bool {
 	return err == nil && strings.EqualFold(u.Host, r.Host)
 }
 
-// isUpgrade reports whether r is a WebSocket upgrade that Accept will take (RFC 6455, 4.2.1).
+// isUpgrade reports whether r is a WebSocket upgrade that Accept will take (RFC 6455, 4.2.1):
+// HTTP/1.1 or later, the two headers, version 13 and exactly one key of 16 bytes. Anything
+// Accept would refuse is refused here, in the error form, before the database (session 7's
+// review, F6).
 func isUpgrade(r *http.Request) bool {
-	key, err := base64.StdEncoding.DecodeString(r.Header.Get("Sec-WebSocket-Key"))
+	keys := r.Header.Values("Sec-WebSocket-Key")
+	if len(keys) != 1 || !r.ProtoAtLeast(1, 1) {
+		return false
+	}
+	key, err := base64.StdEncoding.DecodeString(keys[0])
 	return hasToken(r.Header.Values("Connection"), "upgrade") && hasToken(r.Header.Values("Upgrade"), "websocket") &&
 		r.Header.Get("Sec-WebSocket-Version") == "13" && err == nil && len(key) == 16
 }

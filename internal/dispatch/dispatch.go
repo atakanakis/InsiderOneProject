@@ -267,11 +267,9 @@ func (d *Dispatcher) finish(ctx context.Context, row store.Claimed, r provider.R
 				finished = "stale"
 			}
 			d.o.Metrics.Finished.WithLabelValues(ch, finished).Inc()
-			level := slog.LevelInfo
-			if v.Status == domain.Sent {
-				level = slog.LevelDebug
-			}
-			log.Log(ctx, level, "attempt finished", "status", status, "stale", !changed, "status_code", res.StatusCode,
+			// One line per attempt at info, a delivery included: a delivered notification can
+			// be followed by its correlation id at the level that ships (architecture §10).
+			log.InfoContext(ctx, "attempt finished", "status", status, "stale", !changed, "status_code", res.StatusCode,
 				"duration_ms", r.Duration.Milliseconds(), "error", res.Error)
 			return
 		}

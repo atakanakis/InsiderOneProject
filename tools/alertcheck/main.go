@@ -6,7 +6,8 @@
 //     exported by the service: the scrapes given as arguments, files or URLs of /metrics.
 //
 // Usage: go run ./tools/alertcheck [-rules deploy/prometheus/alerts.yml]
-// [-tests deploy/prometheus/alerts_test.yml] [scrape ...]
+// [-tests deploy/prometheus/alerts_test.yml] [-config deploy/prometheus/prometheus.yml]
+// [scrape ...]
 package main
 
 import (
@@ -30,6 +31,7 @@ import (
 func main() {
 	rulesPath := flag.String("rules", "deploy/prometheus/alerts.yml", "the alert rules")
 	testsPath := flag.String("tests", "deploy/prometheus/alerts_test.yml", "their promtool tests")
+	configPath := flag.String("config", "deploy/prometheus/prometheus.yml", "the scrape configuration, for the jobs of up")
 	flag.Parse()
 	rules, err := os.ReadFile(*rulesPath)
 	if err != nil {
@@ -60,7 +62,17 @@ func main() {
 			}
 			scrapes = append(scrapes, b)
 		}
-		missing, err := unexported(rules, nil, scrapes...)
+		config, err := os.ReadFile(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		jobs, err := scrapeJobs(config)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		missing, err := unexported(rules, jobs, scrapes...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -194,11 +206,26 @@ func exports(scrapes ...[]byte) (exported, error) {
 	return e, nil
 }
 
-// scrapeJobs returns the job names of a Prometheus configuration. Stub.
-func scrapeJobs(config []byte) ([]string, error) { return nil, nil }
+// scrapeJobs returns the job names of a Prometheus configuration, in order.
+func scrapeJobs(config []byte) ([]string, error) {
+	var c struct {
+		ScrapeConfigs []struct {
+			JobName string `yaml:"job_name"`
+		} `yaml:"scrape_configs"`
+	}
+	if err := yaml.Unmarshal(config, &c); err != nil {
+		return nil, fmt.Errorf("scrape configuration: %w", err)
+	}
+	var jobs []string
+	for _, sc := range c.ScrapeConfigs {
+		jobs = append(jobs, sc.JobName)
+	}
+	return jobs, nil
+}
 
 // unexported returns, for every rule, each metric, label value and grouping label it names
-// that none of the scrapes exports.
+// that none of the scrapes exports. `up` is Prometheus's own series, one per target, with the
+// labels job (one of jobs, from the scrape configuration) and instance.
 func unexported(rules []byte, jobs []string, scrapes ...[]byte) ([]string, error) {
 	var r ruleFile
 	if err := yaml.Unmarshal(rules, &r); err != nil {
@@ -207,6 +234,12 @@ func unexported(rules []byte, jobs []string, scrapes ...[]byte) ([]string, error
 	e, err := exports(scrapes...)
 	if err != nil {
 		return nil, err
+	}
+	for _, j := range jobs {
+		e.add("up", "job", j)
+	}
+	if len(jobs) > 0 {
+		e.add("up", "instance", "")
 	}
 	var out []string
 	for _, g := range r.Groups {

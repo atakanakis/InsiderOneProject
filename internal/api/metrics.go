@@ -53,28 +53,50 @@ func labelsOf(r *http.Request) (method, route string) {
 	return method, route
 }
 
-// cached is a figure read from Postgres, reused for FiguresTTL. One read at a time: a caller
-// that finds the figure old waits for the read in progress and takes its result.
+// cached is a figure read from Postgres and kept for FiguresTTL, value or error (architecture
+// §10). One read at a time, shared by every caller that comes while it runs; the read has its
+// own timeout and does not end with the caller that started it. A caller stops waiting at its
+// own context's end. So a stalled Postgres costs one read per FiguresTTL, and no caller waits
+// for another's turn (session 7's review, F3).
 type cached[T any] struct {
-	mu    sync.Mutex
-	at    time.Time
-	value T
+	mu      sync.Mutex
+	at      time.Time // when the kept result was read; zero before the first
+	value   T
+	err     error
+	reading chan struct{} // closed when the read in progress ends; nil when none runs
 }
 
-// get returns the figure, read again when it is older than FiguresTTL. A failed read is not
-// kept: the next caller reads again, one at a time.
-func (c *cached[T]) get(read func() (T, error)) (T, error) {
+// get returns the kept result while it is younger than FiguresTTL; otherwise it waits for a
+// read, starting one when none runs, until ctx ends.
+func (c *cached[T]) get(ctx context.Context, read func() (T, error)) (T, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.at.IsZero() || time.Since(c.at) >= FiguresTTL {
-		v, err := read()
-		if err != nil {
-			var zero T
-			return zero, err
-		}
-		c.value, c.at = v, time.Now()
+	if !c.at.IsZero() && time.Since(c.at) < FiguresTTL {
+		v, err := c.value, c.err
+		c.mu.Unlock()
+		return v, err
 	}
-	return c.value, nil
+	if c.reading == nil {
+		done := make(chan struct{})
+		c.reading = done
+		go func() {
+			v, err := read()
+			c.mu.Lock()
+			c.value, c.err, c.at, c.reading = v, err, time.Now(), nil
+			c.mu.Unlock()
+			close(done)
+		}()
+	}
+	done := c.reading
+	c.mu.Unlock()
+	select {
+	case <-done:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.value, c.err
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
 }
 
 // figures reads the queue's figures and the attempts of each window, each at most once per
@@ -83,9 +105,9 @@ type figures struct {
 	readQueue    func(context.Context) (store.QueueStats, error)
 	readAttempts func(context.Context, time.Duration) (map[domain.Channel]*store.AttemptStats, error)
 	log          *slog.Logger
-	failures *observability.Every
-	queue    cached[store.QueueStats]
-	windows  map[string]*cached[map[domain.Channel]*store.AttemptStats]
+	failures     *observability.Every
+	queue        cached[store.QueueStats]
+	windows      map[string]*cached[map[domain.Channel]*store.AttemptStats]
 }
 
 func newFigures(s *store.Notifications, log *slog.Logger) *figures {
@@ -106,7 +128,7 @@ func newFiguresFrom(readQueue func(context.Context) (store.QueueStats, error),
 // queueStats reads the queue's figures. The read is shared, so it does not end with the
 // caller that started it; it has its own timeout.
 func (f *figures) queueStats(ctx context.Context) (store.QueueStats, error) {
-	return f.queue.get(func() (store.QueueStats, error) {
+	return f.queue.get(ctx, func() (store.QueueStats, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), QueueReadTimeout)
 		defer cancel()
 		return f.readQueue(ctx)
@@ -115,7 +137,7 @@ func (f *figures) queueStats(ctx context.Context) (store.QueueStats, error) {
 
 // attemptStats reads the attempts of one window, shared like queueStats.
 func (f *figures) attemptStats(ctx context.Context, name string, deadline time.Duration) (map[domain.Channel]*store.AttemptStats, error) {
-	return f.windows[name].get(func() (map[domain.Channel]*store.AttemptStats, error) {
+	return f.windows[name].get(ctx, func() (map[domain.Channel]*store.AttemptStats, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deadline)
 		defer cancel()
 		return f.readAttempts(ctx, MetricsWindows[name])
@@ -130,6 +152,7 @@ func (f *figures) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (f *figures) Collect(ch chan<- prometheus.Metric) {
+	// A scrape waits at most for the read's own timeout, QueueReadTimeout.
 	st, err := f.queueStats(context.Background())
 	if err != nil {
 		f.failures.Log(context.Background(), f.log, slog.LevelWarn, "queue figures not read", "error", err)
@@ -188,12 +211,14 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fieldError("window", "must be one of 1m, 5m, 15m and 1h"))
 		return
 	}
-	queue, err := s.figures.queueStats(r.Context())
+	ctx, cancel := s.database(r) // a request waits for the figures no longer than its database deadline
+	defer cancel()
+	queue, err := s.figures.queueStats(ctx)
 	if err != nil {
 		s.internal(w, r, err)
 		return
 	}
-	attempts, err := s.figures.attemptStats(r.Context(), name, s.deadline)
+	attempts, err := s.figures.attemptStats(ctx, name, s.deadline)
 	if err != nil {
 		s.internal(w, r, err)
 		return

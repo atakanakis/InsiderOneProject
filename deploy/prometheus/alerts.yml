@@ -9,9 +9,12 @@ groups:
   - name: notifications
     rules:
       # The provider fails for this channel (architecture section 6); rows wait with their
-      # attempts. Check the provider, PROVIDER_URL and its credentials.
+      # attempts. Check the provider, PROVIDER_URL and its credentials. A breaker stays
+      # half-open on an idle channel until a row comes; with no attempt that is not an outage.
       - alert: NotificationsBreakerOpen
-        expr: max by (channel) (notifications_breaker_state) > 0
+        expr: |
+          max by (channel) (notifications_breaker_state) > 0
+            and on (channel) sum by (channel) (rate(notifications_attempts_total[5m])) > 0
         for: 5m
         labels:
           severity: page
@@ -51,15 +54,16 @@ groups:
         annotations:
           summary: "{{ $labels.channel }}: {{ $value | humanizePercentage }} of finished notifications failed"
 
-      # Postgres refuses writes or does not answer. A row whose result is not stored is
-      # returned by the reaper after its lease and sent again (architecture section 6).
-      - alert: NotificationsResultWritesFailing
-        expr: sum(rate(notifications_worker_errors_total{operation="result_write"}[1m])) > 0
+      # Postgres refuses writes or does not answer. Results of the rows in flight fail for one
+      # lease, then nothing is claimed and claims fail on every loop; a row whose result was not
+      # stored is returned by the reaper and sent again (architecture section 6).
+      - alert: NotificationsDatabaseFailing
+        expr: sum(rate(notifications_worker_errors_total{operation=~"claim|result_write|reap"}[1m])) > 0
         for: 2m
         labels:
           severity: page
         annotations:
-          summary: "Workers cannot store delivery results"
+          summary: "Workers cannot claim or store results: Postgres refuses or does not answer"
 
       # Redis is down, refuses writes or does not answer (architecture section 7). Nothing is
       # claimed or sent until it is back.
@@ -90,3 +94,23 @@ groups:
           severity: ticket
         annotations:
           summary: "Status events are being dropped"
+
+      # The API is down or stalled. The queue's figures come only from the API, so the rules on
+      # them cannot fire while it is gone.
+      - alert: NotificationsAPIDown
+        expr: up{job="api"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Prometheus cannot scrape the API at {{ $labels.instance }}"
+
+      # Nothing is delivered. Workers are found by DNS, so with none running there is no target
+      # and no series at all: the rule asks for the absence of a worker that is up.
+      - alert: NotificationsNoWorker
+        expr: absent(up{job="worker"} == 1)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "No worker answers its scrape: nothing is delivered"

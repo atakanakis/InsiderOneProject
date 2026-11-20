@@ -238,15 +238,15 @@ tests:
             exp_annotations:
               summary: "Prometheus cannot scrape the API at api:8080"
 
-  # Workers are found by DNS: a stopped worker leaves no target, so the series ends. One of two
-  # stopping is not "no worker"; both stopping is.
+  # Workers are found by DNS: a stopped worker leaves no target, and Prometheus ends its series
+  # with a staleness marker. One of two stopping is not "no worker"; both stopping is.
   - name: NotificationsNoWorker
     interval: 1m
     input_series:
       - series: 'up{job="worker", instance="10.0.0.7:9100"}'
-        values: '1 1 1 _x8'
+        values: '1 1 1 stale'
       - series: 'up{job="worker", instance="10.0.0.8:9100"}'
-        values: '1 1 1 1 1 1 _x5'
+        values: '1 1 1 1 1 1 stale'
     alert_rule_test:
       - eval_time: 5m
         alertname: NotificationsNoWorker
