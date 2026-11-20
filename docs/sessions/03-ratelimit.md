@@ -14,7 +14,7 @@
 | `Wait` | Runs the take script; when refused, sleeps for the returned time or until its context ends, and asks again. Any error is returned as an error, never as a permit; `ErrNoPermitInTime` means the context ended first, every other error is the limiter's | TestWaitStopsWhenItsContextEnds, TestWaitWithAnEndedContextTakesNoPermit, TestAnUnreachableRedisIsAnErrorNotAPermit, TestAHungRedisIsALimiterErrorNotAWaitThatRanOut |
 | `Available` | A second script, declared `#!lua flags=no-writes` and run with `EVAL_RO`: it counts the permits younger than the window on the Redis clock and writes nothing | TestAvailableChangesNothing, TestAvailableCountsTheFreePermits |
 | One setting per window | The limit and window are stored next to the window; a worker with other settings is refused by both scripts | TestWorkersWithDifferentSettingsAreRefused |
-| The half-failure | On a read-only replica (`REPLICAOF`) and with Redis out of memory (`maxmemory 1`), `Available` answers and `Wait` returns the script's error at once | TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails |
+| The half-failure | On a read-only replica (`REPLICAOF`) and with Redis out of memory (`maxmemory 1`), `Available` answers and `Wait` returns the script's error at once | The test of that name, which session 5 reversed after its review (F2): `Available` now fails too, TestAvailableFailsWhenTheTakeScriptWould |
 | `make guards` | 21 guards of the limiter (16 before the review), each disabling one line | see "Measured" |
 
 The limiter is not wired into the worker yet. Its only caller will be the provider client's
