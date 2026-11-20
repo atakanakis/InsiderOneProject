@@ -43,6 +43,19 @@ jobs:
         # (architecture §12, A4); these measurements are of the program as it ships.
         run: A5_FULL=1 go test -count=1 -v -run 'TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers|TestGateWaitAndThroughputWithManyDispatchers|TestInvariantsHoldUnderRandomFaults' ./internal/dispatch
 
+  alerts:
+    # Every alert rule has a promtool test in which it fires, and the tests pass
+    # (architecture §10). Whether the rules name only what the binaries export is checked by
+    # the test job (TestEveryAlertRuleUsesMetricsTheBinariesExport) and the compose job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: promtool check, promtool test, a firing test for every rule
+        run: make alerts
+
   guards:
     # Each guard is disabled in turn; its named test must fail (CLAUDE.md, rule 13).
     runs-on: ubuntu-latest

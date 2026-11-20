@@ -1,4 +1,4 @@
-.PHONY: up down logs e2e status test test-unit lint guards check-docs build
+.PHONY: up up-observability down logs e2e status test test-unit lint guards check-docs alerts build
 
 up: ## Build and start the stack: Postgres, Redis, migrate, API, worker, mock provider
 	docker compose up --build -d --wait api worker mockprovider
@@ -32,6 +32,13 @@ guards: ## Disable each guard in turn and check that its named test fails (tools
 
 check-docs: ## Every test named in docs/ and README.md exists in the code
 	go run ./tools/testnames
+
+PROMETHEUS_IMAGE = prom/prometheus:v3.5.0
+PROMTOOL = docker run --rm -v "$(CURDIR)/deploy/prometheus":/rules:ro -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE)
+alerts: ## promtool checks and tests the alert rules; every rule must have a firing test case
+	$(PROMTOOL) check rules alerts.yml
+	$(PROMTOOL) test rules alerts_test.yml
+	go run ./tools/alertcheck
 
 build:
 	go build -o bin/ ./cmd/...
