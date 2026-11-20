@@ -140,6 +140,22 @@ func redisClient(t *testing.T, rawURL string) *redis.Client {
 	return c
 }
 
+// createBatch posts a batch and returns the id of its first notification.
+func (s *system) createBatch(t *testing.T, body string) string {
+	t.Helper()
+	resp, err := http.Post(s.api.URL+"/v1/notifications/batch", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct{ IDs []string }
+	if err := json.Unmarshal(raw, &out); err != nil || resp.StatusCode != http.StatusCreated || len(out.IDs) == 0 {
+		t.Fatalf("batch: %d %s", resp.StatusCode, raw)
+	}
+	return out.IDs[0]
+}
+
 // create posts one notification and returns its id and the answer's correlation id.
 func (s *system) create(t *testing.T, body string, header ...string) (string, string) {
 	t.Helper()
@@ -249,20 +265,23 @@ func TestTheDeliverySpanJoinsTheAPIRequestsTrace(t *testing.T) {
 	const client = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	plain, _ := sys.create(t, smsJSON)
 	joined, _ := sys.create(t, smsJSON, "traceparent", client)
-	sys.waitStatus(t, plain, domain.Sent)
-	sys.waitStatus(t, joined, domain.Sent)
+	item := sys.createBatch(t, `{"notifications": [`+smsJSON+`]}`)
+	all := []string{plain, joined, item}
+	for _, id := range all {
+		sys.waitStatus(t, id, domain.Sent)
+	}
 
 	var requests []sdktrace.ReadOnlySpan
 	for _, s := range apiSpans.Ended() {
-		if s.Name() == "POST /v1/notifications" && s.SpanKind() == trace.SpanKindServer {
+		if strings.HasPrefix(s.Name(), "POST /v1/notifications") && s.SpanKind() == trace.SpanKindServer {
 			requests = append(requests, s)
 		}
 	}
-	if len(requests) != 2 {
-		t.Fatalf("%d spans of POST /v1/notifications, want 2", len(requests))
+	if len(requests) != 3 {
+		t.Fatalf("%d spans of POST /v1/notifications and its batch, want 3", len(requests))
 	}
 	stored := map[string]string{}
-	for _, id := range []string{plain, joined} {
+	for _, id := range all {
 		var tp string
 		if err := sys.env.Pool.QueryRow(context.Background(), `SELECT traceparent FROM notifications WHERE id = $1`, id).Scan(&tp); err != nil {
 			t.Fatal(err)
@@ -271,7 +290,7 @@ func TestTheDeliverySpanJoinsTheAPIRequestsTrace(t *testing.T) {
 	}
 	deliveries := map[string]sdktrace.ReadOnlySpan{}
 	waitSpans := time.Now().Add(5 * time.Second)
-	for len(deliveries) < 2 && time.Now().Before(waitSpans) {
+	for len(deliveries) < len(all) && time.Now().Before(waitSpans) {
 		for _, s := range workerSpans.Ended() {
 			for _, a := range s.Attributes() {
 				if a.Key == "notification.id" {
@@ -281,7 +300,7 @@ func TestTheDeliverySpanJoinsTheAPIRequestsTrace(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	for _, id := range []string{plain, joined} {
+	for _, id := range all {
 		d, ok := deliveries[id]
 		if !ok {
 			t.Fatalf("no delivery span for %s", id)

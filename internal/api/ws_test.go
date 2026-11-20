@@ -521,3 +521,32 @@ func TestTheHubClosesEveryWebSocketOnShutdown(t *testing.T) {
 		t.Errorf("an upgrade after shutdown: %v, want a 503", resp)
 	}
 }
+
+// §9: a client that stops reading fills the TCP buffers until the server's write blocks; the
+// write ends at its deadline, so the connection is closed and its slot and goroutine freed,
+// not held for as long as the client keeps the socket open. Events are delivered at a pace
+// the writer can follow, so the write blocks before the queue overflows.
+func TestAWriteToAClientThatStopsReadingEndsAtItsDeadline(t *testing.T) {
+	a := newWSAPI(t, HubOptions{WriteTimeout: 500 * time.Millisecond})
+	id := uuid.New()
+	rawWS(t, a.url, notificationIDParam+"="+id.String()) // never reads
+	if !waitUntil(5*time.Second, func() bool { return testutil.ToFloat64(a.metrics.WebSockets) == 1 }) {
+		t.Fatal("not connected")
+	}
+	began := time.Now()
+	sent := 0
+	for testutil.ToFloat64(a.metrics.WebSockets) == 1 && time.Since(began) < 20*time.Second {
+		for range 20 {
+			a.hub.Deliver(events.Event{ID: id, Status: domain.Processing})
+		}
+		sent += 20
+		time.Sleep(time.Millisecond)
+	}
+	t.Logf("%d events delivered before the connection was closed, after %v", sent, time.Since(began))
+	if got := testutil.ToFloat64(a.metrics.WebSockets); got != 0 {
+		t.Fatalf("%v connections open 20 s after the client stopped reading; the write did not end", got)
+	}
+	if got := closedBy(a.metrics, "slow"); got != 1 {
+		t.Errorf("closed{slow} = %v, want 1", got)
+	}
+}

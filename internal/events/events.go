@@ -74,13 +74,14 @@ func (e Event) Encode() []byte {
 var ErrMalformed = errors.New("events: malformed event")
 
 // Decode reads an event published by Encode. A message larger than MaxEventBytes is refused
-// unread; so is one without a notification id or with a status that does not exist.
-func Decode(p []byte) (Event, error) {
+// unread and uncopied; so is one without a notification id or with a status that does not
+// exist.
+func Decode(p string) (Event, error) {
 	if len(p) > MaxEventBytes {
 		return Event{}, fmt.Errorf("%w: %d bytes, more than %d", ErrMalformed, len(p), MaxEventBytes)
 	}
 	var w wire
-	if err := json.Unmarshal(p, &w); err != nil {
+	if err := json.Unmarshal([]byte(p), &w); err != nil {
 		return Event{}, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
 	status, err := domain.ParseStatus(w.Status)

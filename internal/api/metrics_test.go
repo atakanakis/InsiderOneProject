@@ -31,14 +31,15 @@ func exec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 
 // queueRows adds rows in the four queue statuses: sms has 2 pending rows due for 90 s, one
 // scheduled in an hour, one retrying in a minute, one processing; email has one pending row
-// due for 10 s. Rows that are final are not in the queue.
+// due for 10 s; push has only a row scheduled in an hour, so nothing due. Rows that are final
+// are not in the queue.
 func queueRows(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	exec(t, pool, `INSERT INTO notifications (id, recipient, channel, content, priority, status, attempts, max_attempts, ready_at, locked_until)
 SELECT gen_random_uuid(), '+905551234567', c, 'hello', 1, s, 1, 6, now() + r::interval, CASE WHEN s = 'processing' THEN now() + interval '1 minute' END
 FROM (VALUES ('sms', 'pending', '-90 seconds'), ('sms', 'pending', '-30 seconds'), ('sms', 'scheduled', '1 hour'),
              ('sms', 'retrying', '1 minute'), ('sms', 'processing', '-5 seconds'), ('email', 'pending', '-10 seconds'),
-             ('sms', 'sent', '-1 hour'), ('push', 'failed', '-1 hour')) AS v(c, s, r)`)
+             ('sms', 'sent', '-1 hour'), ('push', 'failed', '-1 hour'), ('push', 'scheduled', '1 hour')) AS v(c, s, r)`)
 }
 
 // attemptRows adds delivered notifications of a channel created ago, each with one attempt
@@ -80,9 +81,9 @@ func TestTheMetricsEndpointReportsTheRecentWindow(t *testing.T) {
 	a := newAPI(t)
 	queueRows(t, a.Pool)
 	attemptRows(t, a.Pool, "sms", "sent", "2 minutes", "1 minute", 100, 200, 300)
-	attemptRows(t, a.Pool, "sms", "error response", "2 minutes", "1 minute", 50)
-	attemptRows(t, a.Pool, "sms", "sent", "11 minutes", "10 minutes", 400) // in 15m and 1h only
-	attemptRows(t, a.Pool, "sms", "sent", "3 hours", "2 hours", 500)       // in no window
+	attemptRows(t, a.Pool, "sms", "error response", "30 minutes", "1 minute", 50) // not a delivery: no latency
+	attemptRows(t, a.Pool, "sms", "sent", "11 minutes", "10 minutes", 400)        // in 15m and 1h only
+	attemptRows(t, a.Pool, "sms", "sent", "3 hours", "2 hours", 500)              // in no window
 
 	r := a.get(t, "/v1/metrics")
 	if r.code != http.StatusOK {
@@ -98,6 +99,9 @@ func TestTheMetricsEndpointReportsTheRecentWindow(t *testing.T) {
 		if got := number(t, queue[status], "sms.queue."+status); got != want {
 			t.Errorf("sms queue %s = %v, want %v", status, got, want)
 		}
+	}
+	if len(queue) != 4 {
+		t.Errorf("sms queue %v, want the four statuses of the queue only", queue)
 	}
 	if age := number(t, sms["oldestDueAgeSeconds"], "sms.oldestDueAgeSeconds"); age < 90 || age > 120 {
 		t.Errorf("sms oldest due row is %v s old, want about 90", age)
@@ -122,13 +126,16 @@ func TestTheMetricsEndpointReportsTheRecentWindow(t *testing.T) {
 	if p50 := number(t, latency["p50"], "latency p50"); math.Abs(p50-60200) > 1000 {
 		t.Errorf("sms delivery latency p50 %v ms, want about 60,200 (created 2 min ago, delivered 1 min ago in 200 ms)", p50)
 	}
+	if p95 := number(t, latency["p95"], "latency p95"); math.Abs(p95-60300) > 1000 {
+		t.Errorf("sms delivery latency p95 %v ms, want about 60,300: only the attempts that delivered count", p95)
+	}
 	email := obj(t, obj(t, m["channels"], "channels")["email"], "channels.email")
 	if age := number(t, email["oldestDueAgeSeconds"], "email age"); age < 10 || age > 40 {
 		t.Errorf("email oldest due row is %v s old, want about 10", age)
 	}
 	push := obj(t, obj(t, m["channels"], "channels")["push"], "channels.push")
 	if push["deliveredShare"] != nil || push["attemptDurationMs"] != nil || number(t, push["oldestDueAgeSeconds"], "push age") != 0 {
-		t.Errorf("push, with no attempts and nothing due: %v; want no share, no percentiles, age 0", push)
+		t.Errorf("push, with no attempts and only a row scheduled in an hour: %v; want no share, no percentiles, age 0", push)
 	}
 
 	for window, want := range map[string]float64{"1m": 0, "15m": 5, "1h": 5} {
@@ -225,6 +232,7 @@ func TestQueueGaugesComeFromTheDatabase(t *testing.T) {
 		`notifications_queue_depth{channel="email",status="pending"}`:   1,
 		`notifications_queue_depth{channel="push",status="pending"}`:    0,
 		`notifications_queue_depth{channel="push",status="processing"}`: 0,
+		`notifications_queue_depth{channel="push",status="scheduled"}`:  1,
 		`notifications_queue_oldest_due_age_seconds{channel="push"}`:    0,
 	} {
 		if v, ok := got[series]; !ok || v != want {

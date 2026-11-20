@@ -228,11 +228,7 @@ func subscribeOnce(ctx context.Context, c *redis.Client, deliver func(Event), o 
 				o.Metrics.Subscriptions.Inc()
 			}
 		case *redis.Message:
-			var e Event
-			err := ErrMalformed // too large: refused before it is copied
-			if len(m.Payload) <= MaxEventBytes {
-				e, err = Decode([]byte(m.Payload))
-			}
+			e, err := Decode(m.Payload)
 			if err != nil {
 				o.Metrics.Malformed.Inc()
 				malformed.Log(context.Background(), o.Log, slog.LevelWarn, "status events: a malformed event was dropped", "error", err)

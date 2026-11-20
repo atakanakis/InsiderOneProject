@@ -107,7 +107,7 @@ func TestAnEventSurvivesItsWireForm(t *testing.T) {
 		{ID: uuid.New(), BatchID: uuid.New(), Status: domain.Sent},
 	} {
 		b := e.Encode()
-		got, err := Decode(b)
+		got, err := Decode(string(b))
 		if err != nil || got != e {
 			t.Errorf("Decode(Encode(%+v)) = %+v, %v", e, got, err)
 		}
@@ -138,6 +138,12 @@ func TestPublishNeverBlocksWhenRedisHangs(t *testing.T) {
 	t.Logf("%d events published in %v; the slowest call took %v", n, total, slowest)
 	if n < 3*Buffer || slowest > 10*time.Millisecond || total > time.Second {
 		t.Fatalf("Publish waited for Redis: %d of %d events in %v, the slowest call %v", n, 3*Buffer, total, slowest)
+	}
+	// The sender's first pipeline gives up at PublishTimeout (1 s), not at the client's own
+	// read timeout (3 s), and its events are counted.
+	failedAt := waitFor(2*time.Second, func() bool { return testutil.ToFloat64(m.Dropped.WithLabelValues("redis_error")) > 0 })
+	if !failedAt {
+		t.Error("no pipeline to the hung Redis was given up within 2 s")
 	}
 	dropped := func() float64 { return testutil.ToFloat64(m.Dropped.WithLabelValues("buffer_full")) }
 	// The buffer holds Buffer events and the sender holds one pipeline; the rest was dropped.
@@ -399,6 +405,7 @@ func TestAMalformedOrOversizedEventIsDropped(t *testing.T) {
 		`{"id":"not-a-uuid","status":"sent"}`,
 		`{"id":"` + id + `","status":"delivered"}`,
 		`{"id":"` + id + `"}`,
+		`{"status":"sent"}`,
 		`{"id":"` + id + `","status":"sent","pad":"` + strings.Repeat("x", MaxEventBytes) + `"}`,
 		`{"id":"` + id + `","batchId":"x","status":"sent"}`,
 	}

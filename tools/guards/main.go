@@ -15,7 +15,7 @@
 // against a fresh schema. Starting the containers per test process took about 10 s per
 // guard of an integration package (session 1's record).
 //
-// Usage: go run ./tools/guards [-only substring]
+// Usage: go run ./tools/guards [-only substring] [-from substring]
 package main
 
 import (
@@ -55,6 +55,7 @@ var restore struct {
 
 func main() {
 	only := flag.String("only", "", "run only the guards whose name contains this text")
+	from := flag.String("from", "", "run the guards from the first whose name contains this text, in list order")
 	flag.Parse()
 
 	// On Ctrl-C, put back the file being mutated before exiting.
@@ -77,7 +78,7 @@ func main() {
 		os.Exit(1)
 	}
 	testEnv = append(os.Environ(), testkit.PostgresURLVar+"="+pgURL, testkit.RedisURLVar+"="+redisURL)
-	code := run(*only)
+	code := run(*only, *from)
 	stop()
 	os.Exit(code)
 }
@@ -85,11 +86,13 @@ func main() {
 // testEnv is the environment of the test processes: this run's servers.
 var testEnv []string
 
-func run(only string) int {
+func run(only, from string) int {
 	failed := 0
 	ran := 0
+	started := from == ""
 	for _, g := range guards {
-		if only != "" && !strings.Contains(g.Name, only) {
+		started = started || strings.Contains(g.Name, from)
+		if !started || only != "" && !strings.Contains(g.Name, only) {
 			continue
 		}
 		ran++

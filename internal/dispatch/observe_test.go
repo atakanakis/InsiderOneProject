@@ -19,6 +19,7 @@ import (
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/events"
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
+	"github.com/atakanakis/InsiderOneProject/internal/ratelimit"
 	"github.com/atakanakis/InsiderOneProject/internal/recorder"
 	"github.com/atakanakis/InsiderOneProject/internal/redisclient"
 	"github.com/atakanakis/InsiderOneProject/internal/store"
@@ -570,5 +571,116 @@ func TestEveryWorkerLineAboutANotificationCarriesItsCorrelationID(t *testing.T) 
 	}
 	if !reaped {
 		t.Error("no line about the reaped row's lease")
+	}
+}
+
+// §10: a result that comes back after the reaper took its row is counted as stale, and
+// publishes nothing: every attempt is counted once, whatever became of it.
+func TestAStaleResultIsCountedAsStale(t *testing.T) {
+	e := testkit.Setup(t)
+	var first atomic.Bool
+	srv := testkit.Recorder(t, recorder.Options{Respond: func(recorder.Request) recorder.Response {
+		if first.CompareAndSwap(false, true) {
+			return recorder.Response{Delay: 1500 * time.Millisecond} // longer than the lease
+		}
+		return recorder.Response{}
+	}})
+	_, m := newMetrics()
+	log := &eventLog{}
+	opts := testOptions(t)
+	opts.Metrics, opts.Events, opts.Lease = m, log, 500*time.Millisecond
+	startWorker(t, e, workerSpec{
+		channels: []domain.Channel{domain.SMS}, limit: 100, margin: 50 * time.Millisecond,
+		opts: opts, provider: providerOptions(srv, false), reaperTick: 100 * time.Millisecond, reaperEvents: log,
+	})
+	id := insertRows(t, e.Pool, domain.SMS, 1, always(domain.Normal), 6)[0]
+	finished := func(s string) float64 { return testutil.ToFloat64(m.Finished.WithLabelValues("sms", s)) }
+	if !waitFor(10*time.Second, func() bool { return finished("stale") == 1 && finished("sent") == 1 }) {
+		t.Fatalf("finished{stale} = %v, finished{sent} = %v; want 1 and 1 (row %s)", finished("stale"), finished("sent"), rowOf(t, e.Pool, id).Status)
+	}
+	if got := testutil.ToFloat64(m.Attempts.WithLabelValues("sms", "sent")); got != 2 {
+		t.Errorf("attempts{sent} = %v, want 2: both attempts were answered 202", got)
+	}
+	sent := 0
+	for _, ev := range log.of(id) {
+		if ev.Status == domain.Sent {
+			sent++
+		}
+	}
+	if sent != 1 {
+		t.Errorf("%d sent events, want 1: a stale result publishes nothing", sent)
+	}
+}
+
+// failingLimiter is a rate limit whose read fails, as when Redis refuses writes.
+type failingLimiter struct{ Limiter }
+
+func (failingLimiter) Available(context.Context, domain.Channel) (int, error) {
+	return 0, errors.New("READONLY You can't write against a read only replica")
+}
+
+// failingClaims is a queue whose claims fail.
+type failingClaims struct{ Queue }
+
+func (failingClaims) Claim(context.Context, domain.Channel, domain.Priority, int, time.Duration) ([]store.Claimed, error) {
+	return nil, errors.New("connection refused")
+}
+
+type failingReaps struct{}
+
+func (failingReaps) Reap(context.Context, int) ([]store.Change, error) {
+	return nil, errors.New("connection refused")
+}
+
+// §10: a dependency that fails on every loop is counted on every failure and logged at most
+// once per 10 s: the rate-limit read, the claim and the reaper's Reap.
+func TestFailingDependenciesAreCountedAndLoggedSparsely(t *testing.T) {
+	e := testkit.Setup(t)
+	srv := testkit.Recorder(t, recorder.Options{})
+	rdb, err := redisclient.New(e.RedisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	lim, err := ratelimit.New(rdb, 100, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		op    string
+		queue Queue
+		lim   Limiter
+	}{
+		{"rate_limit", store.NewQueue(e.Pool), failingLimiter{lim}},
+		{"claim", failingClaims{store.NewQueue(e.Pool)}, lim},
+	} {
+		buf := &lockedBuffer{}
+		_, m := newMetrics()
+		opts := testOptions(t)
+		opts.Channel, opts.Provider, opts.Metrics = domain.SMS, providerOptions(srv, false), m
+		opts.Log = observability.NewLogger(buf, "worker", "debug")
+		d, err := New(opts, tc.queue, tc.lim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		d.Run(ctx)
+		cancel()
+		failures := testutil.ToFloat64(m.Errors.WithLabelValues(tc.op))
+		lines := len(buf.lines(t))
+		t.Logf("%s: %v failures in 1 s, %d log lines", tc.op, failures, lines)
+		if failures < 10 || lines > 1 {
+			t.Errorf("%s failing for 1 s: %v counted, %d log lines; want every failure counted and one line", tc.op, failures, lines)
+		}
+	}
+
+	buf := &lockedBuffer{}
+	_, m := newMetrics()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	Reaper{Queue: failingReaps{}, Tick: 20 * time.Millisecond, Log: observability.NewLogger(buf, "worker", "debug"), Metrics: m}.Run(ctx)
+	cancel()
+	failures, lines := testutil.ToFloat64(m.Errors.WithLabelValues("reap")), len(buf.lines(t))
+	if failures < 10 || lines > 1 {
+		t.Errorf("reap failing for 1 s: %v counted, %d log lines; want every failure counted and one line", failures, lines)
 	}
 }

@@ -889,7 +889,7 @@ var guards = []Guard{
 	},
 	{
 		Name: "reaper: publishes each change", File: "internal/dispatch/reaper.go",
-		Old: "r.Events.Publish(ctx, c.ID, c.Status)", New: "_ = c",
+		Old: "\t\t\tr.Events.Publish(rowCtx, events.Event{ID: c.ID, BatchID: c.BatchID, Status: c.Status})\n", New: "",
 		Package: "./internal/dispatch", Test: "TestTheReaperReturnsExpiredRowsAndPublishesTheirStatus",
 	},
 	{
@@ -1131,7 +1131,7 @@ var guards = []Guard{
 	},
 	{
 		Name: "api: a created notification is published", File: "internal/api/notifications.go",
-		Old: "\t\ts.events.Publish(r.Context(), n.ID, n.Status)\n", New: "",
+		Old: "\t\ts.events.Publish(r.Context(), events.Event{ID: n.ID, Status: n.Status})\n", New: "",
 		Package: "./internal/api", Test: "TestCreateAndReadANotification",
 	},
 	{
@@ -1285,5 +1285,352 @@ var guards = []Guard{
 		Name: "config: API keys of at least 16 characters", File: "internal/config/config.go",
 		Old: "if len(k) < MinAPIKeyLen {", New: "if false && len(k) < MinAPIKeyLen {",
 		Package: "./internal/config", Test: "TestAPIKeysMustBeAtLeast16Characters",
+	},
+
+	// Session 7: status events, WebSocket, metrics, tracing and alerts (architecture §9, §10).
+	{
+		Name: "events: Publish never waits for Redis (\u00a79)", File: "internal/events/redis.go",
+		Old: "func (p *Redis) Publish(_ context.Context, e Event) {\n\tselect {", New: "func (p *Redis) Publish(ctx context.Context, e Event) {\n\t_ = p.c.Publish(ctx, Channel, e.Encode()).Err()\n\tselect {",
+		Package: "./internal/events", Test: "TestPublishNeverBlocksWhenRedisHangs",
+	},
+	{
+		Name: "events: a full buffer drops the event and counts it", File: "internal/events/redis.go",
+		Old: "\t\tp.o.Metrics.Dropped.WithLabelValues(\"buffer_full\").Inc()\n", New: "",
+		Package: "./internal/events", Test: "TestPublishNeverBlocksWhenRedisHangs",
+	},
+	{
+		Name: "events: one pipeline is bounded by PublishTimeout", File: "internal/events/redis.go",
+		Old: "ctx, cancel := context.WithTimeout(ctx, PublishTimeout)", New: "ctx, cancel := context.WithCancel(ctx)",
+		Package: "./internal/events", Test: "TestPublishNeverBlocksWhenRedisHangs",
+	},
+	{
+		Name: "events: Close sends what is buffered", File: "internal/events/redis.go",
+		Old: "\t\t\tp.drain(batch)\n", New: "\t\t\t_ = batch\n",
+		Package: "./internal/events", Test: "TestThePublisherSendsWhatIsBufferedWhenClosed",
+	},
+	{
+		Name: "events: an event over 1 KiB is refused", File: "internal/events/events.go",
+		Old: "\tif len(p) > MaxEventBytes {", New: "\tif false {",
+		Package: "./internal/events", Test: "TestAMalformedOrOversizedEventIsDropped",
+	},
+	{
+		Name: "events: an event needs a known status", File: "internal/events/events.go",
+		Old: "\tif err != nil || w.ID == uuid.Nil {", New: "\tif err != nil && false || w.ID == uuid.Nil {",
+		Package: "./internal/events", Test: "TestAMalformedOrOversizedEventIsDropped",
+	},
+	{
+		Name: "events: an event needs a notification id", File: "internal/events/events.go",
+		Old: "\tif err != nil || w.ID == uuid.Nil {", New: "\tif err != nil {",
+		Package: "./internal/events", Test: "TestAMalformedOrOversizedEventIsDropped",
+	},
+	{
+		Name: "events: a silent subscription is pinged once, then replaced", File: "internal/events/redis.go",
+		Old: "if ctx.Err() == nil && timedOut(err) && !pinged {", New: "if ctx.Err() == nil && timedOut(err) && (!pinged || true) {",
+		Package: "./internal/events", Test: "TestTheSubscriptionComesBackAfterAnOutage",
+	},
+	{
+		Name: "events: the subscription comes back after an error", File: "internal/events/redis.go",
+		Old: "\t\tif ctx.Err() != nil {\n\t\t\treturn\n\t\t}\n\t\tif subscribed {", New: "\t\treturn\n\t\tif subscribed {",
+		Package: "./internal/events", Test: "TestTheSubscriptionComesBackAfterRedisDropsIt",
+	},
+	{
+		Name: "events: a cancelled subscription returns at once", File: "internal/events/redis.go",
+		Old: "stop := context.AfterFunc(ctx, func() { _ = ps.Close() })", New: "stop := func() bool { return false }",
+		Package: "./internal/events", Test: "TestEventsReachSubscribersThroughRedis",
+	},
+	{
+		Name: "dispatch: handle publishes processing (\u00a79)", File: "internal/dispatch/dispatch.go",
+		Old: "\td.o.Events.Publish(ctx, events.Event{ID: row.ID, BatchID: row.BatchID, Status: domain.Processing})\n", New: "",
+		Package: "./internal/dispatch", Test: "TestEveryStatusChangeOfTheWorkerIsPublished",
+	},
+	{
+		Name: "dispatch: every attempt is counted by its outcome", File: "internal/dispatch/dispatch.go",
+		Old: "\td.o.Metrics.Attempts.WithLabelValues(ch, outcomeLabel(v.Outcome)).Inc()\n", New: "",
+		Package: "./internal/dispatch", Test: "TestAttemptsAndResultsAreCountedOnce",
+	},
+	{
+		Name: "dispatch: an outcome is a label without spaces", File: "internal/dispatch/dispatch.go",
+		Old: "func outcomeLabel(outcome string) string { return strings.ReplaceAll(outcome, \" \", \"_\") }", New: "func outcomeLabel(outcome string) string { return strings.ToLower(outcome) }",
+		Package: "./internal/dispatch", Test: "TestAttemptsAndResultsAreCountedOnce",
+	},
+	{
+		Name: "dispatch: what became of every attempt is counted", File: "internal/dispatch/dispatch.go",
+		Old: "\t\t\td.o.Metrics.Finished.WithLabelValues(ch, finished).Inc()\n", New: "\t\t\t_ = finished\n",
+		Package: "./internal/dispatch", Test: "TestAttemptsAndResultsAreCountedOnce",
+	},
+	{
+		Name: "dispatch: a stale result is counted as stale", File: "internal/dispatch/dispatch.go",
+		Old: "\t\t\t\tfinished = \"stale\"\n", New: "",
+		Package: "./internal/dispatch", Test: "TestAStaleResultIsCountedAsStale",
+	},
+	{
+		Name: "dispatch: a result that is not stored is counted", File: "internal/dispatch/dispatch.go",
+		Old: "\t\t\td.o.Metrics.Finished.WithLabelValues(ch, \"not_stored\").Inc()\n", New: "",
+		Package: "./internal/dispatch", Test: "TestResultWriteFailuresAreCountedAndLoggedSparsely",
+	},
+	{
+		Name: "dispatch: a failed result write is counted", File: "internal/dispatch/dispatch.go",
+		Old: "\t\td.o.Metrics.Errors.WithLabelValues(\"result_write\").Inc()\n", New: "",
+		Package: "./internal/dispatch", Test: "TestResultWriteFailuresAreCountedAndLoggedSparsely",
+	},
+	{
+		Name: "dispatch: a failed result write is logged sparsely (session 5's open item)", File: "internal/dispatch/dispatch.go",
+		Old: "\t\td.writes.Log(context.Background(), d.o.Log, slog.LevelWarn, \"result writes failing; retrying\", \"channel\", ch, \"error\", err)", New: "\t\tlog.WarnContext(ctx, \"result writes failing; retrying\", \"error\", err)",
+		Package: "./internal/dispatch", Test: "TestResultWriteFailuresAreCountedAndLoggedSparsely",
+	},
+	{
+		Name: "dispatch: the wait at the gate is measured", File: "internal/dispatch/dispatch.go",
+		Old: "\td.o.Metrics.GateWait.WithLabelValues(ch).Observe(gate.ended.Sub(gate.began).Seconds())\n", New: "",
+		Package: "./internal/dispatch", Test: "TestTheGateWaitAndProviderLatencyAreMeasured",
+	},
+	{
+		Name: "dispatch: the provider's latency is measured from the permit", File: "internal/dispatch/dispatch.go",
+		Old: "\t\td.o.Metrics.ProviderLatency.WithLabelValues(ch).Observe(time.Since(gate.ended).Seconds())\n", New: "",
+		Package: "./internal/dispatch", Test: "TestTheGateWaitAndProviderLatencyAreMeasured",
+	},
+	{
+		Name: "dispatch: the breaker's state is read when scraped", File: "internal/dispatch/dispatch.go",
+		Old: "\to.Metrics.Watch(o.Channel, func() int { return int(d.breaker.State()) }, func() int { return len(d.slots) })\n", New: "",
+		Package: "./internal/dispatch", Test: "TestTheBreakerStateIsExportedWhenScraped",
+	},
+	{
+		Name: "dispatch: a failed claim or rate-limit read is counted", File: "internal/dispatch/dispatch.go",
+		Old: "\td.o.Metrics.Errors.WithLabelValues(op).Inc()\n", New: "",
+		Package: "./internal/dispatch", Test: "TestFailingDependenciesAreCountedAndLoggedSparsely",
+	},
+	{
+		Name: "dispatch: a failed claim or rate-limit read is logged sparsely", File: "internal/dispatch/dispatch.go",
+		Old: "\tevery.Log(ctx, d.o.Log, slog.LevelWarn, msg, \"channel\", d.o.Channel, \"error\", err)", New: "\td.o.Log.WarnContext(ctx, msg, \"channel\", d.o.Channel, \"error\", err)",
+		Package: "./internal/dispatch", Test: "TestFailingDependenciesAreCountedAndLoggedSparsely",
+	},
+	{
+		Name: "dispatch: the reaper counts the rows it returns", File: "internal/dispatch/reaper.go",
+		Old: "\t\t\tr.Metrics.Reaped.WithLabelValues(string(c.Status)).Inc()\n", New: "",
+		Package: "./internal/dispatch", Test: "TestTheReaperCountsTheRowsItReturns",
+	},
+	{
+		Name: "dispatch: the reaper's failure is counted and logged sparsely", File: "internal/dispatch/reaper.go",
+		Old: "\t\t\tr.Metrics.Errors.WithLabelValues(\"reap\").Inc()\n\t\t\tfailures.Log(ctx, r.Log, slog.LevelError, \"reap failed\", \"error\", err)", New: "\t\t\tr.Log.ErrorContext(ctx, \"reap failed\", \"error\", err)",
+		Package: "./internal/dispatch", Test: "TestFailingDependenciesAreCountedAndLoggedSparsely",
+	},
+	{
+		Name: "dispatch: the reaper logs a row with its correlation id (\u00a710)", File: "internal/dispatch/reaper.go",
+		Old: "rowCtx := observability.WithCorrelationID(ctx, c.CorrelationID)", New: "rowCtx := ctx",
+		Package: "./internal/dispatch", Test: "TestEveryWorkerLineAboutANotificationCarriesItsCorrelationID",
+	},
+	{
+		Name: "dispatch: the delivery span joins the stored trace (\u00a710)", File: "internal/dispatch/dispatch.go",
+		Old: "ctx, span := d.tracer.Start(observability.WithTraceparent(ctx, row.Traceparent), \"deliver\",", New: "ctx, span := d.tracer.Start(ctx, \"deliver\",",
+		Package: "./internal/systemtest", Test: "TestTheDeliverySpanJoinsTheAPIRequestsTrace",
+	},
+	{
+		Name: "observability: Every holds back a line within its period", File: "internal/observability/every.go",
+		Old: "if !e.last.IsZero() && now.Sub(e.last) < e.period {", New: "if false {",
+		Package: "./internal/observability", Test: "TestEveryWritesAtMostOneLinePerPeriod",
+	},
+	{
+		Name: "observability: Every says how many lines it held back", File: "internal/observability/every.go",
+		Old: "\t\targs = append(args[:len(args):len(args)], \"suppressed\", skipped)\n", New: "\t\t_ = skipped\n",
+		Package: "./internal/observability", Test: "TestEveryWritesAtMostOneLinePerPeriod",
+	},
+	{
+		Name: "observability: without an endpoint tracing is the no-op provider", File: "internal/observability/tracing.go",
+		Old: "\tif endpoint == \"\" {\n\t\treturn noop.NewTracerProvider()", New: "\tif false {\n\t\treturn noop.NewTracerProvider()",
+		Package: "./internal/observability", Test: "TestTracingIsOffWithoutAnEndpoint",
+	},
+	{
+		Name: "observability: a stored traceparent is read back", File: "internal/observability/tracing.go",
+		Old: "\treturn propagator.Extract(ctx, propagation.MapCarrier{\"traceparent\": traceparent})", New: "\treturn ctx",
+		Package: "./internal/observability", Test: "TestTracingIsOffWithoutAnEndpoint",
+	},
+	{
+		Name: "api: an instance holds at most MaxConnections WebSockets (\u00a79)", File: "internal/api/ws.go",
+		Old: "if h.open.Add(1) > int64(h.o.MaxConnections) {", New: "if h.open.Add(1) > int64(h.o.MaxConnections)+1000 {",
+		Package: "./internal/api", Test: "TestWebSocketConnectionsAreBoundedPerInstance",
+	},
+	{
+		Name: "api: a client whose queue is full is let go", File: "internal/api/ws.go",
+		Old: "\tdefault:\n\t\th.letGoLocked(f, \"slow\")", New: "\tdefault:\n\t\t_ = f",
+		Package: "./internal/api", Test: "TestASlowWebSocketClientIsDisconnectedAndMemoryStaysBounded",
+	},
+	{
+		Name: "api: a client's queue is bounded", File: "internal/api/ws.go",
+		Old: "queue: make(chan events.Event, h.o.Queue)", New: "queue: make(chan events.Event, 2_000_000)",
+		Package: "./internal/api", Test: "TestASlowWebSocketClientIsDisconnectedAndMemoryStaysBounded",
+	},
+	{
+		Name: "api: a write to a client has a deadline", File: "internal/api/ws.go",
+		Old: "wctx, wcancel := context.WithTimeout(ctx, o.WriteTimeout)", New: "wctx, wcancel := context.WithCancel(ctx)",
+		Package: "./internal/api", Test: "TestAWriteToAClientThatStopsReadingEndsAtItsDeadline",
+	},
+	{
+		Name: "api: a data message from the client ends the connection", File: "internal/api/ws.go",
+		Old: "\t\t\tif data {\n", New: "\t\t\tif data && false {\n",
+		Package: "./internal/api", Test: "TestAWebSocketClientMustNotSendDataMessages",
+	},
+	{
+		Name: "api: a peer must answer a ping within the pong timeout", File: "internal/api/ws.go",
+		Old: "pctx, pcancel := context.WithTimeout(ctx, o.PongTimeout)", New: "pctx, pcancel := context.WithCancel(ctx)",
+		Package: "./internal/api", Test: "TestAWebSocketClientThatDoesNotAnswerPingsIsClosed",
+	},
+	{
+		Name: "api: the server pings every interval", File: "internal/api/ws.go",
+		Old: "ping := time.NewTicker(o.PingInterval)", New: "ping := time.NewTicker(time.Hour)",
+		Package: "./internal/api", Test: "TestAWebSocketClientThatDoesNotAnswerPingsIsClosed",
+	},
+	{
+		Name: "api: a client names at most so many ids", File: "internal/api/ws.go",
+		Old: "\t\tif len(values) > most {", New: "\t\tif false {",
+		Package: "./internal/api", Test: "TestWebSocketFiltersAreBounded",
+	},
+	{
+		Name: "api: a client names at least one id", File: "internal/api/ws.go",
+		Old: "\tif len(ids)+len(batches) == 0 {", New: "\tif false {",
+		Package: "./internal/api", Test: "TestWebSocketFiltersAreBounded",
+	},
+	{
+		Name: "api: a WebSocket takes no other parameter", File: "internal/api/ws.go",
+		Old: "\t\tif name != notificationIDParam && name != batchIDParam {", New: "\t\tif false {",
+		Package: "./internal/api", Test: "TestWebSocketFiltersAreBounded",
+	},
+	{
+		Name: "api: a request that is not an upgrade is a 400 in the error form", File: "internal/api/ws.go",
+		Old: "\tif !isUpgrade(r) {", New: "\tif false {",
+		Package: "./internal/api", Test: "TestWebSocketFiltersAreBounded",
+	},
+	{
+		Name: "api: a page of another origin is refused", File: "internal/api/ws.go",
+		Old: "\tif !sameOrigin(r) {", New: "\tif false {",
+		Package: "./internal/api", Test: "TestOpenAPIMatchesTheServer",
+	},
+	{
+		Name: "api: shutdown closes a WebSocket with 1001", File: "internal/api/ws.go",
+		Old: "\t\t\tif f.reason == \"shutdown\" {", New: "\t\t\tif false {",
+		Package: "./internal/api", Test: "TestTheHubClosesEveryWebSocketOnShutdown",
+	},
+	{
+		Name: "api: a hub that shut down refuses new clients", File: "internal/api/ws.go",
+		Old: "\tif h.closed {\n\t\treturn nil, false\n\t}", New: "\tif false {\n\t\treturn nil, false\n\t}",
+		Package: "./internal/api", Test: "TestTheHubClosesEveryWebSocketOnShutdown",
+	},
+	{
+		Name: "api: an event reaches the followers of its batch", File: "internal/api/ws.go",
+		Old: "\tfor f := range h.byBatch[e.BatchID] {", New: "\tfor f := range h.byBatch[uuid.Nil] {",
+		Package: "./internal/api", Test: "TestAWebSocketClientGetsTheCurrentStateThenEveryChange",
+	},
+	{
+		Name: "api: the current state is sent first", File: "internal/api/ws.go",
+		Old: "\tfor _, m := range first {", New: "\tfor _, m := range first[:0] {",
+		Package: "./internal/api", Test: "TestAWebSocketClientGetsTheCurrentStateThenEveryChange",
+	},
+	{
+		Name: "api: a made-up method is counted as other (\u00a710)", File: "internal/api/metrics.go",
+		Old: "\tif !slices.Contains(observability.HTTPMethods, method) {", New: "\tif false && !slices.Contains(observability.HTTPMethods, method) {",
+		Package: "./internal/api", Test: "TestMetricLabelsHaveBoundedValues",
+	},
+	{
+		Name: "api: a path without a route is counted as unmatched", File: "internal/api/metrics.go",
+		Old: "\tif route == \"\" {", New: "\tif false {",
+		Package: "./internal/api", Test: "TestMetricLabelsHaveBoundedValues",
+	},
+	{
+		Name: "api: a figure from Postgres is read once per 5 s", File: "internal/api/metrics.go",
+		Old: "if c.at.IsZero() || time.Since(c.at) >= FiguresTTL {", New: "if true {",
+		Package: "./internal/api", Test: "TestTheMetricsEndpointIsComputedOncePerFiveSeconds",
+	},
+	{
+		Name: "api: the window is one of four", File: "internal/api/metrics.go",
+		Old: "\tif !ok {\n\t\twriteError(w, http.StatusBadRequest, fieldError(\"window\", \"must be one of 1m, 5m, 15m and 1h\"))", New: "\tif false && !ok {\n\t\twriteError(w, http.StatusBadRequest, fieldError(\"window\", \"must be one of 1m, 5m, 15m and 1h\"))",
+		Package: "./internal/api", Test: "TestTheMetricsEndpointReportsTheRecentWindow",
+	},
+	{
+		Name: "api: the window is given once", File: "internal/api/metrics.go",
+		Old: "\t\tif len(vs) != 1 {", New: "\t\tif false {",
+		Package: "./internal/api", Test: "TestTheMetricsEndpointReportsTheRecentWindow",
+	},
+	{
+		Name: "store: the queue's depth counts its four statuses only", File: "internal/store/stats.go",
+		Old: "WHERE status IN ('scheduled', 'pending', 'retrying', 'processing')\nGROUP BY channel, status", New: "GROUP BY channel, status",
+		Package: "./internal/api", Test: "TestTheMetricsEndpointReportsTheRecentWindow",
+	},
+	{
+		Name: "store: the oldest due row is due", File: "internal/store/stats.go",
+		Old: "      AND ready_at <= now()\n    ORDER BY ready_at\n    LIMIT 1) o ON true", New: "    ORDER BY ready_at\n    LIMIT 1) o ON true",
+		Package: "./internal/api", Test: "TestTheMetricsEndpointReportsTheRecentWindow",
+	},
+	{
+		Name: "store: the attempts are those of the window", File: "internal/store/stats.go",
+		Old: "WHERE a.started_at >= now() - $1::bigint * interval '1 microsecond'\nGROUP BY n.channel, a.outcome", New: "WHERE true\nGROUP BY n.channel, a.outcome",
+		Package: "./internal/api", Test: "TestTheMetricsEndpointReportsTheRecentWindow",
+	},
+	{
+		Name: "store: the delivery latency is of the attempts that delivered", File: "internal/store/stats.go",
+		Old: "FILTER (WHERE a.outcome = 'sent')", New: "FILTER (WHERE true)",
+		Package: "./internal/api", Test: "TestTheMetricsEndpointReportsTheRecentWindow",
+	},
+	{
+		Name: "migration: the attempts' BRIN index on started_at", File: "internal/store/migrations/00005_attempts_started_at.sql",
+		Old: "CREATE INDEX delivery_attempts_started_at ON delivery_attempts USING brin (started_at);", New: "SELECT 1;",
+		Package: "./internal/store", Test: "TestTheWindowsAttemptsAreReadThroughTheirIndex",
+	},
+	{
+		Name: "store: a single create stores its traceparent", File: "internal/store/notifications.go",
+		Old: "\t\tobservability.Traceparent(ctx))", New: "\t\t\"\")",
+		Package: "./internal/systemtest", Test: "TestTheDeliverySpanJoinsTheAPIRequestsTrace",
+	},
+	{
+		Name: "store: a batch stores its traceparent", File: "internal/store/notifications.go",
+		Old: "scheduled, observability.Traceparent(ctx)); err != nil {", New: "scheduled, \"\"); err != nil {",
+		Package: "./internal/systemtest", Test: "TestTheDeliverySpanJoinsTheAPIRequestsTrace",
+	},
+	{
+		Name: "api: a request's span is the child of its traceparent header", File: "internal/api/health.go",
+		Old: "ctx, span := tracer.Start(observability.FromHeaders(ctx, propagation.HeaderCarrier(r.Header)), r.Method,", New: "ctx, span := tracer.Start(observability.FromHeaders(ctx, propagation.HeaderCarrier(nil)), r.Method,",
+		Package: "./internal/systemtest", Test: "TestTheDeliverySpanJoinsTheAPIRequestsTrace",
+	},
+	{
+		Name: "api: a request's span is named after its route", File: "internal/api/health.go",
+		Old: "\t\tspan.SetName(route)\n", New: "",
+		Package: "./internal/systemtest", Test: "TestTheDeliverySpanJoinsTheAPIRequestsTrace",
+	},
+	{
+		Name: "api: a WebSocket upgrade reaches the connection", File: "internal/api/health.go",
+		Old: "func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }", New: "func (s *statusWriter) Unwrap() http.ResponseWriter { return nil }",
+		Package: "./internal/api", Test: "TestAWebSocketOutlivesTheServersRequestTimeouts",
+	},
+	{
+		Name: "alertcheck: a rule needs a case in which it fires (\u00a710)", File: "tools/alertcheck/main.go",
+		Old: "\t\t\tif len(c.ExpAlerts) > 0 {", New: "\t\t\tif true {",
+		Package: "./tools/alertcheck", Test: "TestEveryAlertRuleHasAFiringTest",
+	},
+	{
+		Name: "alertcheck: a metric no scrape exports is found", File: "tools/alertcheck/main.go",
+		Old: "\tif !ok {\n\t\treturn []string{fmt.Sprintf(\"%s: no binary exports the metric %s\", alert, s.metric)}", New: "\tif false && !ok {\n\t\treturn []string{fmt.Sprintf(\"%s: no binary exports the metric %s\", alert, s.metric)}",
+		Package: "./tools/alertcheck", Test: "TestTheCheckRefusesWhatNoBinaryExports",
+	},
+	{
+		Name: "alertcheck: a matched label value must be exported", File: "tools/alertcheck/main.go",
+		Old: "\t\tcase m.op == \"=\" && !values[m.value]:", New: "\t\tcase false:",
+		Package: "./tools/alertcheck", Test: "TestTheCheckRefusesWhatNoBinaryExports",
+	},
+	{
+		Name: "alertcheck: each value of a regex must be exported", File: "tools/alertcheck/main.go",
+		Old: "\t\t\t\tif !values[v] {", New: "\t\t\t\tif false {",
+		Package: "./tools/alertcheck", Test: "TestTheCheckRefusesWhatNoBinaryExports",
+	},
+	{
+		Name: "alertcheck: a grouping label must be on the metric", File: "tools/alertcheck/main.go",
+		Old: "\t\tif _, ok := labels[l]; !ok {", New: "\t\tif false {",
+		Package: "./tools/alertcheck", Test: "TestTheCheckRefusesWhatNoBinaryExports",
+	},
+	{
+		Name: "redisclient: the client's own lines are logged sparsely", File: "internal/redisclient/redisclient.go",
+		Old: "\tl.every.Log(context.Background(), l.log, slog.LevelWarn, \"redis client\", \"message\", fmt.Sprintf(format, v...))", New: "\tl.log.Warn(\"redis client\", \"message\", fmt.Sprintf(format, v...))",
+		Package: "./internal/redisclient", Test: "TestTheRedisClientsOwnLinesAreLoggedSparsely",
+	},
+	{
+		Name: "api: a failed readiness check is logged sparsely", File: "internal/api/health.go",
+		Old: "failures[name].Log(r.Context(), log, slog.LevelWarn, \"readiness check failed\", \"dependency\", name, \"error\", err)", New: "log.WarnContext(r.Context(), \"readiness check failed\", \"dependency\", name, \"error\", err)",
+		Package: "./internal/api", Test: "TestAFailingReadinessCheckIsLoggedSparsely",
 	},
 }

@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -159,4 +160,34 @@ func indent(s string) string {
 		s = s[:4000] + "..."
 	}
 	return "    " + strings.ReplaceAll(s, "\n", "\n    ")
+}
+
+// §10: the attempts of a window are read through the BRIN index on started_at. With
+// sequential scans switched off the planner must still have the index to use.
+func TestTheWindowsAttemptsAreReadThroughTheirIndex(t *testing.T) {
+	e := testkit.Setup(t)
+	ctx := context.Background()
+	tx, err := e.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.Query(ctx, `EXPLAIN SELECT count(*) FROM delivery_attempts WHERE started_at >= now() - interval '5 minutes'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line + "\n")
+	}
+	if !strings.Contains(plan.String(), "delivery_attempts_started_at") {
+		t.Errorf("the window's attempts are not read through the index:\n%s", plan.String())
+	}
 }
