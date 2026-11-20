@@ -25,8 +25,10 @@ early parts were lost by the time later parts were built.
 
 Roles:
 
-- **The candidate** decides scope and trade-offs, reads the result of every session, and
-  starts the next session only after being able to explain the last one.
+- **The candidate** decides scope and trade-offs and reads the record of every session.
+- **A coordinating agent** (the conversation that wrote the design) starts each session in a
+  new conversation when the previous one has finished, and checks that its result is pushed
+  and green before starting the next.
 - **The lead** (the main agent of the session; Claude Opus for the build sessions, each in a
   new conversation) builds from the architecture, writes or directs the code, checks every
   claim against the repository, and writes the session record.
