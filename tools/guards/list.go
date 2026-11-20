@@ -692,4 +692,16 @@ var guards = []Guard{
 		Old: "err == nil && t.After(now) {", New: "err == nil {",
 		Package: "./internal/provider", Test: "TestTheResultCarriesWhatWasObserved",
 	},
+
+	// Session 5: the mock provider's fault injection (cmd/mockprovider).
+	{
+		Name: "mockprovider: injects failures at their rate", File: "cmd/mockprovider/main.go",
+		Old: "case random() < s.failRate:", New: "case false && random() < s.failRate:",
+		Package: "./cmd/mockprovider", Test: "TestMockProviderInjectsFailuresAndThrottlesAtTheirRates",
+	},
+	{
+		Name: "mockprovider: a rate is between 0 and 1", File: "cmd/mockprovider/main.go",
+		Old: "if err != nil || !(f >= 0 && f <= 1) {", New: "if err != nil {",
+		Package: "./cmd/mockprovider", Test: "TestMockProviderRefusesARateOutsideZeroToOne",
+	},
 }

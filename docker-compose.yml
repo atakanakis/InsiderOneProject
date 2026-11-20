@@ -92,6 +92,8 @@ services:
     ports: ["9090:9090"]
     environment:
       MOCK_LATENCY: ${MOCK_LATENCY:-0s}
+      MOCK_FAIL_RATE: ${MOCK_FAIL_RATE:-0}
+      MOCK_THROTTLE_RATE: ${MOCK_THROTTLE_RATE:-0}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9090/healthz"]
       interval: 2s
