@@ -24,6 +24,11 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.15.0
+      - name: No build output is tracked
+        # Two binaries of 23 MB each were committed once (session 7's review, F1).
+        run: |
+          found=$(git ls-files -z | xargs -0 file | grep -E 'executable|ELF|Mach-O' || true)
+          if [ -n "$found" ]; then echo "$found"; exit 1; fi
 
   test:
     # Unit and integration tests; testcontainers starts Postgres and Redis on the runner's

@@ -1,5 +1,9 @@
-# Binaries and build output
+# Binaries and build output; "go build ./cmd/..." in the root writes one per command
 /bin/
+/api
+/worker
+/migrate
+/mockprovider
 *.test
 *.out
 coverage.*

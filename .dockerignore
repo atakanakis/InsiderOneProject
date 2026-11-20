@@ -4,4 +4,8 @@
 docs
 *.md
 bin
+/api
+/worker
+/migrate
+/mockprovider
 coverage.*
