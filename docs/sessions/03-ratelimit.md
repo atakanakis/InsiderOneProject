@@ -114,3 +114,10 @@ All in [architecture.md](../architecture.md):
 - `Available` and `Wait` against an unreachable Redis take 3.5 s together because go-redis
   retries the dial; each stays within its caller's deadline. Session 5 decides whether the
   dispatcher's read of `Available` needs a shorter deadline.
+
+## CI
+
+CI on `08660c8` (the last code and document commit of the session), run 44723980645: lint,
+test, guards and compose all succeeded; the guards job, on Linux, printed
+`111 guards, 111 real, 0 failed` (`gh run view 44723980645`, and `--log` of the guards job).
+The commit that adds this section changes only this file.
