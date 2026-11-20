@@ -530,10 +530,11 @@ func TestTheReaperReturnsExpiredRowsAndPublishesTheirStatus(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		Reaper{Queue: store.NewQueue(e.Pool), Tick: 50 * time.Millisecond, Log: testLog(t), Events: ev}.Run(ctx)
+		Reaper{Queue: store.NewQueue(e.Pool), Tick: time.Second, Log: testLog(t), Events: ev}.Run(ctx)
 		close(done)
 	}()
-	ok := waitFor(5*time.Second, func() bool { return ev.count() == len(ids) })
+	// One tick returns all 250, in batches of 100, before the second tick at 2 s.
+	ok := waitFor(1800*time.Millisecond, func() bool { return ev.count() == len(ids) })
 	cancel()
 	<-done
 	if !ok {
@@ -605,5 +606,101 @@ func TestNewRefusesSettingsThatAreNotPositive(t *testing.T) {
 	}
 	if _, err := New(valid(), q, nil, client); err == nil {
 		t.Error("New accepted no limiter")
+	}
+}
+
+// Architecture §7: the limiter fails closed. When Available fails (here: a worker whose limit
+// differs from the window's), room is 0 and nothing is claimed, so no attempt is spent.
+func TestAnUnavailableRateLimitClaimsNothing(t *testing.T) {
+	e := testkit.Setup(t)
+	srv := testkit.Recorder(t, recorder.Options{})
+	other, err := ratelimit.New(e.Redis, 50, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertRows(t, e.Pool, domain.SMS, 20, always(domain.Normal), 6)
+	stopFill := make(chan struct{})
+	filled := make(chan struct{})
+	go func() { // the window keeps the other worker's settings: limit 50
+		defer close(filled)
+		for {
+			_ = other.Wait(bg(t), domain.SMS)
+			select {
+			case <-stopFill:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}()
+	defer func() { close(stopFill); <-filled }()
+	time.Sleep(100 * time.Millisecond)
+	oneWorker(t, e, srv, testOptions(t)) // limit 100
+	time.Sleep(1500 * time.Millisecond)
+	var attempts int
+	if err := e.Pool.QueryRow(bg(t), `SELECT sum(attempts) FROM notifications`).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 || srv.Received() != 0 {
+		t.Errorf("%d attempts, %d requests received while the rate limit was unavailable; want none", attempts, srv.Received())
+	}
+}
+
+// A row that failed waits for its retry delay before its next attempt.
+func TestARetriedRowWaitsForItsBackoff(t *testing.T) {
+	e := testkit.Setup(t)
+	var seen sync.Map
+	srv := testkit.Recorder(t, recorder.Options{Respond: func(r recorder.Request) recorder.Response {
+		if _, again := seen.LoadOrStore(r.Header.Get("Idempotency-Key"), true); !again {
+			return recorder.Response{Status: http.StatusServiceUnavailable}
+		}
+		return recorder.Response{}
+	}})
+	id := insertRows(t, e.Pool, domain.SMS, 1, always(domain.Normal), 6)[0]
+	opts := testOptions(t)
+	opts.Retry.Base, opts.Retry.Cap = 2*time.Second, 10*time.Second // the first retry: between 1 s and 2 s
+	oneWorker(t, e, srv, opts)
+	if !waitFor(10*time.Second, func() bool { return rowOf(t, e.Pool, id).Status == domain.Sent }) {
+		t.Fatalf("the row is %s", rowOf(t, e.Pool, id).Status)
+	}
+	reqs := srv.Requests()
+	if len(reqs) != 2 {
+		t.Fatalf("%d requests, want 2", len(reqs))
+	}
+	if gap := reqs[1].Arrived.Sub(reqs[0].Arrived); gap < time.Second {
+		t.Errorf("the retry arrived %v after the failed attempt; its delay was at least 1 s", gap)
+	}
+	if got := attemptOutcomes(t, e.Pool, id); len(got) != 2 || got[0] != "error response" || got[1] != "sent" {
+		t.Errorf("attempt history %v, want [error response sent]", got)
+	}
+}
+
+// room reads Available: while the window is full, nothing is claimed, so no row waits at the
+// gate and spends an attempt on a refusal. The window here holds the limit of 1 for 1.05 s,
+// and the gate budget is 200 ms: a row claimed in that time would be refused.
+func TestNoRowIsClaimedWhileTheWindowIsFull(t *testing.T) {
+	e := testkit.Setup(t)
+	srv := testkit.Recorder(t, recorder.Options{})
+	filler, err := ratelimit.New(e.Redis, 1, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertRows(t, e.Pool, domain.SMS, 20, always(domain.Normal), 6)
+	if err := filler.Wait(bg(t), domain.SMS); err != nil {
+		t.Fatal(err)
+	}
+	full := time.Now()
+	o := providerOptions(srv, false)
+	o.GateBudget = 200 * time.Millisecond
+	startWorker(t, e, workerSpec{
+		channels: []domain.Channel{domain.SMS}, limit: 1, margin: 50 * time.Millisecond,
+		opts: testOptions(t), provider: o,
+	})
+	time.Sleep(time.Until(full.Add(700 * time.Millisecond))) // the window is still full
+	var attempts int
+	if err := e.Pool.QueryRow(bg(t), `SELECT sum(attempts) FROM notifications`).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("%d attempts while the window was full; want none", attempts)
 	}
 }

@@ -704,4 +704,217 @@ var guards = []Guard{
 		Old: "if err != nil || !(f >= 0 && f <= 1) {", New: "if err != nil {",
 		Package: "./cmd/mockprovider", Test: "TestMockProviderRefusesARateOutsideZeroToOne",
 	},
+
+	// Session 5: the dispatcher of architecture §6 (the loop, Classify, the retry policy, the
+	// breaker and the reaper), the provider client's changes of §6 and §7, and the worker.
+	{
+		Name: "dispatch: claims the highest priority first (I9)", File: "internal/dispatch/dispatch.go",
+		Old: "for _, p := range domain.Priorities {", New: "for _, p := range []domain.Priority{domain.Low, domain.Normal, domain.High} {",
+		Package: "./internal/dispatch", Test: "TestHighPriorityOvertakesBacklog",
+	},
+	{
+		Name: "dispatch: one claim batch waits for permits at a time (I9)", File: "internal/dispatch/dispatch.go",
+		Old: "if d.waiting.Load() > 0 {", New: "if false && d.waiting.Load() > 0 {",
+		Package: "./internal/dispatch", Test: "TestAWorkerHasAtMostOneClaimBatchWaitingForPermits",
+	},
+	{
+		Name: "dispatch: a claim takes at most the claim batch", File: "internal/dispatch/dispatch.go",
+		Old: "n := min(cap(d.slots)-len(d.slots), d.o.ClaimBatch)", New: "n := cap(d.slots) - len(d.slots)",
+		Package: "./internal/dispatch", Test: "TestAWorkerHasAtMostOneClaimBatchWaitingForPermits",
+	},
+	{
+		Name: "dispatch: room reads the breaker", File: "internal/dispatch/dispatch.go",
+		Old: "n = min(n, d.breaker.Allow())", New: "n = min(n, n)",
+		Package: "./internal/dispatch", Test: "TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue",
+	},
+	{
+		Name: "dispatch: room reads Available", File: "internal/dispatch/dispatch.go",
+		Old: "n = min(n, free)", New: "n = min(n, n+0*free)",
+		Package: "./internal/dispatch", Test: "TestNoRowIsClaimedWhileTheWindowIsFull",
+	},
+	{
+		Name: "dispatch: the gate is the limiter (I1)", File: "internal/dispatch/dispatch.go",
+		Old: "err := d.limiter.Wait(gateCtx, d.o.Channel)", New: "err := gateCtx.Err()",
+		Package: "./internal/dispatch", Test: "TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers",
+	},
+	{
+		Name: "dispatch: the breaker learns from Classify", File: "internal/dispatch/dispatch.go",
+		Old: "d.breaker.Report(probe, verdict.Lesson)", New: "d.breaker.Report(probe, Nothing)",
+		Package: "./internal/dispatch", Test: "TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue",
+	},
+	{
+		Name: "dispatch: the probe's report is the probe's", File: "internal/dispatch/dispatch.go",
+		Old: "d.breaker.Report(probe, verdict.Lesson)", New: "d.breaker.Report(false, verdict.Lesson)",
+		Package: "./internal/dispatch", Test: "TestTheHalfOpenBreakerLetsExactlyOneRowThrough",
+	},
+	{
+		Name: "dispatch: a started row in half-open is the probe", File: "internal/dispatch/dispatch.go",
+		Old: "probe := d.breaker.Started()", New: "probe := false",
+		Package: "./internal/dispatch", Test: "TestTheHalfOpenBreakerLetsExactlyOneRowThrough",
+	},
+	{
+		Name: "dispatch: the single exit ends in Finish (I4)", File: "internal/dispatch/dispatch.go",
+		Old: "d.finish(ctx, row, result, verdict)", New: "_ = row",
+		Package: "./internal/dispatch", Test: "TestShutdownWaitsForSendsInFlightAndDoesNotCancelThem",
+	},
+	{
+		Name: "dispatch: sends run without the loop's cancellation", File: "internal/dispatch/dispatch.go",
+		Old: "go d.handle(context.WithoutCancel(ctx), row, probe, wait)", New: "go d.handle(ctx, row, probe, wait)",
+		Package: "./internal/dispatch", Test: "TestShutdownWaitsForSendsInFlightAndDoesNotCancelThem",
+	},
+	{
+		Name: "dispatch: Run waits for the rows in flight", File: "internal/dispatch/dispatch.go",
+		Old: "defer d.inflight.Wait()", New: "defer func() {}()",
+		Package: "./internal/dispatch", Test: "TestShutdownWaitsForSendsInFlightAndDoesNotCancelThem",
+	},
+	{
+		Name: "dispatch: a result write is retried until answered (lessons 7)", File: "internal/dispatch/dispatch.go",
+		Old: "if time.Now().Add(delay).After(giveUp) {", New: "if time.Now().Add(delay).After(giveUp) || true {",
+		Package: "./internal/dispatch", Test: "TestAFailedResultWriteIsRetriedAndNotSentAgain",
+	},
+	{
+		Name: "dispatch: a retry waits its delay", File: "internal/dispatch/dispatch.go",
+		Old: "RetryIn: d.o.Retry.DelayAfter(row.Attempt, v)", New: "RetryIn: 0",
+		Package: "./internal/dispatch", Test: "TestARetriedRowWaitsForItsBackoff",
+	},
+	{
+		Name: "classify: a response always wins (I6)", File: "internal/dispatch/classify.go",
+		Old: "case r.Responded && r.StatusCode >= 200 && r.StatusCode < 300:", New: "case r.Refusal == nil && r.Responded && r.StatusCode >= 200 && r.StatusCode < 300:",
+		Package: "./internal/dispatch", Test: "TestAResponseAlwaysWins",
+	},
+	{
+		Name: "classify: 400, 413 and 422 end the message", File: "internal/dispatch/classify.go",
+		Old: "return code == http.StatusBadRequest ||", New: "return false && code == http.StatusBadRequest ||",
+		Package: "./internal/dispatch", Test: "TestClassifyDecidesEveryRowOfTheVerdictTable",
+	},
+	{
+		Name: "classify: 404 and 401 are failures of the channel", File: "internal/dispatch/classify.go",
+		Old: "return code == http.StatusBadRequest ||", New: "return code >= 400 && code < 500 ||",
+		Package: "./internal/dispatch", Test: "TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue",
+	},
+	{
+		Name: "classify: a limiter error is a failure", File: "internal/dispatch/classify.go",
+		Old: "case r.Refusal != nil && !errors.Is(r.Refusal, ratelimit.ErrNoPermitInTime):", New: "case false && r.Refusal != nil && !errors.Is(r.Refusal, ratelimit.ErrNoPermitInTime):",
+		Package: "./internal/dispatch", Test: "TestABrokenTakeScriptOpensTheBreakerAndFailsNoRowWithoutASend",
+	},
+	{
+		Name: "classify: no permit in time teaches nothing", File: "internal/dispatch/classify.go",
+		Old: "Delay: Soon, Lesson: Nothing, Outcome: \"no permit in time\"", New: "Delay: Soon, Lesson: Failure, Outcome: \"no permit in time\"",
+		Package: "./internal/dispatch", Test: "TestClassifyDecidesEveryRowOfTheVerdictTable",
+	},
+	{
+		Name: "classify: a connection closed idle teaches nothing", File: "internal/dispatch/classify.go",
+		Old: "case r.ClosedIdle:", New: "case false && r.ClosedIdle:",
+		Package: "./internal/dispatch", Test: "TestTheVerdictTableHoldsForRealSends",
+	},
+	{
+		Name: "classify: the verdict carries Retry-After", File: "internal/dispatch/classify.go",
+		Old: "RetryAfter: r.RetryAfter,", New: "RetryAfter: 0,",
+		Package: "./internal/dispatch", Test: "TestClassifyDecidesEveryRowOfTheVerdictTable",
+	},
+	{
+		Name: "retry: the ceiling doubles", File: "internal/dispatch/retry.go",
+		Old: "ceiling *= 2", New: "ceiling += p.Base",
+		Package: "./internal/dispatch", Test: "TestRetryDelaysDoubleWithJitterUpToTheCap",
+	},
+	{
+		Name: "retry: no delay exceeds the cap", File: "internal/dispatch/retry.go",
+		Old: "ceiling = min(ceiling, p.Cap)", New: "ceiling = max(ceiling, 0)",
+		Package: "./internal/dispatch", Test: "TestRetryDelaysDoubleWithJitterUpToTheCap",
+	},
+	{
+		Name: "retry: delays are jittered", File: "internal/dispatch/retry.go",
+		Old: "d := half + time.Duration(random()*float64(ceiling-half))", New: "d := ceiling + 0*half",
+		Package: "./internal/dispatch", Test: "TestRetryDelaysDoubleWithJitterUpToTheCap",
+	},
+	{
+		Name: "retry: Retry-After is honoured", File: "internal/dispatch/retry.go",
+		Old: "return max(d, min(v.RetryAfter, p.Cap))", New: "return d",
+		Package: "./internal/dispatch", Test: "TestRetryAfterIsHonouredUpToTheCap",
+	},
+	{
+		Name: "retry: Retry-After is capped", File: "internal/dispatch/retry.go",
+		Old: "return max(d, min(v.RetryAfter, p.Cap))", New: "return max(d, v.RetryAfter)",
+		Package: "./internal/dispatch", Test: "TestRetryAfterIsHonouredUpToTheCap",
+	},
+	{
+		Name: "retry: soon is about one window", File: "internal/dispatch/retry.go",
+		Old: "return p.Soon + time.Duration(random()*float64(p.Soon))", New: "return time.Duration(random() * float64(p.Soon))",
+		Package: "./internal/dispatch", Test: "TestRetryDelaysDoubleWithJitterUpToTheCap",
+	},
+	{
+		Name: "breaker: five failures in a row open it", File: "internal/dispatch/breaker.go",
+		Old: "if b.failures++; b.failures >= FailuresToOpen {", New: "if b.failures++; b.failures >= FailuresToOpen+1 {",
+		Package: "./internal/dispatch", Test: "TestBreakerOpensAfterFiveFailuresInARow",
+	},
+	{
+		Name: "breaker: a success resets the count", File: "internal/dispatch/breaker.go",
+		Old: "case b.state() == Closed && l == Success:\n\t\tb.failures = 0", New: "case b.state() == Closed && l == Success:\n\t\t_ = 0",
+		Package: "./internal/dispatch", Test: "TestBreakerOpensAfterFiveFailuresInARow",
+	},
+	{
+		Name: "breaker: open lasts its open time", File: "internal/dispatch/breaker.go",
+		Old: "case b.now().Sub(b.openedAt) < b.open:", New: "case false:",
+		Package: "./internal/dispatch", Test: "TestBreakerOpensAfterFiveFailuresInARow",
+	},
+	{
+		Name: "breaker: one probe at a time", File: "internal/dispatch/breaker.go",
+		Old: "\t\tif !b.probing {\n\t\t\treturn 1", New: "\t\tif true {\n\t\t\treturn 1",
+		Package: "./internal/dispatch", Test: "TestBreakerHalfOpenLetsOneProbeThrough",
+	},
+	{
+		Name: "breaker: only half-open marks a probe", File: "internal/dispatch/breaker.go",
+		Old: "if b.state() == HalfOpen && !b.probing {", New: "if !b.probing {",
+		Package: "./internal/dispatch", Test: "TestBreakerHalfOpenLetsOneProbeThrough",
+	},
+	{
+		Name: "breaker: only the probe's report counts outside closed", File: "internal/dispatch/breaker.go",
+		Old: "case probe && b.probing:", New: "case b.probing:",
+		Package: "./internal/dispatch", Test: "TestBreakerHalfOpenLetsOneProbeThrough",
+	},
+	{
+		Name: "breaker: a failed probe opens it again", File: "internal/dispatch/breaker.go",
+		Old: "\t\tcase Failure:\n\t\t\tb.openedAt = b.now()", New: "\t\tcase Failure:\n\t\t\t_ = b.now()",
+		Package: "./internal/dispatch", Test: "TestBreakerHalfOpenLetsOneProbeThrough",
+	},
+	{
+		Name: "breaker: a refused probe leaves it half-open", File: "internal/dispatch/breaker.go",
+		Old: "\tcase probe && b.probing:\n\t\tb.probing = false", New: "\tcase probe && b.probing:\n\t\tb.probing = l == Nothing",
+		Package: "./internal/dispatch", Test: "TestARefusedProbeLeavesTheBreakerHalfOpen",
+	},
+	{
+		Name: "reaper: batches until a short one", File: "internal/dispatch/reaper.go",
+		Old: "if len(changes) < ReapBatch {", New: "if true {",
+		Package: "./internal/dispatch", Test: "TestTheReaperReturnsExpiredRowsAndPublishesTheirStatus",
+	},
+	{
+		Name: "reaper: publishes each change", File: "internal/dispatch/reaper.go",
+		Old: "r.Events.Publish(ctx, c.ID, c.Status)", New: "_ = c",
+		Package: "./internal/dispatch", Test: "TestTheReaperReturnsExpiredRowsAndPublishesTheirStatus",
+	},
+	{
+		Name: "provider: a connection closed idle is reported", File: "internal/provider/provider.go",
+		Old: "r.ClosedIdle = r.Refusal == nil && closedIdle(err)", New: "r.ClosedIdle = false && closedIdle(err)",
+		Package: "./internal/provider", Test: "TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle",
+	},
+	{
+		Name: "provider: a URL that cannot make a request is refused", File: "internal/provider/provider.go",
+		Old: "err != nil || (u.Scheme != \"http\" && u.Scheme != \"https\") || u.Host == \"\"", New: "err != nil || u == nil",
+		Package: "./internal/provider", Test: "TestNewRefusesAURLThatIsNotAbsoluteHTTP",
+	},
+	{
+		Name: "provider: the correlation id is sent only within its bound", File: "internal/provider/provider.go",
+		Old: "if observability.ValidCorrelationID(m.CorrelationID) {", New: "if observability.ValidCorrelationID(m.CorrelationID) || m.CorrelationID != \"\" {",
+		Package: "./internal/provider", Test: "TestACorrelationIDOutsideItsBoundIsNotSent",
+	},
+	{
+		Name: "worker: a dispatcher runs per channel", File: "cmd/worker/main.go",
+		Old: "running.Go(func() { d.Run(ctx) })", New: "_ = d",
+		Package: "./cmd/worker", Test: "TestTheWorkerDeliversEveryChannel",
+	},
+	{
+		Name: "worker: a reaper runs", File: "cmd/worker/main.go",
+		Old: "running.Go(func() { reaper.Run(ctx) })", New: "_ = reaper",
+		Package: "./cmd/worker", Test: "TestAKilledWorkersRowComesBackThroughTheReaper",
+	},
 }
