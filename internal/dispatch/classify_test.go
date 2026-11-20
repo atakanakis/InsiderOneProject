@@ -15,7 +15,7 @@ import (
 var (
 	errLimiter   = errors.New("rate limit script: OOM command not allowed")
 	errNoPermit  = fmt.Errorf("%w (context deadline exceeded)", ratelimit.ErrNoPermitInTime)
-	errTransport = errors.New(`Post "http://provider/send": dial tcp: connection refused`)
+	errTransport = errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
 )
 
 func responded(code int) provider.Result {

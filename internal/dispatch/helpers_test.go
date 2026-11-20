@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"io"
 	"log/slog"
 	"slices"
 	"sync"
@@ -445,5 +444,3 @@ func everyClaimReachedFinish(t testing.TB, pool *pgxpool.Pool) {
 		t.Errorf("%d claims, %d attempt rows written by Finish, %d leases expired: a claimed row did not reach Finish", claims, finished, expired)
 	}
 }
-
-var discardLog = slog.New(slog.NewTextHandler(io.Discard, nil))
