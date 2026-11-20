@@ -584,4 +584,102 @@ var guards = []Guard{
 		Old: "if margin <= 0 {", New: "if margin < 0 {",
 		Package: "./internal/ratelimit", Test: "TestNewRefusesALimitBelowOneAndAMarginThatIsNotPositive",
 	},
+
+	// Session 4: the provider client and the send gate of architecture §7 (I8, A1, A2, A4, I1 at
+	// the provider's side), and the bounds on what it reads from a response (§8).
+	{
+		Name: "provider: the gate runs when the connection is ready", File: "internal/provider/provider.go",
+		Old: "GotConn: onConn}", New: "GetConn: func(string) { onConn(httptrace.GotConnInfo{}) }}",
+		Package: "./internal/provider", Test: "TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite",
+	},
+	{
+		Name: "provider: the gate runs when the connection is ready (A4)", File: "internal/provider/provider.go",
+		Old: "GotConn: onConn}", New: "GetConn: func(string) { onConn(httptrace.GotConnInfo{}) }}",
+		Package: "./internal/provider", Test: "TestPermitToArrivalStaysWithinTheMargin",
+	},
+	{
+		Name: "provider: the gate runs before the write", File: "internal/provider/provider.go",
+		Old: "GotConn: onConn}", New: "WroteRequest: func(httptrace.WroteRequestInfo) { onConn(httptrace.GotConnInfo{}) }}",
+		Package: "./internal/provider", Test: "TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite",
+	},
+	{
+		Name: "provider: every send passes the gate (I1)", File: "internal/provider/provider.go",
+		Old: "if err := gate(gateCtx); err != nil {", New: "if err := gateCtx.Err(); err != nil {",
+		Package: "./internal/provider", Test: "TestTheProviderReceivesAtMostTheLimitInAnyWindow",
+	},
+	{
+		Name: "provider: a refused send is not sent (A1)", File: "internal/provider/provider.go",
+		Old: "if err := gate(gateCtx); err != nil {", New: "if err := gate(gateCtx); err != nil && false {",
+		Package: "./internal/provider", Test: "TestARefusedSendNeverReachesTheProvider",
+	},
+	{
+		Name: "provider: a refused send's connection is closed in the hook", File: "internal/provider/provider.go",
+		Old: "_ = info.Conn.Close() //", New: "_ = info.Conn //",
+		Package: "./internal/provider", Test: "TestARefusedSendsConnectionIsClosedBeforeTheTransportGoesOn",
+	},
+	{
+		Name: "provider: the Result says why the gate refused", File: "internal/provider/provider.go",
+		Old: "r.Refusal = err", New: "_ = err",
+		Package: "./internal/provider", Test: "TestTheResultCarriesWhatWasObserved",
+	},
+	{
+		Name: "provider: no replay on a dead connection (A2)", File: "internal/provider/provider.go",
+		Old: "req.GetBody = nil //", New: "_ = req.GetBody //",
+		Package: "./internal/provider", Test: "TestADeadReusedConnectionIsNotReplayed",
+	},
+	{
+		Name: "provider: redirects are not followed", File: "internal/provider/provider.go",
+		Old: "CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },", New: "CheckRedirect: nil,",
+		Package: "./internal/provider", Test: "TestRedirectsAreNotFollowed",
+	},
+	{
+		Name: "provider: HTTP/1.1 only", File: "internal/provider/provider.go",
+		Old: "protocols.SetHTTP1(true)", New: "protocols.SetHTTP1(true); protocols.SetHTTP2(true)",
+		Package: "./internal/provider", Test: "TestTheClientSpeaksHTTP11ToAServerThatOffersHTTP2",
+	},
+	{
+		Name: "provider: one deadline per send", File: "internal/provider/provider.go",
+		Old: "ctx, cancel := context.WithTimeout(ctx, c.sendTimeout)", New: "ctx, cancel := context.WithCancel(ctx)",
+		Package: "./internal/provider", Test: "TestOneDeadlineCoversConnectGateWriteAndResponse",
+	},
+	{
+		Name: "provider: the gate waits within the send's deadline", File: "internal/provider/provider.go",
+		Old: "gateCtx, gateCancel := context.WithTimeout(ctx, c.gateBudget)", New: "gateCtx, gateCancel := context.WithTimeout(context.Background(), c.gateBudget)",
+		Package: "./internal/provider", Test: "TestAGateThatWaitsPastTheDeadlineTakesNoPermit",
+	},
+	{
+		Name: "provider: the TLS handshake has its own timeout", File: "internal/provider/provider.go",
+		Old: "TLSHandshakeTimeout:    o.TLSHandshakeTimeout,", New: "TLSHandshakeTimeout:    0,",
+		Package: "./internal/provider", Test: "TestTheTLSHandshakeHasItsOwnTimeout",
+	},
+	{
+		Name: "provider: an idle connection for every slot", File: "internal/provider/provider.go",
+		Old: "MaxIdleConnsPerHost:    o.IdleConns,", New: "MaxIdleConnsPerHost:    0,",
+		Package: "./internal/provider", Test: "TestTheClientKeepsAnIdleConnectionForEverySlot",
+	},
+	{
+		Name: "provider: idle connections are dropped after the timeout", File: "internal/provider/provider.go",
+		Old: "IdleConnTimeout:        o.IdleConnTimeout,", New: "IdleConnTimeout:        0,",
+		Package: "./internal/provider", Test: "TestIdleConnectionsAreDroppedAfterTheIdleTimeout",
+	},
+	{
+		Name: "provider: response headers are bounded", File: "internal/provider/provider.go",
+		Old: "MaxResponseHeaderBytes: MaxResponseHeaderBytes,", New: "MaxResponseHeaderBytes: 0,",
+		Package: "./internal/provider", Test: "TestResponseHeadersOverTheBoundAreNotAResponse",
+	},
+	{
+		Name: "provider: the response body is read up to its bound", File: "internal/provider/provider.go",
+		Old: "io.LimitReader(resp.Body, MaxResponseBody)", New: "io.LimitReader(resp.Body, 1<<62)",
+		Package: "./internal/provider", Test: "TestTheResponseBodyIsReadUpToItsBound",
+	},
+	{
+		Name: "provider: Retry-After is capped", File: "internal/provider/provider.go",
+		Old: "err == nil && secs > int64(MaxRetryAfter/time.Second):", New: "false:",
+		Package: "./internal/provider", Test: "TestTheResultCarriesWhatWasObserved",
+	},
+	{
+		Name: "provider: the notification id is the Idempotency-Key", File: "internal/provider/provider.go",
+		Old: "req.Header.Set(\"Idempotency-Key\", m.ID.String())", New: "_ = m.ID.String()",
+		Package: "./internal/provider", Test: "TestTheRequestHasTheAssignmentsFormat",
+	},
 }
