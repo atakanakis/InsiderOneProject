@@ -261,7 +261,12 @@ every queue write is simpler than a list of exceptions, and both are one short s
 
 **Known behaviours.**
 - If the reply to a claim is lost after the statement committed (a dropped connection), the
-  rows stay `processing` until the lease ends, and that claim still counts as an attempt.
+  rows stay `processing` until the lease ends, and that claim still counts as an attempt. The
+  same happens when Postgres stalls for longer than the queue's own timeout (10 s): the worker
+  stops waiting, and the statement commits when Postgres resumes. Session 5's reviewer paused
+  Postgres for 20 s: 40 rows stayed `processing` for their 60 s lease, each with one attempt
+  spent, and were then reaped and delivered (session 5's review, F7). Nothing is lost; the
+  delay is one lease.
 - Rows that left the queue leave dead entries at the head of the claim index until vacuum
   removes them. The review measured the cost: after 500,000 processed rows under a
   long-running transaction a claim took 12 to 14 ms, where it normally takes under 1 ms. Every
@@ -384,9 +389,16 @@ probe can be forgotten.
      provider's keep-alive ran out (section 7, the connection pool). Go reports this case
      with its own error, "http: server closed idle connection" (`transport.go` line 1090,
      set when the read loop sees the connection end while no request is on it, line 2660).
-     The provider client reports it as `Result.ClosedIdle`. Nothing reached the provider, so
-     nothing is learned about its health: retry soon, and the breaker learns nothing. A
-     provider that is really down also fails new connections, and those count. The attempt
+     The provider client reports it as `Result.ClosedIdle`, **only on a reused connection**.
+     Nothing reached the provider, so nothing is learned about its health: retry soon, and
+     the breaker learns nothing. A provider that is really down also fails new connections,
+     and those count. Go gives the same error when a *new* connection is closed before the
+     request is written: an address that accepts connections and closes them (a published
+     port with nothing behind it, a load balancer with no backend, a provider at its
+     connection limit). That is a broken channel, and it is case 1. Until session 5's review
+     the client set `ClosedIdle` on new connections too, and such an address drained the
+     whole queue into `failed` with the breaker closed (review F1;
+     TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle). The attempt
      is spent, as for every refusal (rule 4); how often this happens is bounded by the
      relation of section 13 and counted by a metric in session 7.
   3. *The request was never made,* because it could not be built. This case is removed
@@ -437,8 +449,10 @@ TestARefusedProbeLeavesTheBreakerHalfOpen).
 
 - `room` reads the four limits cheapest first and stops at the first 0, so an open breaker
   or a full worker does not ask Redis. An error from `Available` (Redis unreachable, a worker
-  with other settings) is room 0, logged. The read uses the loop's context with no shorter
-  deadline: against an unreachable Redis it takes about 3.5 s (session 3), the loop claims
+  with other settings, a Redis that refuses writes) is room 0, logged. The read uses the
+  loop's context with no shorter deadline: against an unreachable Redis it takes about 3.5 s
+  (session 3), against a Redis that accepts connections and does not answer (paused) about
+  20 s, go-redis's read timeout and its retries (session 5's review, F4). The loop claims
   nothing meanwhile, and the rows in flight run on their own goroutines, so nothing else
   waits for it (TestNoRowIsClaimedWhileTheWindowIsFull, TestAnUnavailableRateLimitClaimsNothing).
 - Slots and the waiting mark are the dispatcher's own: a channel's dispatcher has at most
@@ -446,15 +460,35 @@ TestARefusedProbeLeavesTheBreakerHalfOpen).
 - `handle` runs on a context that keeps the loop's values and ignores its cancellation
   (`context.WithoutCancel`), so a shutdown cancels neither the send nor the result write. The
   context carries the correlation id, so every log line about the row has it.
-- The provider client is `*provider.Client`, not an interface: the dispatcher cannot be given
-  a provider that skips the send gate (rule 9). The queue and the limiter are interfaces,
-  so that tests can wrap the real ones to inject stalls and failures and to stamp permits.
+- The dispatcher builds its own provider client from `provider.Options`; it is not given one.
+  So no dispatcher can be given a provider that skips the send gate (rule 9), and no two
+  dispatchers share a connection pool: section 7 keeps one idle connection per slot, and the
+  first worker shared one client of 50 idle connections among three dispatchers of 50 slots
+  each, which made 993 connections for 2,362 requests to a slow provider (session 5's review,
+  F5). The queue and the limiter are interfaces, so that tests can wrap the real ones to
+  inject stalls and failures and to stamp permits.
 - Status events go through a narrow `events.Publisher` interface; session 5 uses one that
   drops them, session 7 the Redis one.
 
 The open time is longer than the longest possible send, so no result from before the breaker
 opened can arrive while it is probing. While the breaker is open, an outage uses attempts only
 through probes: one row per open period per worker.
+
+**What the breaker protects, and what it does not** (session 5's review, F2 and F6). The
+breaker is each worker's, and it counts failures in a row. So a broken channel (a wrong URL, an
+expired credential) costs, per worker, the five failures that open the breaker plus the rows
+already in flight, and then one attempt per open period. With a backlog, that is a small part
+of it: TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue runs two workers through
+two open periods and no row fails. With little traffic it is not: a row has 6 attempts, and
+with two workers the breakers need ten failures between them, so a few rows that trickle in
+can use all their attempts and end `failed` before both breakers are open (the reviewer: 6 of 6
+rows over 255 s). They are not lost: `failed` is the dead-letter state, and `POST /retry`
+(session 6) requeues them once the configuration is fixed. A breaker shared by all workers
+would cut the cost to five failures in all; it is left out (section 16). A provider that fails
+about half of its requests opens a breaker often, because five failures in a row are common
+among 50 sends at once; the reviewer measured 749 of 900 sent after 400 s with 50% 503s and
+10% 429s, and strict priority kept the low-priority rows waiting meanwhile. That is the
+intended reading: such a provider is unhealthy.
 
 **A lost result write.** If writing the result fails after a send, the write is retried with
 backoff until the database answers: either the result is stored, or the row is no longer this
@@ -586,7 +620,10 @@ that hangs needs an address that drops packets, which a test on one machine cann
   response arrived; the duration. It holds no verdict.
 - `New` refuses a URL that is not an absolute `http` or `https` URL with a host, and `Send`
   sets `X-Correlation-ID` only when the id is within its bound (section 8), so no message can
-  make a request that cannot be built (section 6, "no response" case 3; session 5). What it means for the row is
+  make a request that cannot be built (section 6, "no response" case 3; session 5).
+- The provider URL can hold a secret (a webhook.site path, credentials). It is never logged:
+  `New`'s error does not quote it, and the worker logs only its scheme and host (session 5's
+  review, a nit; TestTheWorkerLogsOnlyTheProvidersHost). What it means for the row is
   decided by `Classify` (section 6), in session 5 (TestTheResultCarriesWhatWasObserved).
 - No proxy: a send goes straight to the provider, as it does in every measurement here.
 - **Bounds.** The client reads at most 64 KiB of response headers (Go's default is 10 MiB,
@@ -611,16 +648,19 @@ client's own doing, not the provider's failure; the third relation below states 
 decides how `Classify` counts it, and session 7 counts it in a metric.
 
 The limiter **fails closed**: when a permit cannot be taken, nothing is sent. When Redis is
-unreachable `Available()` fails too, so nothing is even claimed. When only the permit script
-fails (a read-only replica after a failover, Redis out of memory), sends are refused, and
-those refusals open the breaker.
+unreachable `Available()` fails too, so nothing is even claimed. When Redis refuses writes (a
+read-only replica after a failover, Redis out of memory), `Available()` fails as well, so again
+nothing is claimed and no attempt is spent. Until session 5's review `Available` was declared
+read-only so that it kept working in that case, and the breaker was meant to see the refusals
+at the gate; but each refusal spent an attempt, and the reviewer saw rows end `failed` with no
+send (review F2). The half-failure was removed instead of handled.
 
 **The limiter in detail** (`internal/ratelimit`, session 3). One key per channel,
 `ratelimit:<channel>`: a sorted set whose members are permits and whose scores are the Redis
 times at which they were granted, in microseconds. Next to it, `ratelimit:<channel>:settings`
-holds the limit and the window the set was filled with. The scripts use `#!lua` flags and
-`EVAL_RO`, so the limiter needs Redis 7.0 or later; on an older Redis every call fails, which
-fails closed. Compose and the tests run `redis:7-alpine`.
+holds the limit and the window the set was filled with. The scripts use `#!lua` shebangs,
+so the limiter needs Redis 7.0 or later; on an older Redis every call fails, which fails
+closed. Compose and the tests run `redis:7-alpine`.
 
 - **`Wait(ctx, channel)`** runs the take script. The script reads the clock with `TIME`,
   removes the permits that are one window old or older, and grants one permit if fewer than
@@ -642,13 +682,15 @@ fails closed. Compose and the tests run `redis:7-alpine`.
   50 µs of the window and every test passes (session 3's review, F5); the take script's
   bounds are covered by the A6 test, which fails when the bound moves 2 ms.
 - **`Available(ctx, channel)`** returns the number of free permits now. It is a separate
-  script, declared `#!lua flags=no-writes` and run with `EVAL_RO`: it reads `TIME` and counts
-  the permits younger than the window, and Redis itself refuses any write inside it. It
-  changes nothing, and it keeps working when only the take script fails: on a read-only
-  replica after a failover, and when Redis is out of memory (the take script is declared
-  `#!lua` without `allow-oom`, so Redis refuses it before it runs). This is the half-failure
-  that the breaker must see (section 6): `Available` says there is room, `Wait` refuses
-  (TestAvailableChangesNothing, TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails).
+  script: it reads `TIME` and counts the permits younger than the window, and it has no write
+  command, so it changes nothing (TestAvailableChangesNothing). It is declared `#!lua` with no
+  flags, like the take script, so Redis treats it as a script that may write: on a read-only
+  replica it is refused (`READONLY`) and when Redis is out of memory too (`OOM`, no
+  `allow-oom`). So `Available` fails exactly when the take script would, and nothing is
+  claimed (TestAvailableFailsWhenTheTakeScriptWould). Sessions 3 and 4 declared it
+  `flags=no-writes` and ran it with `EVAL_RO`, so that it kept working when only writes failed;
+  session 5's review showed that this half-failure only spent attempts (section 7, "fails
+  closed").
 - **Errors are never permits, and the two kinds of refusal are told apart.** The verdict
   table of section 6 treats "the limiter returned an error" as a failure of the channel and
   "no permit came free within the gate budget" as nothing. When the context ends before a
@@ -826,7 +868,7 @@ client. The test kit does not contain a fake provider that could skip the send g
 | A2 | With `GetBody = nil` the transport never replays a request, so one send is one `GotConn` and at most one write | **Measured** by the design reviewer (one hook call, one request received). **Permanent test** (session 4): TestADeadReusedConnectionIsNotReplayed. The provider closes the kept-alive connection while the send waits at the gate: one gate call, nothing received, an error. With `GetBody` left as Go sets it, the gate ran twice in one send (two permits) and the client saw a 202 for a request whose first write was lost (`go test -count=1 -v -run TestADeadReusedConnectionIsNotReplayed ./internal/provider`, mutation by hand; `make guards` checks it). |
 | A3 | The claim reads the index in order with no sort and no full scan, under a custom plan and under a generic plan, also with many tied `ready_at` values and many rows that are not due yet | **Measured** by the second design reviewer on the final query: 2.8 million rows, 1 million of them future high-priority rows; 0.15 to 0.59 ms under both plans; a claim that finds nothing due reads 3 index pages. **Permanent test** (session 2): TestClaimPlanReadsTheIndexInOrder, on 300,000 rows (50,000 due with one `ready_at`, 200,000 not due, 50,000 finished). Under both plans: one ordered index scan, no sort, no sequential or bitmap scan of the claim index; a claim of 10 reads 4 index pages in 0.13 to 0.31 ms, a claim that finds nothing reads 3 pages in 0.03 ms (`go test -count=1 -v -run TestClaimPlanReadsTheIndexInOrder ./internal/store`). With the rejected `IN (SELECT ...)` form the generic plan is a sequential scan with a hash join, 32.5 ms (the same test, mutation applied by `make guards`). |
 | A4 | The time from permit to arrival at the provider varies by less than the 50 ms margin, on new and on reused connections | **Measured** (session 4) at the recording server on one machine, with the real limiter: TestPermitToArrivalStaysWithinTheMargin. 40 senders for 2 s at the limit of 100 per second over TLS; half use a fresh client per send, whose handshake the server holds back 100 ms, half share one client. The time is from `Wait` returning to the arrival stamp, both on the worker's monotonic clock; Redis's reply to the take script is not inside it. Four runs without the race detector: new connections median 0.15 to 0.42 ms, maximum 2.3 to 9.9 ms; reused, median 0.06 to 0.16 ms, maximum 3.0 to 6.6 ms (`go test -count=4 -v -run TestPermitToArrivalStaysWithinTheMargin ./internal/provider`). With `-race`, six runs: maxima 14 to 41 ms on new and 10 to 29 ms on reused connections (the same with `-race -count=6`): the race detector slows the client and the server on the same CPUs. So the test asserts the margin only without the race detector, which is how `make guards` runs it, in CI too. Session 4's reviewer, with 14 busy processes on 8 CPUs and `-race`, measured 71.7 ms on reused connections: under CPU starvation A4 does not hold, which is the "frozen worker" case of section 7's limits table. Not measured: the network between a worker and a real provider. **Through the dispatchers** (session 5), with a worker's real load (three workers, nine loops, three channels at the limit at once, 1,200 requests): TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers. Without the race detector: median 60 to 70 µs, p99 under 1.1 ms, maximum 0.97 to 2.27 ms (`go test -count=1 -v -run TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers ./internal/dispatch`). With `-race`, three runs: maximum 10.5 to 28.6 ms, none past the margin (the same with `-race -count=3`). CI runs the measurement without the race detector on every push (the test job's last step). **The margin stays 50 ms**: through the dispatchers the program as it ships uses under 5% of it on this machine. The cases that exceed it are a starved CPU (the race detector with other packages' tests on the same CPUs in CI, the reviewer's 71.7 ms), which a larger margin would not bound either; they are the "frozen worker" row of section 7's limits table, and every I1 test checks the guarantee as that row states it. A margin of 100 ms would cost 4.5% of the throughput for no case that was measured. |
-| A5 | With the claim batch rule, the wait at the gate stays near one window plus `10 × W / 100` seconds and nothing is refused, for up to 12 workers; throughput stays near the top speed | Simulated in the design review (93 to 96 sends per second, no refusals, worst wait 2.04 s at 12 workers), with waiters served in order. Session 3's reviewer modelled it with the real limiter, which serves waiters in no order, and every worker keeping 10 rows waiting: worst waits of 3.16 s and 2.12 s at 12 workers, no refusals; refusals from 24 workers (section 6). **Measured** (session 5) on the real dispatchers: TestGateWaitAndThroughputWithManyDispatchers, 1, 3, 6 and 12 dispatchers on one channel, each in its own worker, the defaults of section 13, a provider answering in 20 ms, 12 s each. Without the race detector: 94.1, 94.9, 94.9 and 94.9 sends per second (top speed 95.2); longest wait at the gate 6 ms, 0.98 s, 1.03 s and 1.05 s; median 2 to 10 ms; no refusal (`A5_FULL=1 go test -count=1 -v -run TestGateWaitAndThroughputWithManyDispatchers ./internal/dispatch`). With `-race`: 94.1 to 95.0 sends per second, longest wait 1.09 s, no refusal. The wait is about one window, not `10 × W / 100` seconds, because `Available` stops the claims while the window is full (section 6). Not measured above 12 dispatchers per channel, and not with a provider slower than 20 ms. By default the test runs 1 and 12 dispatchers for 6 s; CI runs all four without the race detector. |
+| A5 | With the claim batch rule, the wait at the gate stays near one window plus `10 × W / 100` seconds and nothing is refused, for up to 12 workers; throughput stays near the top speed | Simulated in the design review (93 to 96 sends per second, no refusals, worst wait 2.04 s at 12 workers), with waiters served in order. Session 3's reviewer modelled it with the real limiter, which serves waiters in no order, and every worker keeping 10 rows waiting: worst waits of 3.16 s and 2.12 s at 12 workers, no refusals; refusals from 24 workers (section 6). **Measured** (session 5) on the real dispatchers: TestGateWaitAndThroughputWithManyDispatchers, 1, 3, 6 and 12 dispatchers on one channel, each in its own worker, a provider answering in 20 ms, 12 s each. The provider client has the defaults of section 13 (send timeout 15 s, gate budget 5 s); the dispatcher has the tests' shorter pauses and open time (`testOptions`: idle pause 50 ms, lease 20 s, open time 3.5 s), which do not change the wait at the gate or the rate (session 5's review, a nit). Without the race detector: 94.1, 94.9, 94.9 and 94.9 sends per second (top speed 95.2); longest wait at the gate 6 ms, 0.98 s, 1.03 s and 1.05 s; median 2 to 10 ms; no refusal (`A5_FULL=1 go test -count=1 -v -run TestGateWaitAndThroughputWithManyDispatchers ./internal/dispatch`). With `-race`: 94.1 to 95.0 sends per second, longest wait 1.09 s, no refusal. The wait is about one window, not `10 × W / 100` seconds, because `Available` stops the claims while the window is full (section 6). Not measured above 12 dispatchers per channel, and not with a provider slower than 20 ms. By default the test runs 1 and 12 dispatchers for 6 s; CI runs all four without the race detector. |
 | A6 | The sliding-window script grants at most the limit per window under concurrent callers | **Permanent test** (session 3): TestNoWindowHoldsMoreThanTheLimit. 200 callers on 4 Redis clients, half waiting in `Wait`, half asking once at random moments, limit 100, margin 50 ms, for 3.3 s: 400 permits, at most 100 in any window of 1,050,000 µs on the permits' own Redis times (`go test -count=1 -v -run TestNoWindowHoldsMoreThanTheLimit ./internal/ratelimit`). With the window's lower bound moved 2 ms early, it fails in 3 of 3 runs. |
 
 ## 13. Timing budget
@@ -945,6 +987,8 @@ and `provider`; all of them depend on `domain`; `domain` depends on nothing.
 | Not done | Why |
 |---|---|
 | Priority aging (a low-priority row can wait as long as higher ones keep arriving) | Strict priority is what the requirement asks for and is easy to reason about. Aging needs real traffic to tune. |
+| A circuit breaker shared by all workers | It needs state in Redis and a second protocol between workers. The per-worker breaker bounds what a broken channel costs per worker; with little traffic rows can still reach `failed`, the dead-letter state, and `/retry` requeues them (section 6, "What the breaker protects"). |
+| A breaker that counts a failure rate | Five failures in a row is simple to reason about; a rate needs a window and a threshold tuned on real traffic. A provider that fails half its requests opens it often, which is the intended reading (section 6). |
 | Pausing the whole channel on one 429 | A provider that throttles a few requests at random would halve throughput. A run of 429s opens the breaker, which covers the sustained case. |
 | Not counting an attempt when nothing was sent | It needs a second counter, or attempts that go down. Both were sources of defects on paper (design review, F2). The rare lost attempt is cheaper. |
 | Expiry of idempotency keys | Needs a retention policy; without one, keeping keys is the safe default |
