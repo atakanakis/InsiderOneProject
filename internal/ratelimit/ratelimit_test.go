@@ -179,8 +179,8 @@ func TestAPermitIsRefusedAtTheLimit(t *testing.T) {
 		t.Fatalf("available after 3 of 3 permits: %d", n)
 	}
 	err := l.Wait(ctxFor(t, 100*time.Millisecond), domain.SMS)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("a fourth permit within the window: err = %v", err)
+	if !errors.Is(err, ErrNoPermitInTime) {
+		t.Fatalf("a fourth permit within the window: err = %v, want ErrNoPermitInTime", err)
 	}
 	if n := len(permits(t, rdb, domain.SMS)); n != 3 {
 		t.Fatalf("%d permits stored, want 3", n)
@@ -221,8 +221,8 @@ func TestWaitStopsWhenItsContextEnds(t *testing.T) {
 	began := time.Now()
 	err := l.Wait(ctxFor(t, 100*time.Millisecond), domain.SMS)
 	took := time.Since(began)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want the context's deadline", err)
+	if !errors.Is(err, ErrNoPermitInTime) {
+		t.Fatalf("err = %v, want ErrNoPermitInTime", err)
 	}
 	if took > 400*time.Millisecond {
 		t.Fatalf("Wait returned %s after its 100 ms deadline", took)
@@ -236,8 +236,8 @@ func TestWaitWithAnEndedContextTakesNoPermit(t *testing.T) {
 	l, rdb := newLimiter(t, 5, 50*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := l.Wait(ctx, domain.SMS); err == nil {
-		t.Fatal("Wait with a cancelled context returned a permit")
+	if err := l.Wait(ctx, domain.SMS); !errors.Is(err, ErrNoPermitInTime) {
+		t.Fatalf("Wait with a cancelled context: err = %v, want ErrNoPermitInTime", err)
 	}
 	if n := len(permits(t, rdb, domain.SMS)); n != 0 {
 		t.Fatalf("%d permits stored, want 0", n)
@@ -274,7 +274,7 @@ func TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails(t *testing.T) {
 			}
 			if err := l.Wait(ctxFor(t, 2*time.Second), domain.SMS); err == nil {
 				t.Fatal("Wait returned a permit while the script fails")
-			} else if errors.Is(err, context.DeadlineExceeded) {
+			} else if errors.Is(err, ErrNoPermitInTime) {
 				t.Fatalf("Wait waited for its deadline instead of returning the script's error: %v", err)
 			}
 			if n := len(permits(t, rdb, domain.SMS)); n != 1 {
@@ -331,8 +331,7 @@ func TestAvailableCountsTheFreePermits(t *testing.T) {
 	if n := mustAvailable(t, l, domain.SMS); n != 3 {
 		t.Fatalf("after 2 permits: Available = %d, want 3", n)
 	}
-	// More permits than the limit (a limit lowered while permits are in the window) is no room,
-	// never a negative number.
+	// More permits than the limit, written here by hand, is no room, never a negative number.
 	now := redisMicros(t, rdb)
 	for i := range 4 {
 		rdb.ZAdd(ctxFor(t, 5*time.Second), key(domain.SMS), redis.Z{Score: float64(now), Member: "extra-" + strconv.Itoa(i)})
@@ -373,14 +372,15 @@ func TestTheWindowHoldsAtMostTheLimitAndExpires(t *testing.T) {
 		t.Fatalf("expiry %s, want between 0 and one window", ttl)
 	}
 	time.Sleep(time.Second + margin + 100*time.Millisecond)
-	if n := rdb.Exists(ctxFor(t, time.Second), key(domain.SMS)).Val(); n != 0 {
-		t.Fatal("the window is still stored one window after its last permit")
+	if n := rdb.Exists(ctxFor(t, time.Second), key(domain.SMS), settingsKey(domain.SMS)).Val(); n != 0 {
+		t.Fatalf("%d of the window's 2 keys are still stored one window after its last permit", n)
 	}
 }
 
-// I12: rate-limit times come from the Redis clock. A permit is stored with the Redis time at
-// which it was granted.
-func TestPermitsAreStampedWithTheRedisClock(t *testing.T) {
+// The time Wait returns is the permit's stored score, taken while the call ran. (Where the
+// test's clock and Redis's are one clock, as on Linux, this cannot tell them apart; I12's
+// test is TestTheLimiterSendsRedisNoClockTime.)
+func TestAPermitIsStoredWithTheTimeItWasGranted(t *testing.T) {
 	l, rdb := newLimiter(t, 5, 50*time.Millisecond)
 	before := redisMicros(t, rdb)
 	at := mustWait(t, l, domain.SMS)
@@ -517,16 +517,93 @@ func TestAnUnreachableRedisIsAnErrorNotAPermit(t *testing.T) {
 	}
 }
 
-func TestNewRefusesALimitBelowOneAndANegativeMargin(t *testing.T) {
+func TestNewRefusesALimitBelowOneAndAMarginThatIsNotPositive(t *testing.T) {
 	for _, c := range []struct {
 		limit  int
 		margin time.Duration
-	}{{0, 0}, {-1, 50 * time.Millisecond}, {100, -time.Millisecond}} {
+	}{{0, 50 * time.Millisecond}, {-1, 50 * time.Millisecond}, {100, 0}, {100, -time.Millisecond}} {
 		if _, err := New(nil, c.limit, c.margin); err == nil {
 			t.Errorf("New(limit %d, margin %s) was accepted", c.limit, c.margin)
 		}
 	}
-	if _, err := New(nil, 1, 0); err != nil {
-		t.Errorf("New(limit 1, margin 0): %v", err)
+	if _, err := New(nil, 1, time.Microsecond); err != nil {
+		t.Errorf("New(limit 1, margin 1µs): %v", err)
+	}
+}
+
+// A Redis that accepts the connection and never answers is the limiter failing, not a wait
+// that ran out: the breaker must learn of it (architecture §6, §7). Both end with the
+// caller's deadline, so only ErrNoPermitInTime tells them apart.
+func TestAHungRedisIsALimiterErrorNotAWaitThatRanOut(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.Close() })
+		}
+	}()
+	rdb, err := redisclient.New("redis://" + ln.Addr().String() + "/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rdb.Close() }()
+	l, err := New(rdb, 100, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	began := time.Now()
+	err = l.Wait(ctxFor(t, 200*time.Millisecond), domain.SMS)
+	if err == nil || errors.Is(err, ErrNoPermitInTime) {
+		t.Fatalf("Wait against a hung Redis: err = %v, want a limiter error", err)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("Wait returned %s after its 200 ms deadline", took)
+	}
+}
+
+// The window is shared by every worker, but the limit and margin are each worker's settings.
+// A worker whose settings differ from the window's is refused by both calls, with an error
+// that is not ErrNoPermitInTime, so it claims nothing and its breaker opens; the window keeps
+// the settings it was filled with (architecture §7).
+func TestWorkersWithDifferentSettingsAreRefused(t *testing.T) {
+	e := testkit.Setup(t)
+	first, err := New(e.Redis, 5, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWait(t, first, domain.SMS)
+	for _, c := range []struct {
+		name   string
+		limit  int
+		margin time.Duration
+		own    domain.Channel // a channel whose window this worker fills itself
+	}{{"another limit", 6, 50 * time.Millisecond, domain.Email}, {"another margin", 5, time.Millisecond, domain.Push}} {
+		other, err := New(e.Redis, c.limit, c.margin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err := other.Available(ctxFor(t, 5*time.Second), domain.SMS); err == nil {
+			t.Errorf("%s: Available = %d, want an error", c.name, n)
+		}
+		if err := other.Wait(ctxFor(t, 2*time.Second), domain.SMS); err == nil || errors.Is(err, ErrNoPermitInTime) {
+			t.Errorf("%s: Wait err = %v, want a limiter error", c.name, err)
+		}
+		// Another channel's window is not this one's.
+		if err := other.Wait(ctxFor(t, 2*time.Second), c.own); err != nil {
+			t.Errorf("%s: Wait on another channel: %v", c.name, err)
+		}
+	}
+	if n := len(permits(t, e.Redis, domain.SMS)); n != 1 {
+		t.Fatalf("%d permits stored, want 1", n)
+	}
+	if n := mustAvailable(t, first, domain.SMS); n != 4 {
+		t.Fatalf("the first worker: Available = %d, want 4", n)
 	}
 }
