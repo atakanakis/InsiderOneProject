@@ -194,7 +194,7 @@ func TestRequestHeadersOverTheBoundAreRefused(t *testing.T) {
 // architecture §8: request headers must arrive within the header timeout (5 s; shortened
 // here). A client that sends them slowly is disconnected.
 func TestSlowRequestHeadersAreCutOff(t *testing.T) {
-	srv := newServer("127.0.0.1:0", handler(&bytes.Buffer{}, ok, ok, time.Second), 300*time.Millisecond)
+	srv := newServer("127.0.0.1:0", handler(&bytes.Buffer{}, ok, ok, time.Second), timeouts{header: 300 * time.Millisecond, request: 30 * time.Second, answer: 30 * time.Second})
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		t.Fatal(err)

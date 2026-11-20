@@ -20,8 +20,12 @@ import (
 // Bounds of architecture §8 on every request.
 const (
 	// MaxHeaderBytes bounds the request line and headers together.
-	MaxHeaderBytes    = 64 << 10
-	HeaderTimeout     = 5 * time.Second
+	MaxHeaderBytes = 64 << 10
+	HeaderTimeout  = 5 * time.Second
+	// RequestTimeout bounds the whole request, body included; AnswerTimeout the writing of
+	// the answer, from the end of the request's headers.
+	RequestTimeout    = 30 * time.Second
+	AnswerTimeout     = 30 * time.Second
 	ReadinessTimeout  = 2 * time.Second
 	correlationHeader = "X-Correlation-ID"
 
@@ -69,14 +73,20 @@ func NewHandler(log *slog.Logger, o Options) http.Handler {
 
 // NewServer returns an HTTP server with the request bounds of architecture §8.
 func NewServer(addr string, h http.Handler) *http.Server {
-	return newServer(addr, h, HeaderTimeout)
+	return newServer(addr, h, timeouts{header: HeaderTimeout, request: RequestTimeout, answer: AnswerTimeout})
 }
 
-func newServer(addr string, h http.Handler, headerTimeout time.Duration) *http.Server {
+// timeouts bound the time a connection can hold the server (architecture §8): the headers,
+// the whole request with its body, and the writing of the answer.
+type timeouts struct {
+	header, request, answer time.Duration
+}
+
+func newServer(addr string, h http.Handler, t timeouts) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           h,
-		ReadHeaderTimeout: headerTimeout,
+		ReadHeaderTimeout: t.header,
 		MaxHeaderBytes:    MaxHeaderBytes - headerSlack,
 		IdleTimeout:       60 * time.Second,
 	}

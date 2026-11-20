@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -860,5 +861,72 @@ func TestAPIKeysAreRequiredWhenConfigured(t *testing.T) {
 	}
 	if r := newAPI(t).get(t, "/v1/notifications"); r.code != http.StatusOK {
 		t.Errorf("no keys configured: %d", r.code)
+	}
+}
+
+// serve runs the real handler behind a server with the given timeouts and returns its
+// address.
+func serve(t *testing.T, e *testkit.Env, to timeouts) string {
+	t.Helper()
+	h := NewHandler(observability.NewLogger(io.Discard, "api", "error"), Options{
+		Health: Health{Postgres: e.Pool.Ping, Redis: ok}, Pool: e.Pool, MaxAttempts: 6,
+	})
+	srv := newServer("127.0.0.1:0", h, to)
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return ln.Addr().String()
+}
+
+// architecture §8: the whole request, body included, must arrive within its timeout (30 s;
+// shortened here). A client that sends the body slowly cannot hold the connection and the
+// handler.
+func TestSlowRequestBodiesAreCutOff(t *testing.T) {
+	e := testkit.Setup(t)
+	addr := serve(t, e, timeouts{header: 5 * time.Second, request: 500 * time.Millisecond, answer: 5 * time.Second})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	// The headers arrive at once; the body promises 100,000 bytes and sends 10.
+	_, _ = fmt.Fprint(conn, "POST /v1/notifications HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{\"content\"")
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	began := time.Now()
+	_, err = io.ReadAll(conn)
+	if took := time.Since(began); took > 2*time.Second {
+		t.Fatalf("connection held for %s by an unfinished body (err %v)", took, err)
+	}
+}
+
+// architecture §8: the answer must be written within its timeout (30 s; shortened here). A
+// client that sends 100 pipelined requests for a 400 KB notification and reads nothing holds
+// 40 MB of answers; the server stops writing and closes the connection.
+func TestAnswersToAClientThatDoesNotReadAreCutOff(t *testing.T) {
+	e := testkit.Setup(t)
+	addr := serve(t, e, timeouts{header: 5 * time.Second, request: 30 * time.Second, answer: 500 * time.Millisecond})
+	a := apiEnv{Env: e, url: "http://" + addr}
+	r := a.post(t, "/v1/notifications", email(strings.Repeat("😀", 100_000)))
+	if r.code != http.StatusCreated {
+		t.Fatalf("%d %.200s", r.code, r.raw)
+	}
+	path := "/v1/notifications/" + r.json(t)["id"].(string)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	const requests = 100
+	_, _ = fmt.Fprint(conn, strings.Repeat("GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n", requests))
+	time.Sleep(2 * time.Second) // the client reads nothing
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, _ := io.Copy(io.Discard, conn)
+	all := int64(requests) * int64(len(r.raw))
+	t.Logf("received %d of %d bytes", n, all)
+	if n > all/2 {
+		t.Errorf("the server kept writing to a client that did not read: %d of %d bytes", n, all)
 	}
 }
