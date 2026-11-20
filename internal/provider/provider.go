@@ -191,7 +191,7 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		r.Err = err
+		r.Err = withoutURL(err)
 		if r.Refusal != nil {
 			r.Err = fmt.Errorf("refused at the send gate: %w", r.Refusal)
 		}
@@ -225,6 +225,17 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 // The error is not exported; TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle
 // fails if Go changes it.
 const serverClosedIdle = "http: server closed idle connection"
+
+// withoutURL drops the URL that Go's *url.Error quotes and keeps the operation and the
+// cause. The URL can hold a secret, and the error is stored, logged and shown by the API
+// (architecture §7; session 6's review, F2).
+func withoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("%s: %w", ue.Op, ue.Err)
+	}
+	return err
+}
 
 func closedIdle(err error) bool {
 	var ue *url.Error
