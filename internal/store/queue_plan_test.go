@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-
 	"github.com/atakanakis/InsiderOneProject/internal/store"
 	"github.com/atakanakis/InsiderOneProject/internal/testkit"
 )
@@ -30,7 +29,7 @@ func (n planNode) walk(f func(planNode)) {
 }
 
 // Assumption A3: the claim reads the claim index in order and stops after n rows: no sort,
-// no full scan, no bitmap scan (which loses the order), under a custom plan and under a
+// no full scan, no bitmap scan of the claim index (which loses the order), under a custom plan and under a
 // generic plan (the plan a cached prepared statement can switch to). The table holds many
 // rows that share one ready_at and many rows that are not due yet, the two cases that could
 // push the planner away from the index. Both claims, one that finds 10 rows among 50,000
@@ -121,8 +120,14 @@ func checkClaimPlan(t *testing.T, name, raw string, wantRows, maxBlocks int) {
 	)
 	out[0].Plan.walk(func(n planNode) {
 		switch n.NodeType {
-		case "Seq Scan", "Sort", "Incremental Sort", "Bitmap Heap Scan", "Bitmap Index Scan", "Hash Join", "Merge Join":
+		case "Seq Scan", "Sort", "Incremental Sort", "Hash Join", "Merge Join":
 			bad = append(bad, n.NodeType)
+		case "Bitmap Index Scan":
+			// A bitmap scan loses the index order. It is right only for the outer update,
+			// which fetches the at most n claimed ids by primary key.
+			if n.IndexName != "notifications_pkey" {
+				bad = append(bad, n.NodeType+" on "+n.IndexName)
+			}
 		case "Index Scan", "Index Only Scan":
 			if n.IndexName == "notifications_claim_idx" {
 				claimScans = append(claimScans, n)
@@ -131,7 +136,6 @@ func checkClaimPlan(t *testing.T, name, raw string, wantRows, maxBlocks int) {
 			updated = n.ActualRows
 		}
 	})
-	t.Logf("%s: %.3f ms", name, out[0].ExecutionTime)
 	if len(bad) > 0 {
 		t.Errorf("%s: the plan has %s:\n%s", name, strings.Join(bad, ", "), indent(raw))
 	}
@@ -139,6 +143,7 @@ func checkClaimPlan(t *testing.T, name, raw string, wantRows, maxBlocks int) {
 		t.Fatalf("%s: the plan reads notifications_claim_idx %d times, want once:\n%s", name, len(claimScans), indent(raw))
 	}
 	scan := claimScans[0]
+	t.Logf("%s: %.3f ms, %d pages of the claim index read", name, out[0].ExecutionTime, scan.SharedHit+scan.SharedRead)
 	if blocks := scan.SharedHit + scan.SharedRead; blocks > maxBlocks {
 		t.Errorf("%s: the index scan touched %d pages, want at most %d", name, blocks, maxBlocks)
 	}

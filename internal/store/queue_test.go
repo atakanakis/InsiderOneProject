@@ -462,8 +462,10 @@ func TestFinishOnARowThatIsNoLongerProcessingChangesNothing(t *testing.T) {
 		t.Errorf("reaped row after a late result: %+v, want pending with 1 attempt", s)
 	}
 
-	final := addRow(t, e.Pool, waiting(-time.Second))
-	c := claim(t, q, domain.SMS, domain.High, 1, hour)
+	r := waiting(-time.Second)
+	r.priority = domain.Normal
+	final := addRow(t, e.Pool, r)
+	c := claim(t, q, domain.SMS, domain.Normal, 1, hour)
 	failed := store.Result{Status: domain.Failed, Outcome: "rejected", StatusCode: 400, Error: "bad recipient"}
 	if status, changed, err := q.Finish(ctx(t), final, c[0].Attempt, failed); err != nil || !changed || status != domain.Failed {
 		t.Fatalf("first result: %s, %v, %v", status, changed, err)
@@ -863,7 +865,7 @@ func TestAttemptsNeverGoDown(t *testing.T) {
 	q := store.NewQueue(e.Pool)
 	rng := rand.New(rand.NewPCG(2, 2026))
 	var rows []uuid.UUID
-	for range 4 {
+	for range 6 {
 		rows = append(rows, addRow(t, e.Pool, row{status: domain.Pending, maxAttempts: 3}))
 	}
 	last := map[uuid.UUID]int{}
@@ -872,13 +874,13 @@ func TestAttemptsNeverGoDown(t *testing.T) {
 		{Status: domain.Retrying, Outcome: "server error", StatusCode: 503}, // due again at once
 	}
 	held := map[uuid.UUID]int{} // attempt numbers handed out, by row
-	for step := range 400 {
+	for step := range 600 {
 		id := rows[rng.IntN(len(rows))]
 		switch op := rng.IntN(6); op {
 		case 0, 1:
-			lease := hour
-			if rng.IntN(2) == 0 {
-				lease = time.Microsecond
+			lease := time.Microsecond // lost at once: the reaper returns it
+			if rng.IntN(4) == 0 {
+				lease = hour
 			}
 			for _, c := range claim(t, q, domain.SMS, domain.High, rng.IntN(3)+1, lease) {
 				if c.Attempt != last[c.ID]+1 {
@@ -905,7 +907,7 @@ func TestAttemptsNeverGoDown(t *testing.T) {
 				t.Fatalf("step %d: requeue: %v", step, err)
 			}
 		case 5:
-			if rng.IntN(10) == 0 {
+			if rng.IntN(20) == 0 {
 				if _, err := q.Cancel(ctx(t), id); err != nil && !errors.Is(err, store.ErrWrongStatus) {
 					t.Fatalf("step %d: cancel: %v", step, err)
 				}
