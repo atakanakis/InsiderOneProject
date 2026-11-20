@@ -45,7 +45,7 @@ type Options struct {
 }
 
 // Dispatcher serves one channel.
-type Dispatcher struct{}
+type Dispatcher struct{ breaker *Breaker }
 
 // New returns a dispatcher.
 func New(o Options, q Queue, l Limiter, c *provider.Client) (*Dispatcher, error) {

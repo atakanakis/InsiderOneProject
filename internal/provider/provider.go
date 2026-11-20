@@ -68,6 +68,10 @@ type Result struct {
 	Refusal error
 	// ConnReused is true when the send ran on a kept-alive connection.
 	ConnReused bool
+	// ClosedIdle is true when no response arrived because the provider closed the kept-alive
+	// connection before the request was written on it: Go's "server closed idle connection".
+	// Nothing reached the provider (architecture §6, "no response" case 2).
+	ClosedIdle bool
 
 	// Err is why no response arrived (connect, timeout, reset, refusal), or, when Responded
 	// is true, an error while reading the body.

@@ -876,3 +876,76 @@ func TestPermitToArrivalStaysWithinTheMargin(t *testing.T) {
 		}
 	}
 }
+
+// Architecture §6, "no response" case 2: when the provider closes a kept-alive connection
+// while the send waits at the gate, nothing was written and the Result says so. A provider
+// that closes the connection after the request arrived is an ordinary "no response".
+func TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle(t *testing.T) {
+	var closeAfterRequest atomic.Bool
+	srv := testkit.Recorder(t, recorder.Options{Respond: func(recorder.Request) recorder.Response {
+		return recorder.Response{Close: closeAfterRequest.Load()}
+	}})
+	c := newClient(t, testOptions(srv.URL))
+	if r := c.Send(bg(t), message(domain.SMS), allow); !r.Responded || r.ClosedIdle {
+		t.Fatalf("the first send: %+v", r)
+	}
+	r := c.Send(bg(t), message(domain.SMS), func(context.Context) error {
+		for deadline := time.Now().Add(2 * time.Second); srv.CloseIdle() == 0 && time.Now().Before(deadline); {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond) // the close reaches the client
+		return nil
+	})
+	if r.Responded || !r.ConnReused || !r.ClosedIdle {
+		t.Errorf("a kept-alive connection closed at the gate: %+v, want no response, reused, ClosedIdle", r)
+	}
+	closeAfterRequest.Store(true)
+	for _, reused := range []bool{false, true} {
+		if !reused {
+			c.CloseIdleConnections()
+		}
+		r := c.Send(bg(t), message(domain.SMS), allow)
+		if r.Responded || r.ClosedIdle || r.Err == nil {
+			t.Errorf("closed after the request arrived (reused %v): %+v, want no response and not ClosedIdle", reused, r)
+		}
+	}
+}
+
+// Architecture §6, "no response" case 3, removed: the URL is the same for every message, so a
+// URL that cannot make a request is refused when the client is built.
+func TestNewRefusesAURLThatIsNotAbsoluteHTTP(t *testing.T) {
+	for _, u := range []string{"", "localhost:9090/send", "/send", "ftp://provider/send", "http://", "http//provider",
+		"https:///send", "http://provider:port/send", "http://provider/%zz"} {
+		o := testOptions(u)
+		if _, err := New(o); err == nil {
+			t.Errorf("New accepted the URL %q", u)
+		}
+	}
+	for _, u := range []string{"http://provider/send", "https://provider", "http://127.0.0.1:9090/send?x=1"} {
+		if _, err := New(testOptions(u)); err != nil {
+			t.Errorf("New refused the URL %q: %v", u, err)
+		}
+	}
+}
+
+// A correlation id outside its bound (architecture §8) is not sent, so it cannot make the
+// request invalid; the message is delivered without it.
+func TestACorrelationIDOutsideItsBoundIsNotSent(t *testing.T) {
+	srv := testkit.Recorder(t, recorder.Options{})
+	c := newClient(t, testOptions(srv.URL))
+	for _, id := range []string{"line\nbreak", "tab\there", strings.Repeat("a", 65), "spaces are not allowed"} {
+		m := message(domain.SMS)
+		m.CorrelationID = id
+		if r := c.Send(bg(t), m, allow); !r.Responded || r.StatusCode != http.StatusAccepted {
+			t.Errorf("correlation id %q: %+v, want the message delivered", id, r)
+		}
+	}
+	for _, req := range srv.Requests() {
+		if v, ok := req.Header["X-Correlation-Id"]; ok {
+			t.Errorf("the provider received X-Correlation-ID %q", v)
+		}
+	}
+	if srv.Received() != 4 {
+		t.Errorf("the provider received %d requests, want 4", srv.Received())
+	}
+}
