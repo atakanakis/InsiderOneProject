@@ -153,10 +153,8 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 	ctx, cancel := context.WithTimeout(ctx, c.sendTimeout) // the one deadline of the send
 	defer cancel()
 
-	payload, err := json.Marshal(body{To: m.To, Channel: string(m.Channel), Content: m.Content})
-	if err != nil {
-		return Result{Err: fmt.Errorf("provider: encode the request: %w", err)}
-	}
+	// Three strings: Marshal cannot fail (invalid UTF-8 is replaced, not refused).
+	payload, _ := json.Marshal(body{To: m.To, Channel: string(m.Channel), Content: m.Content})
 
 	var r Result
 	// onConn is the send gate. GotConn calls it on this goroutine, inside Do, after the
@@ -194,6 +192,11 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 	defer func() { _ = resp.Body.Close() }()
 	r.Responded, r.StatusCode = true, resp.StatusCode
 	r.RetryAfter = retryAfter(resp.Header.Get("Retry-After"), time.Now())
+	if resp.StatusCode < http.StatusOK {
+		// A 101 hands over the raw connection as the body, and the request's context no
+		// longer closes it: reading it could outlive the deadline. It is closed unread.
+		return r
+	}
 	r.Body, r.Err = io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
 	if r.StatusCode >= 200 && r.StatusCode < 300 {
 		var accepted struct {

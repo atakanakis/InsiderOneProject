@@ -86,17 +86,6 @@ func bg(t testing.TB) context.Context {
 	return ctx
 }
 
-// received counts the recorded requests of one channel.
-func received(srv *recorder.Server, ch domain.Channel) int {
-	n := 0
-	for _, r := range srv.Requests() {
-		if r.Channel == string(ch) {
-			n++
-		}
-	}
-	return n
-}
-
 // The request is the one the assignment describes: POST, a JSON body of exactly "to",
 // "channel" and "content", and the notification id as the Idempotency-Key.
 func TestTheRequestHasTheAssignmentsFormat(t *testing.T) {
@@ -191,15 +180,17 @@ func TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite(t *testing.T) 
 // A1: a send that the gate refuses never reaches the provider, on new connections and on
 // reused ones. Cancelling the request instead let 13 of 40,000 refused requests through in
 // experiment 01. Every refused send of the "reused" half follows an allowed send on the same
-// goroutine, so it usually finds that send's connection idle in the pool. 5,000 per half:
-// each refused send leaves one client port in TIME_WAIT, and macOS has about 16,000.
+// goroutine, so it usually finds that send's connection idle in the pool. 2,500 per half:
+// each refused send leaves one client port in TIME_WAIT for 30 s, and macOS has about
+// 16,000, so two runs in a row must fit too. Every request that reached the recorder counts,
+// whether or not its body could be read.
 func TestARefusedSendNeverReachesTheProvider(t *testing.T) {
-	const perMode, parallel = 5000, 32
+	const perMode, parallel = 2500, 32
 	srv := testkit.Recorder(t, recorder.Options{Lean: true})
 	for _, reuse := range []bool{false, true} {
 		srv.Reset()
 		c := newClient(t, testOptions(srv.URL))
-		var refused, reused, gateCalls, responses atomic.Int64
+		var refused, reused, gateCalls, responses, allowed atomic.Int64
 		var wrong atomic.Value
 		var wg sync.WaitGroup
 		work := make(chan struct{})
@@ -210,6 +201,7 @@ func TestARefusedSendNeverReachesTheProvider(t *testing.T) {
 						if r := c.Send(bg(t), message(domain.SMS), allow); !r.Responded {
 							wrong.Store(fmt.Sprintf("an allowed send got no response: %v", r.Err))
 						}
+						allowed.Add(1)
 					}
 					g := &countingGate{next: refuse}
 					r := c.Send(bg(t), message(domain.Email), g.gate)
@@ -233,7 +225,7 @@ func TestARefusedSendNeverReachesTheProvider(t *testing.T) {
 		wg.Wait()
 		time.Sleep(200 * time.Millisecond) // a request still on its way would arrive by now
 
-		reached := received(srv, domain.Email)
+		reached := srv.Received() - int(allowed.Load())
 		t.Logf("reuse=%v: %d refused, %d of them on reused connections, %d reached the provider",
 			reuse, refused.Load(), reused.Load(), reached)
 		if w := wrong.Load(); w != nil {
@@ -269,7 +261,7 @@ func TestARefusedSendsConnectionIsClosedBeforeTheTransportGoesOn(t *testing.T) {
 		}
 		c := newClient(t, o)
 		for _, warm := range []bool{false, true} {
-			if warm {
+			if warm { // the only send that may reach the provider
 				if r := c.Send(bg(t), message(domain.SMS), allow); !r.Responded {
 					t.Fatalf("tls=%v: an allowed send got no response: %v", useTLS, r.Err)
 				}
@@ -292,7 +284,7 @@ func TestARefusedSendsConnectionIsClosedBeforeTheTransportGoesOn(t *testing.T) {
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		if n := received(srv, domain.Email); n != 0 {
+		if n := srv.Received() - 1; n != 0 {
 			t.Errorf("tls=%v: %d refused sends reached the provider", useTLS, n)
 		}
 	}
@@ -327,7 +319,7 @@ func TestADeadReusedConnectionIsNotReplayed(t *testing.T) {
 	if g.calls.Load() != 1 {
 		t.Errorf("the gate ran %d times in one send, want 1", g.calls.Load())
 	}
-	if n := received(srv, domain.Email); n > 1 {
+	if n := srv.Received() - 1; n > 1 { // the first send's request is the 1
 		t.Errorf("the provider received the send %d times, want at most 1", n)
 	}
 	if r.Responded || r.Err == nil {
@@ -336,7 +328,7 @@ func TestADeadReusedConnectionIsNotReplayed(t *testing.T) {
 	if g.calls.Load() == 1 && !r.ConnReused {
 		t.Error("the send did not run on the kept-alive connection; the test did not test a dead reused connection")
 	}
-	t.Logf("gate calls %d, received %d, error %v", g.calls.Load(), received(srv, domain.Email), r.Err)
+	t.Logf("gate calls %d, received %d, error %v", g.calls.Load(), srv.Received()-1, r.Err)
 }
 
 // Property 5: a redirect is a response like any other. Go's client would follow 301, 302
@@ -381,11 +373,52 @@ func TestTheClientSpeaksHTTP11ToAServerThatOffersHTTP2(t *testing.T) {
 	}
 }
 
-// One deadline covers connecting, the gate, the write and the response. Each part in turn
-// takes longer than the send timeout; Send returns at the deadline with no response.
+// rawProvider is a provider written by hand, for answers the recorder cannot give. For each
+// connection it reads the request's headers, writes reply, keeps the connection open for
+// hold, then closes it. An empty reply means it reads nothing and writes nothing.
+func rawProvider(t *testing.T, reply string, hold time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	t.Cleanup(func() { _ = ln.Close(); wg.Wait() })
+	wg.Go(func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Go(func() {
+				defer func() { _ = conn.Close() }()
+				if reply != "" {
+					buf, seen := make([]byte, 4096), ""
+					for !strings.Contains(seen, "\r\n\r\n") {
+						n, err := conn.Read(buf)
+						if err != nil {
+							return
+						}
+						seen += string(buf[:n])
+					}
+					if _, err := conn.Write([]byte(reply)); err != nil {
+						return
+					}
+				}
+				time.Sleep(hold)
+			})
+		}
+	})
+	return "http://" + ln.Addr().String()
+}
+
+// One deadline covers connecting, the gate, the write and the response, its headers and its
+// body. Each part in turn takes longer than the send timeout; Send returns at the deadline.
+// A 101 Switching Protocols hands the raw connection over as its body, which the deadline
+// no longer covers; the client does not read it (review F2).
 func TestOneDeadlineCoversConnectGateWriteAndResponse(t *testing.T) {
 	const timeout = 500 * time.Millisecond
-	check := func(t *testing.T, o Options, m Message, gate Gate) Result {
+	check := func(t *testing.T, o Options, m Message, gate Gate, wantResponse bool) Result {
 		t.Helper()
 		o.SendTimeout, o.GateBudget, o.TLSHandshakeTimeout = timeout, 5*time.Second, 5*time.Second
 		c := newClient(t, o)
@@ -397,8 +430,8 @@ func TestOneDeadlineCoversConnectGateWriteAndResponse(t *testing.T) {
 		if took < timeout || took > timeout+time.Second {
 			t.Errorf("Send took %v, want the send timeout %v", took, timeout)
 		}
-		if r.Responded || !errors.Is(r.Err, context.DeadlineExceeded) {
-			t.Errorf("result %+v, want no response and the deadline", r)
+		if r.Responded != wantResponse || !errors.Is(r.Err, context.DeadlineExceeded) {
+			t.Errorf("result %+v, want response %v and the deadline", r, wantResponse)
 		}
 		return r
 	}
@@ -406,7 +439,7 @@ func TestOneDeadlineCoversConnectGateWriteAndResponse(t *testing.T) {
 	t.Run("connect", func(t *testing.T) {
 		srv := testkit.Recorder(t, recorder.Options{TLS: true, HandshakeDelay: 3 * time.Second})
 		g := &countingGate{next: allow}
-		check(t, tlsOptions(srv), message(domain.SMS), g.gate)
+		check(t, tlsOptions(srv), message(domain.SMS), g.gate, false)
 		if g.calls.Load() != 0 {
 			t.Errorf("the gate ran on a connection that never became ready")
 		}
@@ -416,50 +449,45 @@ func TestOneDeadlineCoversConnectGateWriteAndResponse(t *testing.T) {
 		r := check(t, testOptions(srv.URL), message(domain.SMS), func(ctx context.Context) error {
 			<-ctx.Done()
 			return ctx.Err()
-		})
+		}, false)
 		if !errors.Is(r.Refusal, context.DeadlineExceeded) || srv.Received() != 0 {
 			t.Errorf("refusal %v, received %d; want the deadline and nothing", r.Refusal, srv.Received())
 		}
 	})
 	t.Run("write", func(t *testing.T) {
-		// A provider that accepts the connection and never reads: the write of a body far
-		// larger than the socket buffers cannot finish.
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		var conns []net.Conn
-		var mu sync.Mutex
-		go func() {
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				mu.Lock()
-				conns = append(conns, conn)
-				mu.Unlock()
-			}
-		}()
-		t.Cleanup(func() {
-			_ = ln.Close()
-			mu.Lock()
-			defer mu.Unlock()
-			for _, c := range conns {
-				_ = c.Close()
-			}
-		})
+		// A provider that never reads: the write of a body far larger than the socket
+		// buffers cannot finish.
 		m := message(domain.Email)
 		m.Content = strings.Repeat("x", 32<<20)
-		check(t, testOptions("http://"+ln.Addr().String()), m, allow)
+		check(t, testOptions(rawProvider(t, "", 3*time.Second)), m, allow, false)
 	})
-	t.Run("response", func(t *testing.T) {
+	t.Run("response headers", func(t *testing.T) {
 		srv := testkit.Recorder(t, recorder.Options{Respond: func(recorder.Request) recorder.Response {
 			return recorder.Response{Delay: 3 * time.Second}
 		}})
-		check(t, testOptions(srv.URL), message(domain.SMS), allow)
+		check(t, testOptions(srv.URL), message(domain.SMS), allow, false)
 		if srv.Received() != 1 {
 			t.Errorf("the provider received %d requests, want 1", srv.Received())
+		}
+	})
+	t.Run("response body", func(t *testing.T) {
+		url := rawProvider(t, "HTTP/1.1 202 Accepted\r\nContent-Length: 100\r\n\r\n{", 3*time.Second)
+		if r := check(t, testOptions(url), message(domain.SMS), allow, true); r.StatusCode != http.StatusAccepted {
+			t.Errorf("status %d, want the 202 whose body never finished", r.StatusCode)
+		}
+	})
+	t.Run("switching protocols", func(t *testing.T) {
+		url := rawProvider(t, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\nConnection: Upgrade\r\n\r\n", 3*time.Second)
+		o := testOptions(url)
+		o.SendTimeout = timeout
+		c := newClient(t, o)
+		began := time.Now()
+		r := c.Send(bg(t), message(domain.SMS), allow)
+		if took := time.Since(began); took > timeout {
+			t.Errorf("Send took %v after a 101, send timeout %v", took, timeout)
+		}
+		if !r.Responded || r.StatusCode != http.StatusSwitchingProtocols || len(r.Body) != 0 {
+			t.Errorf("result %+v, want the response 101 with no body read", r)
 		}
 	})
 }
@@ -593,6 +621,10 @@ func TestTheResultCarriesWhatWasObserved(t *testing.T) {
 	date := time.Now().Add(30 * time.Second).UTC().Format(http.TimeFormat)
 	if r := send(retry(date), allow); r.RetryAfter < 28*time.Second || r.RetryAfter > 30*time.Second {
 		t.Errorf("Retry-After as a date 30 s ahead: %v", r.RetryAfter)
+	}
+	past := time.Now().Add(-30 * time.Second).UTC().Format(http.TimeFormat)
+	if r := send(retry(past), allow); r.RetryAfter != 0 {
+		t.Errorf("Retry-After as a date 30 s ago: %v, want 0", r.RetryAfter)
 	}
 	if r := send(recorder.Response{Close: true}, allow); r.Responded || r.Err == nil || r.Refusal != nil {
 		t.Errorf("a connection closed without an answer: %+v", r)
