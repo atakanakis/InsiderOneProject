@@ -8,10 +8,14 @@
 package redisclient
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/atakanakis/InsiderOneProject/internal/observability"
 )
 
 // New returns a client for a redis:// or rediss:// URL. It does not connect.
@@ -24,5 +28,18 @@ func New(url string) (*redis.Client, error) {
 	return redis.NewClient(opts), nil
 }
 
-// LogTo sends the Redis client's own lines to log. Stub.
-func LogTo(log *slog.Logger) {}
+// LogTo sends the Redis client's own lines to log, at most one per 10 s with the number held
+// back (architecture §10). go-redis writes a plain-text line on every failed dial, to one
+// logger for the whole process, so this is called once, when a command starts.
+func LogTo(log *slog.Logger) {
+	redis.SetLogger(&clientLog{log: log, every: observability.NewEvery(10 * time.Second)})
+}
+
+type clientLog struct {
+	log   *slog.Logger
+	every *observability.Every
+}
+
+func (l *clientLog) Printf(_ context.Context, format string, v ...any) {
+	l.every.Log(context.Background(), l.log, slog.LevelWarn, "redis client", "message", fmt.Sprintf(format, v...))
+}

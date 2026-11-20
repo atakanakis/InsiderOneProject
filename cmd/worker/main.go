@@ -40,6 +40,7 @@ func main() {
 func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	cfg, err := config.Load(getenv)
 	log := observability.NewLogger(out, "worker", cfg.LogLevel)
+	redisclient.LogTo(log) // the Redis client's own lines, as JSON and at most one per 10 s
 	if err != nil {
 		log.Error("configuration", "error", err)
 		return 2

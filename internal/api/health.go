@@ -79,8 +79,10 @@ func NewHandler(log *slog.Logger, o Options) http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_ = writeJSON(w, http.StatusOK, map[string]string{"status": "ok"}) // a map of strings always encodes
 	})
+	failures := map[string]*observability.Every{"postgres": observability.NewEvery(10 * time.Second),
+		"redis": observability.NewEvery(10 * time.Second)}
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		ready(w, r, log, h)
+		ready(w, r, log, h, failures)
 	})
 	register(mux, log, o)
 	return correlate(log, o.Metrics, o.Tracing.Tracer("api"), mux)
@@ -110,10 +112,11 @@ func newServer(addr string, h http.Handler, t timeouts) *http.Server {
 }
 
 // ready runs both checks at once, each bounded by the timeout, and never shows their errors
-// to the caller; the errors are logged. Only Postgres decides readiness: the API writes rows
+// to the caller; the errors are logged, at most once per 10 s per dependency (the platform
+// probes every few seconds). Only Postgres decides readiness: the API writes rows
 // and needs nothing else to accept a request, while Redis carries best-effort status events
 // (architecture §8, §9). Redis is reported for the operator.
-func ready(w http.ResponseWriter, r *http.Request, log *slog.Logger, h Health) {
+func ready(w http.ResponseWriter, r *http.Request, log *slog.Logger, h Health, failures map[string]*observability.Every) {
 	checks := map[string]Check{"postgres": h.Postgres, "redis": h.Redis}
 	result := make(map[string]string, len(checks)+1)
 	var mu sync.Mutex
@@ -125,7 +128,7 @@ func ready(w http.ResponseWriter, r *http.Request, log *slog.Logger, h Health) {
 			state := "ok"
 			if err := check(ctx); err != nil {
 				state = "unreachable"
-				log.WarnContext(r.Context(), "readiness check failed", "dependency", name, "error", err)
+				failures[name].Log(r.Context(), log, slog.LevelWarn, "readiness check failed", "dependency", name, "error", err)
 			}
 			mu.Lock()
 			result[name] = state
