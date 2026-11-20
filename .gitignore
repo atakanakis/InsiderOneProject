@@ -1,0 +1,14 @@
+# Binaries and build output
+/bin/
+*.test
+*.out
+coverage.*
+
+# Local environment
+.env
+.DS_Store
+
+# Editor and agent state
+.idea/
+.vscode/
+.claude/settings.local.json
