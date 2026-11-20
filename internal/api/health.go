@@ -62,7 +62,7 @@ func NewHandler(log *slog.Logger, o Options) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		_ = writeJSON(w, http.StatusOK, map[string]string{"status": "ok"}) // a map of strings always encodes
 	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		ready(w, r, log, h)
@@ -123,7 +123,7 @@ func ready(w http.ResponseWriter, r *http.Request, log *slog.Logger, h Health) {
 		code, status = http.StatusServiceUnavailable, "unavailable"
 	}
 	result["status"] = status
-	writeJSON(w, code, result)
+	_ = writeJSON(w, code, result) // a map of strings always encodes
 }
 
 // correlate accepts the client's X-Correlation-ID when it is within the bound of
@@ -155,8 +155,17 @@ func (s *statusWriter) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
+// writeJSON encodes v before it writes the status, so an answer that cannot be encoded (a
+// time after the year 9999) is a 500 in the error form, never a 2xx without a body. It
+// returns the encoding error for the caller to log.
+func writeJSON(w http.ResponseWriter, code int, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, apiError{Code: "internal", Message: "the answer could not be encoded"})
+		return err
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(append(b, '\n'))
+	return nil
 }

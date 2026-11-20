@@ -12,13 +12,15 @@ import (
 
 // planNode is one node of EXPLAIN (FORMAT JSON).
 type planNode struct {
-	NodeType     string     `json:"Node Type"`
-	IndexName    string     `json:"Index Name"`
-	RelationName string     `json:"Relation Name"`
-	ActualRows   float64    `json:"Actual Rows"`
-	SharedHit    int        `json:"Shared Hit Blocks"`
-	SharedRead   int        `json:"Shared Read Blocks"`
-	Plans        []planNode `json:"Plans"`
+	NodeType     string  `json:"Node Type"`
+	IndexName    string  `json:"Index Name"`
+	RelationName string  `json:"Relation Name"`
+	ActualRows   float64 `json:"Actual Rows"`
+	// RowsRemovedByFilter counts rows the node read and dropped (EXPLAIN ANALYZE).
+	RowsRemovedByFilter float64    `json:"Rows Removed by Filter"`
+	SharedHit           int        `json:"Shared Hit Blocks"`
+	SharedRead          int        `json:"Shared Read Blocks"`
+	Plans               []planNode `json:"Plans"`
 }
 
 func (n planNode) walk(f func(planNode)) {

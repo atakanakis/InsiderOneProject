@@ -23,7 +23,7 @@ const (
 	MaxVariableNameLen     = 64
 	MaxTemplateNameLen     = 64
 	MaxIdempotencyKeyLen   = 128
-	MaxRenderedBytes       = 16 << 20 // the total of one request
+	MaxRenderedBytes       = 8 << 20 // the total of one request: the batch's body bound
 	MaxEmailRecipientBytes = 254
 	MinDeviceTokenLen      = 16
 	MaxDeviceTokenLen      = 256
@@ -90,6 +90,10 @@ type Variables []Variable
 
 // UnmarshalJSON decodes an object of strings and stops at the 51st entry.
 func (v *Variables) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		*v = nil
+		return nil
+	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return ErrBadVariables
@@ -197,7 +201,7 @@ func (c *Compiled) literal(s string) {
 }
 
 // Variables lists the template's distinct variables in the order of their first use.
-func (c *Compiled) Variables() []string { return slices.Clone(c.vars) }
+func (c *Compiled) Variables() []string { return append([]string{}, c.vars...) }
 
 // Measure returns the length the template would render to with vars, in characters and in
 // bytes, without rendering. A variable the template does not use and a placeholder without a
@@ -325,11 +329,10 @@ func Prepare(in Input, field string, lookup Lookup, errs *Errors) Prepared {
 		}
 	}
 	if in.ScheduledAt != "" {
-		t, err := time.Parse(time.RFC3339Nano, in.ScheduledAt)
+		t, err := scheduledAt(in.ScheduledAt)
 		if err != nil {
-			errs.Add(at("scheduledAt"), "must be an RFC 3339 time")
+			errs.Add(at("scheduledAt"), err.Error())
 		} else {
-			t = t.UTC()
 			p.ScheduledAt = &t
 		}
 	}
@@ -386,6 +389,21 @@ func Prepare(in Input, field string, lookup Lookup, errs *Errors) Prepared {
 		errs.Add(at("content"), fmt.Sprintf("is longer than %d characters, the bound of the channel", ContentLimit(p.Channel)))
 	}
 	return p
+}
+
+// scheduledAt reads a time as Postgres stores it: UTC, cut to microseconds. A time from the
+// year 10000 in UTC is refused: Go cannot write it as RFC 3339, so its row could never be
+// answered (architecture §8, "Scheduling").
+func scheduledAt(s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, errors.New("must be an RFC 3339 time")
+	}
+	t = t.UTC().Truncate(time.Microsecond)
+	if t.Year() > 9999 {
+		return time.Time{}, errors.New("must be before the year 10000 in UTC")
+	}
+	return t, nil
 }
 
 func checkRecipient(ch Channel, to string) string {
@@ -447,8 +465,8 @@ func Hash(items ...Input) []byte {
 		}
 		field(priority)
 		at := in.ScheduledAt
-		if t, err := time.Parse(time.RFC3339Nano, at); err == nil {
-			at = t.UTC().Format(time.RFC3339Nano)
+		if t, err := scheduledAt(at); err == nil {
+			at = t.Format(time.RFC3339Nano)
 		}
 		field(at)
 	}
@@ -468,9 +486,10 @@ func ValidIdempotencyKey(s string) bool {
 	return true
 }
 
-var templateName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var templateName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 
-// ValidTemplateName reports whether s is 1 to 64 letters, digits, '_', '-' or '.'.
+// ValidTemplateName reports whether s is 1 to 64 letters, digits, '_', '-' or '.', starting
+// with a letter or digit ("." and ".." are path segments, not names).
 func ValidTemplateName(s string) bool {
 	return len(s) > 0 && len(s) <= MaxTemplateNameLen && templateName.MatchString(s)
 }
@@ -504,4 +523,57 @@ type TemplateInput struct {
 	Name    string `json:"name"`
 	Channel string `json:"channel"`
 	Body    string `json:"body"`
+}
+
+// UnmarshalJSON decodes a template after checking its field names.
+func (t *TemplateInput) UnmarshalJSON(b []byte) error {
+	if err := checkNames(b, "name", "channel", "body"); err != nil {
+		return err
+	}
+	type plain TemplateInput
+	return json.Unmarshal(b, (*plain)(t))
+}
+
+// UnmarshalJSON decodes a notification after checking its field names.
+func (in *Input) UnmarshalJSON(b []byte) error {
+	if err := checkNames(b, "recipient", "channel", "content", "template", "variables",
+		"priority", "scheduledAt", "idempotencyKey"); err != nil {
+		return err
+	}
+	type plain Input
+	return json.Unmarshal(b, (*plain)(in))
+}
+
+// checkNames checks that b is a JSON object whose field names are among allowed, matched
+// exactly, each once. Go's decoder matches names in any case and keeps the last of two, so
+// {"Content": "a", "content": "b"} would be accepted (architecture §8, "Field names").
+func checkNames(b []byte, allowed ...string) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok != json.Delim('{') {
+		return ErrNotAnObject
+	}
+	seen := make(map[string]bool, len(allowed))
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, _ := tok.(string)
+		switch {
+		case !slices.Contains(allowed, name):
+			return &FieldNameError{Name: Echo(name), Message: "is not a known field; names are matched exactly"}
+		case seen[name]:
+			return &FieldNameError{Name: name, Message: "is given twice"}
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+	}
+	return nil
 }

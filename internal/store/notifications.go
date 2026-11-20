@@ -298,6 +298,26 @@ func (s *Notifications) Batch(ctx context.Context, id uuid.UUID) (Batch, error) 
 // List returns one page of summaries (Content and History are empty), ordered
 // created_at DESC, id ASC: the order of the list index (architecture §4).
 func (s *Notifications) List(ctx context.Context, f Filter) ([]Notification, error) {
+	sql, args := listSQL(f)
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Notification, error) {
+		var n Notification
+		var channel, status string
+		err := r.Scan(&n.ID, &n.BatchID, &n.Recipient, &channel, &n.Priority, &status, &n.Attempts, &n.CreatedAt, &n.UpdatedAt)
+		n.Channel, n.Status = domain.Channel(channel), domain.Status(status)
+		return n, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	return list, nil
+}
+
+// listSQL builds the list's statement for a filter.
+func listSQL(f Filter) (string, []any) {
 	var where []string
 	var args []any
 	add := func(cond string, v any) {
@@ -322,7 +342,9 @@ func (s *Notifications) List(ctx context.Context, f Filter) ([]Notification, err
 	if f.After != nil {
 		args = append(args, f.After.CreatedAt, f.After.ID)
 		c, i := len(args)-1, len(args)
-		where = append(where, fmt.Sprintf("(created_at < $%d OR (created_at = $%d AND id > $%d))", c, c, i))
+		// created_at <= c is implied by the OR; it is written so that Postgres uses it as a
+		// bound of the index scan instead of reading the index from its start (§8, "List").
+		where = append(where, fmt.Sprintf("created_at <= $%d AND (created_at < $%d OR (created_at = $%d AND id > $%d))", c, c, c, i))
 	}
 	sql := `SELECT id, batch_id, recipient, channel, priority, status, attempts, created_at, updated_at FROM notifications`
 	if len(where) > 0 {
@@ -330,21 +352,7 @@ func (s *Notifications) List(ctx context.Context, f Filter) ([]Notification, err
 	}
 	args = append(args, f.Limit)
 	sql += fmt.Sprintf(" ORDER BY created_at DESC, id ASC LIMIT $%d", len(args))
-	rows, err := s.pool.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list: %w", err)
-	}
-	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Notification, error) {
-		var n Notification
-		var channel, status string
-		err := r.Scan(&n.ID, &n.BatchID, &n.Recipient, &channel, &n.Priority, &status, &n.Attempts, &n.CreatedAt, &n.UpdatedAt)
-		n.Channel, n.Status = domain.Channel(channel), domain.Status(status)
-		return n, err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list: %w", err)
-	}
-	return list, nil
+	return sql, args
 }
 
 // CreateTemplate stores a template. A template with the same name, channel and body returns

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
@@ -32,6 +33,11 @@ const (
 	DefaultPage       = 50
 	MaxErrorBodyBytes = 64 << 10
 	maxEchoedName     = domain.MaxEchoedName
+	// MaxRenderingRequests is how many requests of one API instance render and store at
+	// once; the others wait, holding only what they sent (architecture §8).
+	MaxRenderingRequests = 4
+	// DatabaseDeadline bounds the database work of one request (architecture §8).
+	DatabaseDeadline = 5 * time.Second
 )
 
 // Options configure the API's handler.
@@ -41,7 +47,8 @@ type Options struct {
 	APIKeys     []string         // empty: no authentication
 	MaxAttempts int              // a new row's max_attempts and the budget of /retry; 0 means 6
 	Events      events.Publisher // nil: events.Discard
-	// DatabaseDeadline bounds the database work of a request; 0 means DatabaseDeadline.
+	// DatabaseDeadline bounds the database work of a request; 0 means the constant
+	// DatabaseDeadline. Tests shorten it.
 	DatabaseDeadline time.Duration
 }
 
@@ -62,6 +69,8 @@ type server struct {
 	keys        [][32]byte
 	maxAttempts int
 	events      events.Publisher
+	deadline    time.Duration
+	rendering   chan struct{} // a slot per request that renders and stores
 }
 
 type route struct {
@@ -108,7 +117,11 @@ func register(mux *http.ServeMux, log *slog.Logger, o Options) {
 	}
 	s := &server{
 		log: log, store: store.NewNotifications(o.Pool, maxAttempts(o)), queue: store.NewQueue(o.Pool),
-		maxAttempts: maxAttempts(o), events: o.Events,
+		maxAttempts: maxAttempts(o), events: o.Events, deadline: o.DatabaseDeadline,
+		rendering: make(chan struct{}, MaxRenderingRequests),
+	}
+	if s.deadline <= 0 {
+		s.deadline = DatabaseDeadline
 	}
 	if s.events == nil {
 		s.events = events.Discard{}
@@ -137,8 +150,9 @@ func (s *server) authenticate(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		given := r.Header.Get("X-API-Key")
-		if auth, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
-			given = auth
+		// The scheme is matched in any case (RFC 9110, section 11.1).
+		if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+			given = auth[7:]
 		}
 		sum := sha256.Sum256([]byte(given))
 		match := 0
@@ -190,6 +204,31 @@ type failure struct {
 	err  apiError
 }
 
+// database is the context of a request's database work: the request's own, with the
+// deadline of architecture §8. Postgres enforces the statement timeout itself, so without a
+// deadline here a stalled Postgres would hold the request until it woke up.
+func (s *server) database(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), s.deadline)
+}
+
+// reply writes an answer and logs one that could not be encoded (writeJSON answered 500).
+func (s *server) reply(w http.ResponseWriter, r *http.Request, code int, v any) {
+	if err := writeJSON(w, code, v); err != nil {
+		s.log.ErrorContext(r.Context(), "answer not encoded", "path", r.URL.Path, "error", err)
+	}
+}
+
+// render waits for one of the MaxRenderingRequests slots. It returns false when the request
+// ended while it waited.
+func (s *server) render(r *http.Request) (release func(), ok bool) {
+	select {
+	case s.rendering <- struct{}{}:
+		return func() { <-s.rendering }, true
+	case <-r.Context().Done():
+		return nil, false
+	}
+}
+
 // internal logs err and answers 500 without showing it.
 func (s *server) internal(w http.ResponseWriter, r *http.Request, err error) {
 	s.log.ErrorContext(r.Context(), "request failed", "path", r.URL.Path, "error", err)
@@ -202,22 +241,27 @@ func decodeFailure(err error, prefix string, limit int64) *failure {
 	var tooLarge *http.MaxBytesError
 	var syntax *json.SyntaxError
 	var typ *json.UnmarshalTypeError
+	var name *domain.FieldNameError
+	at := func(field string) string { return strings.TrimSuffix(prefix+field, ".") }
 	switch {
 	case errors.As(err, &tooLarge):
 		return &failure{http.StatusRequestEntityTooLarge, apiError{Code: "body_too_large",
 			Message: fmt.Sprintf("the body is larger than %d bytes", limit)}}
 	case errors.Is(err, domain.ErrTooManyVariables):
-		return &failure{http.StatusBadRequest, fieldError(prefix+"variables", fmt.Sprintf("at most %d variables", domain.MaxVariables))}
+		return &failure{http.StatusBadRequest, fieldError(at("variables"), fmt.Sprintf("at most %d variables", domain.MaxVariables))}
 	case errors.Is(err, domain.ErrBadVariables):
-		return &failure{http.StatusBadRequest, fieldError(prefix+"variables", "must be an object of strings, each name once")}
+		return &failure{http.StatusBadRequest, fieldError(at("variables"), "must be an object of strings, each name once")}
+	case errors.As(err, &name):
+		return &failure{http.StatusBadRequest, fieldError(at(name.Name), name.Message)}
+	case errors.Is(err, domain.ErrNotAnObject) && prefix == "":
+		return &failure{http.StatusBadRequest, apiError{Code: "invalid_json", Message: "the body must be a JSON object"}}
+	case errors.Is(err, domain.ErrNotAnObject):
+		return &failure{http.StatusBadRequest, fieldError(at(""), "must be a JSON object")}
 	case errors.As(err, &syntax):
 		return &failure{http.StatusBadRequest, apiError{Code: "invalid_json",
 			Message: fmt.Sprintf("the body is not valid JSON (at byte %d)", syntax.Offset)}}
 	case errors.As(err, &typ):
-		return &failure{http.StatusBadRequest, fieldError(prefix+domain.Echo(typ.Field), "has the wrong type")}
-	case strings.HasPrefix(err.Error(), "json: unknown field "):
-		name := strings.Trim(strings.TrimPrefix(err.Error(), "json: unknown field "), `"`)
-		return &failure{http.StatusBadRequest, fieldError(prefix+domain.Echo(name), "is not a known field")}
+		return &failure{http.StatusBadRequest, fieldError(at(domain.Echo(typ.Field)), "has the wrong type")}
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		return &failure{http.StatusBadRequest, apiError{Code: "invalid_json", Message: "the body ends before its JSON value does"}}
 	}
@@ -228,8 +272,7 @@ func decodeFailure(err error, prefix string, limit int64) *failure {
 // (at most the bound) is read and dropped, so the client gets the answer.
 func body(w http.ResponseWriter, r *http.Request, limit int64) (*json.Decoder, func()) {
 	rd := http.MaxBytesReader(w, r.Body, limit)
-	dec := json.NewDecoder(rd)
-	dec.DisallowUnknownFields()
+	dec := json.NewDecoder(rd) // field names are checked by the types themselves (domain.Input)
 	return dec, func() { _, _ = io.Copy(io.Discard, rd) }
 }
 
@@ -323,7 +366,7 @@ func decodeBatch(dec *json.Decoder) ([]domain.Input, *failure) {
 
 // lookup reads the templates the items name in one query, and compiles each on its first
 // use, once per request (architecture §8).
-func (s *server) lookup(r *http.Request, items []domain.Input) (domain.Lookup, error) {
+func (s *server) lookup(ctx context.Context, items []domain.Input) (domain.Lookup, error) {
 	var names []string
 	seen := map[string]bool{}
 	for _, in := range items {
@@ -338,7 +381,7 @@ func (s *server) lookup(r *http.Request, items []domain.Input) (domain.Lookup, e
 	}
 	byName := map[string]*template{}
 	if len(names) > 0 {
-		list, err := s.store.TemplatesNamed(r.Context(), names)
+		list, err := s.store.TemplatesNamed(ctx, names)
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +397,7 @@ func (s *server) lookup(r *http.Request, items []domain.Input) (domain.Lookup, e
 		if t.compiled == nil {
 			c, err := domain.CompileTemplate(t.Body)
 			if err != nil { // a stored body always compiles: it was checked when created
-				s.log.ErrorContext(r.Context(), "stored template does not compile", "template", t.Name, "error", err)
+				s.log.ErrorContext(ctx, "stored template does not compile", "template", t.Name, "error", err)
 				return nil, "", false
 			}
 			t.compiled = c
@@ -371,12 +414,26 @@ func newRow(p domain.Prepared, hash []byte) store.NewNotification {
 }
 
 func (s *server) create(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Idempotency-Key") != "" {
+		_, drain := body(w, r, MaxBodyBytes)
+		drain()
+		writeError(w, http.StatusBadRequest, fieldError("Idempotency-Key",
+			"a single notification takes idempotencyKey in its body; the header is for a batch"))
+		return
+	}
 	var in domain.Input
 	if f := readOne(w, r, MaxBodyBytes, &in); f != nil {
 		writeError(w, f.code, f.err)
 		return
 	}
-	lookup, err := s.lookup(r, []domain.Input{in})
+	release, ok := s.render(r)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx, cancel := s.database(r)
+	defer cancel()
+	lookup, err := s.lookup(ctx, []domain.Input{in})
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -387,7 +444,7 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, validationError(&errs))
 		return
 	}
-	n, created, err := s.store.Create(r.Context(), newRow(p, domain.Hash(in)))
+	n, created, err := s.store.Create(ctx, newRow(p, domain.Hash(in)))
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
 		writeError(w, http.StatusConflict, apiError{Code: "idempotency_conflict",
@@ -397,12 +454,18 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, r, err)
 		return
 	}
-	code := http.StatusOK
+	code := http.StatusCreated
 	if created {
-		code = http.StatusCreated
 		s.events.Publish(r.Context(), n.ID, n.Status)
+	} else {
+		// A repeat answers the stored row as the status endpoint does (architecture §8).
+		code = http.StatusOK
+		if n, err = s.store.Get(ctx, n.ID); err != nil {
+			s.internal(w, r, err)
+			return
+		}
 	}
-	writeJSON(w, code, notificationJSON(n, true))
+	s.reply(w, r, code, notificationJSON(n, true))
 }
 
 func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
@@ -423,7 +486,14 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fieldError("notifications", "a batch has at least one notification"))
 		return
 	}
-	lookup, err := s.lookup(r, items)
+	release, ok := s.render(r)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx, cancel := s.database(r)
+	defer cancel()
+	lookup, err := s.lookup(ctx, items)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -454,7 +524,7 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 	for i, p := range prepared {
 		b.Items[i] = newRow(p, nil)
 	}
-	id, n, created, err := s.store.CreateBatch(r.Context(), b)
+	id, n, created, err := s.store.CreateBatch(ctx, b)
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
 		writeError(w, http.StatusConflict, apiError{Code: "idempotency_conflict",
@@ -475,7 +545,7 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 			s.events.Publish(r.Context(), id, initialStatus(prepared[i]))
 		}
 	}
-	writeJSON(w, code, map[string]any{"batchId": id, "total": n, "ids": ids})
+	s.reply(w, r, code, map[string]any{"batchId": id, "total": n, "ids": ids})
 }
 
 // initialStatus is the status the insert gave a batch item. The insert decided it on the
@@ -506,14 +576,16 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	n, err := s.store.Get(r.Context(), id)
+	ctx, cancel := s.database(r)
+	defer cancel()
+	n, err := s.store.Get(ctx, id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		notFound(w, "notification")
 	case err != nil:
 		s.internal(w, r, err)
 	default:
-		writeJSON(w, http.StatusOK, notificationJSON(n, true))
+		s.reply(w, r, http.StatusOK, notificationJSON(n, true))
 	}
 }
 
@@ -522,14 +594,16 @@ func (s *server) batch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	b, err := s.store.Batch(r.Context(), id)
+	ctx, cancel := s.database(r)
+	defer cancel()
+	b, err := s.store.Batch(ctx, id)
 	switch {
 	case errors.Is(err, store.ErrBatchNotFound):
 		notFound(w, "batch")
 	case err != nil:
 		s.internal(w, r, err)
 	default:
-		writeJSON(w, http.StatusOK, map[string]any{"id": b.ID, "total": b.Total, "createdAt": b.CreatedAt, "counts": b.Counts})
+		s.reply(w, r, http.StatusOK, map[string]any{"id": b.ID, "total": b.Total, "createdAt": b.CreatedAt, "counts": b.Counts})
 	}
 }
 
@@ -608,7 +682,9 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, validationError(&errs))
 		return
 	}
-	list, err := s.store.List(r.Context(), f)
+	ctx, cancel := s.database(r)
+	defer cancel()
+	list, err := s.store.List(ctx, f)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -623,7 +699,7 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		last := list[len(list)-1]
 		out["nextCursor"] = encodeCursor(store.Cursor{CreatedAt: last.CreatedAt, ID: last.ID})
 	}
-	writeJSON(w, http.StatusOK, out)
+	s.reply(w, r, http.StatusOK, out)
 }
 
 // change answers a cancel or a retry.
@@ -643,7 +719,7 @@ func (s *server) change(w http.ResponseWriter, r *http.Request, op func(uuid.UUI
 		s.internal(w, r, err)
 	default:
 		s.events.Publish(r.Context(), id, st)
-		writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": st})
+		s.reply(w, r, http.StatusOK, map[string]any{"id": id, "status": st})
 	}
 }
 
@@ -670,11 +746,7 @@ func templateJSON(t store.StoredTemplate, withBody bool) map[string]any {
 }
 
 func (s *server) createTemplate(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Name    string `json:"name"`
-		Channel string `json:"channel"`
-		Body    string `json:"body"`
-	}
+	var in domain.TemplateInput
 	if f := readOne(w, r, MaxBodyBytes, &in); f != nil {
 		writeError(w, f.code, f.err)
 		return
@@ -685,7 +757,9 @@ func (s *server) createTemplate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, validationError(&errs))
 		return
 	}
-	st, created, err := s.store.CreateTemplate(r.Context(), t)
+	ctx, cancel := s.database(r)
+	defer cancel()
+	st, created, err := s.store.CreateTemplate(ctx, t)
 	switch {
 	case errors.Is(err, store.ErrTemplateExists):
 		writeError(w, http.StatusConflict, apiError{Code: "template_exists",
@@ -693,9 +767,9 @@ func (s *server) createTemplate(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.internal(w, r, err)
 	case created:
-		writeJSON(w, http.StatusCreated, templateJSON(st, true))
+		s.reply(w, r, http.StatusCreated, templateJSON(st, true))
 	default:
-		writeJSON(w, http.StatusOK, templateJSON(st, true))
+		s.reply(w, r, http.StatusOK, templateJSON(st, true))
 	}
 }
 
@@ -709,7 +783,9 @@ func (s *server) templates(w http.ResponseWriter, r *http.Request) {
 		}
 		after = string(b)
 	}
-	list, err := s.store.Templates(r.Context(), after, MaxPage)
+	ctx, cancel := s.database(r)
+	defer cancel()
+	list, err := s.store.Templates(ctx, after, MaxPage)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -722,7 +798,7 @@ func (s *server) templates(w http.ResponseWriter, r *http.Request) {
 	if len(list) == MaxPage {
 		out["nextCursor"] = base64.RawURLEncoding.EncodeToString([]byte(list[len(list)-1].Name))
 	}
-	writeJSON(w, http.StatusOK, out)
+	s.reply(w, r, http.StatusOK, out)
 }
 
 func (s *server) template(w http.ResponseWriter, r *http.Request) {
@@ -731,14 +807,16 @@ func (s *server) template(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: "no template has this name"})
 		return
 	}
-	t, err := s.store.Template(r.Context(), name)
+	ctx, cancel := s.database(r)
+	defer cancel()
+	t, err := s.store.Template(ctx, name)
 	switch {
 	case errors.Is(err, store.ErrTemplateNotFound):
 		writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: "no template has this name"})
 	case err != nil:
 		s.internal(w, r, err)
 	default:
-		writeJSON(w, http.StatusOK, templateJSON(t, true))
+		s.reply(w, r, http.StatusOK, templateJSON(t, true))
 	}
 }
 

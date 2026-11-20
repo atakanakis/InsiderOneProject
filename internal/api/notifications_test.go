@@ -47,6 +47,14 @@ func (r *recordedEvents) of(id uuid.UUID) []domain.Status {
 	return r.seen[id]
 }
 
+// testLog writes the API's log lines to the test's log, shown when the test fails.
+type testLog struct{ t *testing.T }
+
+func (l testLog) Write(p []byte) (int, error) {
+	l.t.Log(strings.TrimSpace(string(p)))
+	return len(p), nil
+}
+
 type apiEnv struct {
 	*testkit.Env
 	url    string
@@ -55,14 +63,17 @@ type apiEnv struct {
 
 func newAPI(t *testing.T, keys ...string) apiEnv {
 	t.Helper()
+	return newAPIWith(t, Options{APIKeys: keys})
+}
+
+// newAPIWith is newAPI with options; the health checks, the pool, MAX_ATTEMPTS and the
+// events are the test's.
+func newAPIWith(t *testing.T, o Options) apiEnv {
+	t.Helper()
 	e := testkit.Setup(t)
 	ev := &recordedEvents{}
-	h := NewHandler(observability.NewLogger(io.Discard, "api", "error"), Options{
-		Health:  Health{Postgres: e.Pool.Ping, Redis: ok},
-		Pool:    e.Pool,
-		APIKeys: keys, MaxAttempts: 6, Events: ev,
-	})
-	srv := httptest.NewServer(h)
+	o.Health, o.Pool, o.MaxAttempts, o.Events = Health{Postgres: e.Pool.Ping, Redis: ok}, e.Pool, 6, ev
+	srv := httptest.NewServer(NewHandler(observability.NewLogger(testLog{t}, "api", "error"), o))
 	t.Cleanup(srv.Close)
 	return apiEnv{Env: e, url: srv.URL, events: ev}
 }
@@ -991,10 +1002,11 @@ func TestACursorOutsideTheTimeRangeIsRefused(t *testing.T) {
 }
 
 // The rendering of many requests at once is bounded, not only each request (session 6's
-// review, F1): 40 batches at once, each rendering 8 MB from a 66 KB body. The heap is sampled
-// while they run.
+// review, F1): 40 batches at once, each rendering 8 MB from a 44 KB body. The heap is sampled
+// while they run. The test measures memory, not time: on a machine busy with other packages'
+// tests an 8 MB insert has taken more than the 5 s deadline, so the deadline is longer here.
 func TestConcurrentRequestsRenderInBoundedMemory(t *testing.T) {
-	a := newAPI(t)
+	a := newAPIWith(t, Options{DatabaseDeadline: time.Minute})
 	createTemplate(t, a, "amp", "email", strings.Repeat("{{.v}}", 16_000))
 	body, err := json.Marshal(items(500, func(int) map[string]any { return fromTemplate("amp", map[string]string{"v": "a"}) }))
 	if err != nil {
@@ -1139,7 +1151,7 @@ func TestARequestEndsAtItsDeadlineWhenPostgresStalls(t *testing.T) {
 // never a 2xx without a body (session 6's review, F4).
 func TestAnAnswerThatCannotBeEncodedIsA500(t *testing.T) {
 	rec := httptest.NewRecorder()
-	writeJSON(rec, http.StatusOK, map[string]any{"at": time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)})
+	_ = writeJSON(rec, http.StatusOK, map[string]any{"at": time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)})
 	if rec.Code != http.StatusInternalServerError || rec.Body.Len() == 0 {
 		t.Errorf("%d with %d bytes, want a 500 with the error form", rec.Code, rec.Body.Len())
 	}

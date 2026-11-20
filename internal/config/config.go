@@ -15,6 +15,9 @@ import (
 	"time"
 )
 
+// MinAPIKeyLen is the shortest API key the API accepts (architecture §8).
+const MinAPIKeyLen = 16
+
 // ResultWriteReserve is the part of the lease kept for writing the result after the send
 // timeout has passed (architecture §13: lease ≥ send timeout + 30 s).
 const ResultWriteReserve = 30 * time.Second
@@ -74,6 +77,11 @@ func Load(getenv func(string) string) (Config, error) {
 		LogLevel:    p.oneOf("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
 		APIKeys:     p.list("API_KEYS"),
 		MaxAttempts: p.integer("MAX_ATTEMPTS", 6),
+	}
+	for i, k := range c.APIKeys {
+		if len(k) < MinAPIKeyLen {
+			p.errs = append(p.errs, fmt.Errorf("API_KEYS: key %d of %d is shorter than %d characters", i+1, len(c.APIKeys), MinAPIKeyLen))
+		}
 	}
 	if c.MaxAttempts <= 0 {
 		p.errs = append(p.errs, fmt.Errorf("MAX_ATTEMPTS must be positive, got %d", c.MaxAttempts))
