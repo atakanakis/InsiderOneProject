@@ -1,0 +1,72 @@
+package gateexp
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// How often does a request reach the server when the client refuses it in
+// the GotConn hook? Variants: cancel only; close the connection and cancel.
+func run(t *testing.T, name string, closeConn, warm bool) {
+	var received atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Refused") == "1" {
+			received.Add(1)
+		}
+		w.WriteHeader(202)
+	}))
+	defer srv.Close()
+	tr := &http.Transport{MaxIdleConnsPerHost: 64, ForceAttemptHTTP2: false}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	const total = 20000
+	var wg sync.WaitGroup
+	var gotResp atomic.Int64
+	sem := make(chan struct{}, 32)
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if warm { // make an idle connection available first
+				resp, err := client.Get(srv.URL)
+				if err == nil {
+					resp.Body.Close()
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+				if closeConn {
+					_ = info.Conn.Close()
+				}
+				cancel()
+			}})
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, bytes.NewReader([]byte(`{"to":"x"}`)))
+			req.Header.Set("X-Refused", "1")
+			req.Header.Set("Idempotency-Key", "k")
+			resp, err := client.Do(req)
+			if err == nil {
+				gotResp.Add(1)
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+	time.Sleep(200 * time.Millisecond)
+	t.Logf("RESULT %-28s refused=%d reached_server=%d client_got_response=%d", name, total, received.Load(), gotResp.Load())
+}
+
+func TestGate(t *testing.T) {
+	run(t, "cancel-only/cold", false, false)
+	run(t, "cancel-only/warm", false, true)
+	run(t, "close+cancel/cold", true, false)
+	run(t, "close+cancel/warm", true, true)
+}
