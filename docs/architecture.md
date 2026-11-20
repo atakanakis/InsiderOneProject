@@ -98,6 +98,9 @@ would move to a log such as Kafka; the `Queue` interface in section 6 is the sea
 once its `ready_at` time has come. The three names exist so that a client can see why a
 notification is waiting.
 
+The diagram is `domain.CanTransition`. TestStatusTransitionsFollowTheLifecycle walks all 49
+pairs of statuses against the list of arrows above.
+
 ## 4. Data model
 
 ```
@@ -135,6 +138,18 @@ Indexes, each for one query:
 | `(created_at DESC, id)`, `(batch_id)` | List and batch queries |
 
 Migrations are versioned, append-only files run by a one-shot `migrate` command.
+
+The schema is tied to package `domain` by tests, so the two cannot drift apart:
+
+| What | Test |
+|---|---|
+| The tables and columns above | TestMigrationsCreateTheDataModel |
+| The claim index holds exactly `domain.Claimable` | TestClaimIndexCoversExactlyTheClaimableStatuses |
+| The other three indexes | TestReapListAndBatchIndexesExist |
+| The CHECK constraints accept exactly the statuses, channels and priorities of `domain` | TestColumnChecksAcceptExactlyTheDomainValues |
+| One row per idempotency key, separately for notifications and batches | TestIdempotencyKeysAreUniqueInTheDatabase |
+| One attempt row per attempt number | TestAnAttemptNumberIsRecordedOnce |
+| A migration is never changed after it is recorded in `migrations.sha256` | TestMigrationsAreAppendOnly |
 
 ## 5. The queue: five operations
 
@@ -473,7 +488,7 @@ known enum values. Errors name the field.
 
 | What | Limit |
 |---|---|
-| Request headers | 64 KiB, arriving within 5 s |
+| Request headers | 64 KiB, arriving within 5 s (TestRequestHeadersOverTheBoundAreRefused, TestSlowRequestHeadersAreCutOff) |
 | Request body | 1 MiB (8 MiB for a batch) |
 | Batch size | 1000 notifications |
 | Content after rendering | Per channel: SMS 1600 characters, push 4096, email 100,000 |
@@ -484,7 +499,11 @@ known enum values. Errors name the field.
 | Metrics window | 1 hour |
 | Database time per API request | Statement timeout of 5 s |
 | WebSocket | 1000 connections per API instance; a client that cannot keep up is disconnected |
-| `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged |
+| `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged (TestCorrelationIDBound, TestCorrelationIDIsAcceptedOrReplaced) |
+
+Readiness answers within its 2 s per dependency even when one hangs
+(TestReadyzAnswersWithinItsTimeoutWhenADependencyHangs), and does not show dependency errors
+(TestReadyzDoesNotShowDependencyErrors).
 
 **Authentication** is optional and off by default for local use: when `API_KEYS` is set,
 every `/v1` request needs a key (`Authorization: Bearer` or `X-API-Key`).
@@ -519,20 +538,20 @@ Each invariant is enforced in one place and has at least one test that fails whe
 enforcing line is disabled (`make guards` runs that check). The test names are filled in by
 the session that builds the part.
 
-| # | Invariant | Enforced in |
-|---|---|---|
-| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window |
-| I2 | A row is never claimed by a second worker while its lease is valid | `SKIP LOCKED` and the status filter in Claim |
-| I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish |
-| I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap |
-| I5 | An accepted notification is never lost: it ends as `sent`, `failed` or `cancelled` | I4 + retries + the `failed` state |
-| I6 | A provider response always decides the verdict | `Classify` |
-| I7 | `attempts` only goes up. Each claim is one attempt, and no attempt number is used twice. | Claim; Requeue raises `max_attempts` |
-| I8 | One send makes one connection, takes one permit and writes at most one request | Provider client (section 7, properties 1 to 5) |
-| I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule |
-| I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash |
-| I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8 |
-| I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script |
+| # | Invariant | Enforced in | Tests so far |
+|---|---|---|---|
+| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | |
+| I2 | A row is never claimed by a second worker while its lease is valid | `SKIP LOCKED` and the status filter in Claim | |
+| I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish | The database part: TestAnAttemptNumberIsRecordedOnce (a repeated Finish cannot add a second attempt row). The `WHERE` of Finish: session 2. |
+| I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | |
+| I5 | An accepted notification is never lost: it ends as `sent`, `failed` or `cancelled` | I4 + retries + the `failed` state | |
+| I6 | A provider response always decides the verdict | `Classify` | |
+| I7 | `attempts` only goes up. Each claim is one attempt, and no attempt number is used twice. | Claim; Requeue raises `max_attempts` | |
+| I8 | One send makes one connection, takes one permit and writes at most one request | Provider client (section 7, properties 1 to 5) | |
+| I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule | |
+| I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash | The database part: TestIdempotencyKeysAreUniqueInTheDatabase. The request hash: session 6. |
+| I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8 | Request headers and the correlation id (section 8). The rest: session 6. |
+| I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script | |
 
 Tests of I1, I4, I5 and I8 observe the system **from the provider's side**: a recording HTTP
 server stamps each request at the moment it arrives. They run through the real provider
@@ -554,30 +573,37 @@ client. The test kit does not contain a fake provider that could skip the send g
 These values are configuration. The worker refuses to start when a relation in the last
 column does not hold.
 
-| Setting | Default | Must hold |
-|---|---|---|
-| Rate limit | 100 per second per channel | |
-| Window margin | 50 ms | |
-| Send timeout (connect + gate + write + response) | 15 s | |
-| Dial timeout, TLS handshake timeout | 3 s each | each < send timeout |
-| Gate budget (longest wait for a permit) | 5 s | < send timeout |
-| Lease | 60 s | ≥ send timeout + 30 s for the result write |
-| Breaker open time | 30 s | > send timeout |
-| Shutdown timeout | 25 s | ≥ send timeout + 5 s |
-| Result write retries | up to one lease length after the send | |
-| Concurrent sends (slots) per channel per worker | 50 | |
-| Idle connections kept per provider host | 50 | = slots |
-| Idle connection timeout | 10 s | |
-| Claim batch | 10 | ≤ slots |
-| Pause when there is no room / nothing to claim | 20 ms / 200 ms | |
-| Reaper tick | 5 s | |
-| Attempts; backoff | 6; 2 s doubling to a cap of 2 min, with jitter | |
+| Setting | Environment variable | Default | Must hold | Test of the relation |
+|---|---|---|---|---|
+| Rate limit | `RATE_LIMIT` | 100 per second per channel | | |
+| Window margin | `WINDOW_MARGIN` | 50 ms | | |
+| Send timeout (connect + gate + write + response) | `SEND_TIMEOUT` | 15 s | | |
+| Dial timeout, TLS handshake timeout | `DIAL_TIMEOUT`, `TLS_HANDSHAKE_TIMEOUT` | 3 s each | each < send timeout | TestDialTimeoutMustBeShorterThanSendTimeout, TestTLSHandshakeTimeoutMustBeShorterThanSendTimeout |
+| Gate budget (longest wait for a permit) | `GATE_BUDGET` | 5 s | < send timeout | TestGateBudgetMustBeShorterThanSendTimeout |
+| Lease | `LEASE` | 60 s | ≥ send timeout + 30 s for the result write | TestLeaseMustCoverSendTimeoutPlusResultWrite |
+| Breaker open time | `BREAKER_OPEN` | 30 s | > send timeout | TestBreakerOpenTimeMustExceedSendTimeout |
+| Shutdown timeout | `SHUTDOWN_TIMEOUT` | 25 s | ≥ send timeout + 5 s | TestShutdownTimeoutMustCoverSendTimeoutPlusFiveSeconds |
+| Result write retries | (the lease) | up to one lease length after the send | | |
+| Concurrent sends (slots) per channel per worker | `SLOTS` | 50 | | |
+| Idle connections kept per provider host | `IDLE_CONNS` | 50 | = slots | TestIdleConnectionsMustEqualSlots |
+| Idle connection timeout | `IDLE_CONN_TIMEOUT` | 10 s | | |
+| Claim batch | `CLAIM_BATCH` | 10 | ≤ slots | TestClaimBatchMustNotExceedSlots |
+| Pause when there is no room / nothing to claim | `PAUSE_BUSY`, `PAUSE_IDLE` | 20 ms / 200 ms | | |
+| Reaper tick | `REAPER_TICK` | 5 s | | |
+| Attempts; backoff | `MAX_ATTEMPTS`; `BACKOFF_BASE`, `BACKOFF_CAP` | 6; 2 s doubling to a cap of 2 min, with jitter | | |
+
+Every number in the table must also be positive (TestNonPositiveSettingsAreRefused); a relation
+between two settings means nothing if one of them is zero. The defaults are the table
+(TestDefaultsAreTheTimingBudget). The worker checks all of this before it connects to anything,
+and exits with status 2 naming each broken relation
+(TestWorkerRefusesToStartWithALeaseShorterThanSendTimeoutPlus30s).
 
 Three relations cannot be checked by a single worker. They are stated here and watched by
 metrics:
 
 - The container's stop grace period (30 s, in `docker-compose.yml`) must be longer than the
-  shutdown timeout.
+  shutdown timeout. A test reads the Compose file for this one
+  (TestComposeStopGracePeriodExceedsShutdownTimeout).
 - One worker can run at most `slots ÷ provider latency` sends per second. With 50 slots that
   is the full rate up to a provider latency of about 500 ms; a slower provider needs more
   slots or more workers.
