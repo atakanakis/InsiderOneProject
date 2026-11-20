@@ -483,6 +483,7 @@ known enum values. Errors name the field.
 | Metrics window | 1 hour |
 | Database time per API request | Statement timeout of 5 s |
 | WebSocket | 1000 connections per API instance; a client that cannot keep up is disconnected |
+| `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged |
 
 **Authentication** is optional and off by default for local use: when `API_KEYS` is set,
 every `/v1` request needs a key (`Authorization: Bearer` or `X-API-Key`).
@@ -596,8 +597,16 @@ internal/api           handlers, middleware, WebSocket
 internal/events        publish and subscribe
 internal/observability logging, metrics, tracing
 internal/config        settings and the checks of section 13
-internal/testkit       test database, test Redis, the recording provider server
+internal/recorder      the recording provider server: stamps each request on arrival,
+                       injects responses, latency, slow TLS setup and closed connections
+internal/testkit       test database and test Redis (testcontainers); starts the recorder
+tools/guards           `make guards`: disables each guard and expects a named test to fail
+tools/testnames        checks that every test named in docs/ exists in the code
 ```
+
+The recording server is its own package, not part of `testkit`, because `cmd/mockprovider`
+runs the same code as the local provider of the Compose stack. Inside `testkit` it would pull
+the testcontainers dependencies into that binary. (Changed in session 1.)
 
 Dependencies point one way: `api` and `dispatch` depend on `service`, `store`, `ratelimit`
 and `provider`; all of them depend on `domain`; `domain` depends on nothing.
