@@ -1010,8 +1010,8 @@ var guards = []Guard{
 		Package: "./internal/domain", Test: "TestTheRequestHashIgnoresFormAndDefaults",
 	},
 	{
-		Name: "domain: the hash reads scheduledAt in UTC", File: "internal/domain/request.go",
-		Old: "at = t.UTC().Format(time.RFC3339Nano)", New: "at = t.Format(time.RFC3339Nano)",
+		Name: "domain: scheduledAt is read in UTC", File: "internal/domain/request.go",
+		Old: "t = t.UTC().Truncate(time.Microsecond)", New: "t = t.Truncate(time.Microsecond)",
 		Package: "./internal/domain", Test: "TestTheRequestHashIgnoresFormAndDefaults",
 	},
 	{
@@ -1095,14 +1095,14 @@ var guards = []Guard{
 		Package: "./internal/api", Test: "TestATemplateIsCompiledOncePerRequest",
 	},
 	{
-		Name: "api: an unknown field's name passes Echo", File: "internal/api/notifications.go",
-		Old: "return &failure{http.StatusBadRequest, fieldError(prefix+domain.Echo(name), \"is not a known field\")}", New: "return &failure{http.StatusBadRequest, fieldError(prefix+name, \"is not a known field\")}",
+		Name: "domain: an unknown field's name passes Echo", File: "internal/domain/request.go",
+		Old: "return &FieldNameError{Name: Echo(name), Message: \"is not a known field; names are matched exactly\"}", New: "return &FieldNameError{Name: name, Message: \"is not a known field; names are matched exactly\"}",
 		Package: "./internal/api", Test: "TestErrorBodiesStayWithinTheirBoundForAnyRequest",
 	},
 	{
-		Name: "api: unknown fields are refused", File: "internal/api/notifications.go",
-		Old: "\tdec.DisallowUnknownFields()\n", New: "",
-		Package: "./internal/api", Test: "TestUnknownFieldsAndWrongTypesAreRefusedByName",
+		Name: "domain: an unknown field is refused", File: "internal/domain/request.go",
+		Old: "case !slices.Contains(allowed, name):", New: "case false:",
+		Package: "./internal/domain", Test: "TestFieldNamesAreMatchedExactlyAndOnce",
 	},
 	{
 		Name: "api: nothing follows the JSON value", File: "internal/api/notifications.go",
@@ -1176,7 +1176,7 @@ var guards = []Guard{
 	},
 	{
 		Name: "store: the list cursor excludes the last item", File: "internal/store/notifications.go",
-		Old: "where = append(where, fmt.Sprintf(\"(created_at < $%d OR (created_at = $%d AND id > $%d))\", c, c, i))", New: "where = append(where, fmt.Sprintf(\"(created_at < $%d OR (created_at = $%d AND id >= $%d))\", c, c, i))",
+		Old: "\"created_at <= $%d AND (created_at < $%d OR (created_at = $%d AND id > $%d))\", c, c, c, i))", New: "\"created_at <= $%d AND (created_at < $%d OR (created_at = $%d AND id >= $%d))\", c, c, c, i))",
 		Package: "./internal/api", Test: "TestTheListIsOrderedAndPagedByCursor",
 	},
 	{
@@ -1213,5 +1213,77 @@ var guards = []Guard{
 		Name: "api: a cursor's time is within the years a row can have", File: "internal/api/notifications.go",
 		Old: "if micros > lastCursorMicros {", New: "if false {",
 		Package: "./internal/api", Test: "TestACursorOutsideTheTimeRangeIsRefused",
+	},
+
+	// Session 6: the answers to its review.
+	{
+		Name: "store: the list cursor bounds the index scan (review F3)", File: "internal/store/notifications.go",
+		Old: "\"created_at <= $%d AND (created_at < $%d OR", New: "\"created_at <= $%d + interval '100 years' AND (created_at < $%d OR",
+		Package: "./internal/store", Test: "TestAListPageReadsTheIndexFromItsCursor",
+	},
+	{
+		Name: "domain: scheduledAt is cut to microseconds (review F4)", File: "internal/domain/request.go",
+		Old: "t = t.UTC().Truncate(time.Microsecond)", New: "t = t.UTC()",
+		Package: "./internal/domain", Test: "TestTheRequestHashIgnoresFormAndDefaults",
+	},
+	{
+		Name: "domain: scheduledAt is before the year 10000 (review F4)", File: "internal/domain/request.go",
+		Old: "if t.Year() > 9999 {", New: "if false {",
+		Package: "./internal/domain", Test: "TestAScheduledAtFromTheYear10000IsRefused",
+	},
+	{
+		Name: "domain: a field name is given once (review F7)", File: "internal/domain/request.go",
+		Old: "case seen[name]:", New: "case false:",
+		Package: "./internal/domain", Test: "TestFieldNamesAreMatchedExactlyAndOnce",
+	},
+	{
+		Name: "domain: a template name starts with a letter or digit", File: "internal/domain/request.go",
+		Old: "var templateName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)", New: "var templateName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)",
+		Package: "./internal/domain", Test: "TestIdempotencyKeyAndTemplateNameBounds",
+	},
+	{
+		Name: "domain: the rendered total is the batch's body bound (review F1)", File: "internal/domain/request.go",
+		Old: "MaxRenderedBytes       = 8 << 20", New: "MaxRenderedBytes       = 16 << 20",
+		Package: "./internal/api", Test: "TestTheRenderedTotalOfARequestIsBounded",
+	},
+	{
+		Name: "api: at most 4 requests render at once (review F1)", File: "internal/api/notifications.go",
+		Old: "rendering: make(chan struct{}, MaxRenderingRequests),", New: "rendering: make(chan struct{}, 1000),",
+		Package: "./internal/api", Test: "TestConcurrentRequestsRenderInBoundedMemory",
+	},
+	{
+		Name: "api: a request's database work has a deadline (review F5)", File: "internal/api/notifications.go",
+		Old: "return context.WithTimeout(r.Context(), s.deadline)", New: "return context.WithCancel(r.Context())",
+		Package: "./internal/api", Test: "TestARequestEndsAtItsDeadlineWhenPostgresStalls",
+	},
+	{
+		Name: "api: an answer is encoded before its status (review F4)", File: "internal/api/health.go",
+		Old: "\tif err != nil {\n\t\twriteError(w, http.StatusInternalServerError, apiError{Code: \"internal\", Message: \"the answer could not be encoded\"})", New: "\tif false {\n\t\twriteError(w, http.StatusInternalServerError, apiError{Code: \"internal\", Message: \"the answer could not be encoded\"})",
+		Package: "./internal/api", Test: "TestAnAnswerThatCannotBeEncodedIsA500",
+	},
+	{
+		Name: "api: a repeat answers the stored row with its history (review F6)", File: "internal/api/notifications.go",
+		Old: "if n, err = s.store.Get(ctx, n.ID); err != nil {", New: "if err = error(nil); err != nil {",
+		Package: "./internal/api", Test: "TestARepeatedCreateAnswersWithItsAttemptHistory",
+	},
+	{
+		Name: "api: an Idempotency-Key header on a single create is refused (review F9)", File: "internal/api/notifications.go",
+		Old: "if r.Header.Get(\"Idempotency-Key\") != \"\" {\n\t\t_, drain := body(w, r, MaxBodyBytes)", New: "if false {\n\t\t_, drain := body(w, r, MaxBodyBytes)",
+		Package: "./internal/api", Test: "TestAnIdempotencyKeyHeaderOnASingleCreateIsRefused",
+	},
+	{
+		Name: "api: the bearer scheme in any case", File: "internal/api/notifications.go",
+		Old: "strings.EqualFold(auth[:7], \"Bearer \")", New: "auth[:7] == \"Bearer \"",
+		Package: "./internal/api", Test: "TestAPIKeysAreRequiredWhenConfigured",
+	},
+	{
+		Name: "provider: a send's error does not quote the URL (session 6's review, F2)", File: "internal/provider/provider.go",
+		Old: "r.Err = withoutURL(err)", New: "r.Err = err",
+		Package: "./internal/provider", Test: "TestASendErrorDoesNotQuoteTheURL",
+	},
+	{
+		Name: "config: API keys of at least 16 characters", File: "internal/config/config.go",
+		Old: "if len(k) < MinAPIKeyLen {", New: "if false && len(k) < MinAPIKeyLen {",
+		Package: "./internal/config", Test: "TestAPIKeysMustBeAtLeast16Characters",
 	},
 }

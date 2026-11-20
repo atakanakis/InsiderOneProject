@@ -11,8 +11,8 @@ logs:
 	docker compose logs -f api worker
 
 N ?= 100
-e2e: ## Send N notifications per channel through the API and wait until all are sent
-	go run ./tools/e2e -n $(N)
+e2e: ## Send N notifications per channel through the API and wait until all are sent; KEY=... when API_KEYS is set
+	go run ./tools/e2e -n $(N) $(if $(KEY),-key $(KEY))
 
 status: ## Count the notifications by status
 	docker compose exec -T postgres psql -U notifications -c \
