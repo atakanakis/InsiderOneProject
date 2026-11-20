@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"time"
 
@@ -14,25 +15,29 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load(os.Getenv)
-	log := observability.NewLogger(os.Stdout, "migrate", cfg.LogLevel)
+	os.Exit(run(context.Background(), os.Getenv, os.Stdout))
+}
+
+func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
+	cfg, err := config.Load(getenv)
+	log := observability.NewLogger(out, "migrate", cfg.LogLevel)
 	if err != nil {
 		log.Error("configuration", "error", err)
-		os.Exit(2)
+		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	pool, err := store.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Error("connect", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer pool.Close()
 	version, err := store.Migrate(ctx, pool)
 	if err != nil {
 		log.Error("migrate", "error", err)
-		pool.Close()
-		os.Exit(1) //nolint:gocritic // the pool is closed above
+		return 1
 	}
 	log.Info("migrations applied", "version", version)
+	return 0
 }

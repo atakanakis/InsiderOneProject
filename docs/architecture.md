@@ -446,7 +446,7 @@ and it counts towards the breaker.
 | `POST /v1/templates`, `GET /v1/templates`, `GET /v1/templates/{name}` | Templates |
 | `GET /v1/metrics` | Queue depth, success and failure rates, latency |
 | `GET /v1/ws` | WebSocket: live status events, filtered by notification or batch |
-| `GET /healthz`, `GET /readyz` | Liveness; readiness (Postgres and Redis reachable) |
+| `GET /healthz`, `GET /readyz` | Liveness; readiness (Postgres and Redis each answer a ping within 2 s) |
 | `GET /metrics` | Prometheus |
 | `GET /docs`, `GET /openapi.yaml` | OpenAPI specification and viewer |
 
@@ -473,6 +473,7 @@ known enum values. Errors name the field.
 
 | What | Limit |
 |---|---|
+| Request headers | 64 KiB, arriving within 5 s |
 | Request body | 1 MiB (8 MiB for a batch) |
 | Batch size | 1000 notifications |
 | Content after rendering | Per channel: SMS 1600 characters, push 4096, email 100,000 |
