@@ -10,13 +10,18 @@ tests:
     interval: 1m
     input_series:
       # One worker's sms breaker opens and probes for 10 minutes; another worker's stays closed.
+      # The probes and the rows of before the opening are attempts.
       - series: 'notifications_breaker_state{channel="sms", instance="w1", job="worker"}'
         values: '0 1 1 2 1 1 1 2 1 1 1'
       - series: 'notifications_breaker_state{channel="sms", instance="w2", job="worker"}'
         values: '0x10'
+      - series: 'notifications_attempts_total{channel="sms", outcome="error_response", instance="w1", job="worker"}'
+        values: '0+2x10'
       # email opens and closes again, never for 5 minutes in a row.
       - series: 'notifications_breaker_state{channel="email", instance="w1", job="worker"}'
         values: '0 1 1 0 1 1 0 1 1 0 0'
+      - series: 'notifications_attempts_total{channel="email", outcome="error_response", instance="w1", job="worker"}'
+        values: '0+2x10'
     alert_rule_test:
       - eval_time: 4m
         alertname: NotificationsBreakerOpen
@@ -27,6 +32,20 @@ tests:
           - exp_labels: { severity: page, channel: sms }
             exp_annotations:
               summary: "sms: a worker's breaker has not been closed for 5 minutes"
+
+  # The shape the review saw (F2): the provider healed, the waiting rows were cancelled, and the
+  # breakers stayed half-open with no attempt at all. Not an outage.
+  - name: NotificationsBreakerOpen, half-open on an idle channel
+    interval: 1m
+    input_series:
+      - series: 'notifications_breaker_state{channel="push", instance="w1", job="worker"}'
+        values: '0 1 2x18'
+      - series: 'notifications_attempts_total{channel="push", outcome="error_response", instance="w1", job="worker"}'
+        values: '5x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: NotificationsBreakerOpen
+        exp_alerts: []
 
   - name: NotificationsOldestDueRowTooOld
     interval: 1m
@@ -98,31 +117,43 @@ tests:
               summary: "sms: 25% of finished notifications failed"
 
   # The rules on a dependency use rate() over 1 minute, so these series are scraped every 15 s,
-  # as Prometheus scrapes the service.
-  - name: NotificationsResultWritesFailing, sustained
+  # as Prometheus scrapes the service. The input is the shape a read-only Postgres gave on the
+  # Compose stack (session 7's review, F2): result writes fail for about one lease, then stop,
+  # because nothing more is claimed, and claims fail on every loop from then on.
+  - name: NotificationsDatabaseFailing, a read-only Postgres
     interval: 15s
     input_series:
       - series: 'notifications_worker_errors_total{operation="result_write", instance="w1", job="worker"}'
-        values: '0+10x40'
+        values: '0 30 60 90 120 120x40'
+      - series: 'notifications_worker_errors_total{operation="claim", instance="w1", job="worker"}'
+        values: '0 0 0 0 0+68x40'
+      - series: 'notifications_worker_errors_total{operation="reap", instance="w1", job="worker"}'
+        values: '0x4 0+1x40'
     alert_rule_test:
       - eval_time: 1m
-        alertname: NotificationsResultWritesFailing
+        alertname: NotificationsDatabaseFailing
         exp_alerts: []
       - eval_time: 4m
-        alertname: NotificationsResultWritesFailing
+        alertname: NotificationsDatabaseFailing
         exp_alerts:
           - exp_labels: { severity: page }
             exp_annotations:
-              summary: "Workers cannot store delivery results"
+              summary: "Workers cannot claim or store results: Postgres refuses or does not answer"
+      - eval_time: 10m
+        alertname: NotificationsDatabaseFailing
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "Workers cannot claim or store results: Postgres refuses or does not answer"
 
-  - name: NotificationsResultWritesFailing, a single blip
+  - name: NotificationsDatabaseFailing, a single blip
     interval: 15s
     input_series:
-      - series: 'notifications_worker_errors_total{operation="result_write", instance="w1", job="worker"}'
+      - series: 'notifications_worker_errors_total{operation="claim", instance="w1", job="worker"}'
         values: '0 5 5x30'
     alert_rule_test:
       - eval_time: 5m
-        alertname: NotificationsResultWritesFailing
+        alertname: NotificationsDatabaseFailing
         exp_alerts: []
 
   - name: NotificationsRateLimitUnavailable, sustained
@@ -190,3 +221,39 @@ tests:
           - exp_labels: { severity: ticket }
             exp_annotations:
               summary: "Status events are being dropped"
+
+  - name: NotificationsAPIDown
+    interval: 1m
+    input_series:
+      - series: 'up{job="api", instance="api:8080"}'
+        values: '1 1 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: NotificationsAPIDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: NotificationsAPIDown
+        exp_alerts:
+          - exp_labels: { severity: page, job: api, instance: "api:8080" }
+            exp_annotations:
+              summary: "Prometheus cannot scrape the API at api:8080"
+
+  # Workers are found by DNS: a stopped worker leaves no target, so the series ends. One of two
+  # stopping is not "no worker"; both stopping is.
+  - name: NotificationsNoWorker
+    interval: 1m
+    input_series:
+      - series: 'up{job="worker", instance="10.0.0.7:9100"}'
+        values: '1 1 1 _x8'
+      - series: 'up{job="worker", instance="10.0.0.8:9100"}'
+        values: '1 1 1 1 1 1 _x5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NotificationsNoWorker
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: NotificationsNoWorker
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "No worker answers its scrape: nothing is delivered"

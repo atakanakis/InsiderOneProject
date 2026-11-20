@@ -60,7 +60,7 @@ func main() {
 			}
 			scrapes = append(scrapes, b)
 		}
-		missing, err := unexported(rules, scrapes...)
+		missing, err := unexported(rules, nil, scrapes...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -194,9 +194,12 @@ func exports(scrapes ...[]byte) (exported, error) {
 	return e, nil
 }
 
+// scrapeJobs returns the job names of a Prometheus configuration. Stub.
+func scrapeJobs(config []byte) ([]string, error) { return nil, nil }
+
 // unexported returns, for every rule, each metric, label value and grouping label it names
 // that none of the scrapes exports.
-func unexported(rules []byte, scrapes ...[]byte) ([]string, error) {
+func unexported(rules []byte, jobs []string, scrapes ...[]byte) ([]string, error) {
 	var r ruleFile
 	if err := yaml.Unmarshal(rules, &r); err != nil {
 		return nil, fmt.Errorf("rules: %w", err)

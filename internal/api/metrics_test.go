@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/atakanakis/InsiderOneProject/internal/events"
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
 	"github.com/atakanakis/InsiderOneProject/internal/redisclient"
+	"github.com/atakanakis/InsiderOneProject/internal/store"
 	"github.com/atakanakis/InsiderOneProject/internal/testkit"
 )
 
@@ -359,5 +361,66 @@ func TestTheAPIAnswersWhileRedisHangs(t *testing.T) {
 	id := one.json(t)["id"].(string)
 	if r := timed("a cancel", func() reply { return srv.do(t, http.MethodPost, "/v1/notifications/"+id+"/cancel", nil) }); r.code != http.StatusOK {
 		t.Fatalf("cancel: %d %s", r.code, r.raw)
+	}
+}
+
+// §10, session 7's review F3: with Postgres stalled, a read of the figures is shared by every
+// caller of its time, its failure is kept for 5 s like a value, and a caller stops waiting at
+// its own deadline. A scrape is answered within its 2 s, without these figures.
+func TestAFailingFigureReadIsSharedKeptAndLeftByItsCallers(t *testing.T) {
+	var reads atomic.Int64
+	stalled := func(ctx context.Context) (store.QueueStats, error) {
+		reads.Add(1)
+		<-ctx.Done() // Postgres does not answer: the read ends at its own timeout
+		return store.QueueStats{}, ctx.Err()
+	}
+	f := newFiguresFrom(stalled, nil, observability.NewLogger(testLog{t}, "api", "error"))
+
+	began := time.Now()
+	var wg sync.WaitGroup
+	var slowest atomic.Int64
+	for range 20 {
+		wg.Go(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), DatabaseDeadline)
+			defer cancel()
+			t0 := time.Now()
+			if _, err := f.queueStats(ctx); err == nil {
+				t.Error("a read of a stalled Postgres succeeded")
+			}
+			if d := int64(time.Since(t0)); d > slowest.Load() {
+				slowest.Store(d)
+			}
+		})
+	}
+	wg.Wait()
+	t.Logf("20 callers: %d reads, the slowest answered in %v, all in %v", reads.Load(), time.Duration(slowest.Load()), time.Since(began))
+	if reads.Load() != 1 || time.Duration(slowest.Load()) > QueueReadTimeout+time.Second {
+		t.Errorf("20 callers at once: %d reads, the slowest waited %v; want one read, shared, within %v",
+			reads.Load(), time.Duration(slowest.Load()), QueueReadTimeout+time.Second)
+	}
+
+	t0 := time.Now()
+	if _, err := f.queueStats(context.Background()); err == nil || time.Since(t0) > 100*time.Millisecond || reads.Load() != 1 {
+		t.Errorf("within 5 s of a failed read: %v after %v, %d reads; want the kept error at once", err, time.Since(t0), reads.Load())
+	}
+
+	// A caller stops waiting at its own deadline while the read goes on.
+	g := newFiguresFrom(stalled, nil, observability.NewLogger(testLog{t}, "api", "error"))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	t0 = time.Now()
+	if _, err := g.queueStats(ctx); err == nil || time.Since(t0) > time.Second {
+		t.Errorf("a caller with 300 ms: %v after %v; want its own deadline", err, time.Since(t0))
+	}
+
+	// A scrape during the stall answers within the read's timeout, without the queue's figures.
+	h := newFiguresFrom(stalled, nil, observability.NewLogger(testLog{t}, "api", "error"))
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(h, prometheus.NewCounter(prometheus.CounterOpts{Name: "other_total"}))
+	t0 = time.Now()
+	fams, err := reg.Gather()
+	if err != nil || time.Since(t0) > QueueReadTimeout+time.Second || len(fams) != 1 {
+		t.Errorf("a scrape during the stall: %d families, %v, after %v; want the other metric within %v",
+			len(fams), err, time.Since(t0), QueueReadTimeout+time.Second)
 	}
 }

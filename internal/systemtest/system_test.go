@@ -78,13 +78,17 @@ type setup struct {
 	respond    func(recorder.Request) recorder.Response
 	apiTracing trace.TracerProvider
 	wrkTracing trace.TracerProvider
-	events     bool // status events through Redis, and a hub fed by a subscription
+	events     bool   // status events through Redis, and a hub fed by a subscription
+	logLevel   string // both processes' LOG_LEVEL; "" is debug
 }
 
 func start(t *testing.T, s setup) *system {
 	t.Helper()
 	e := testkit.Setup(t)
 	sys := &system{env: e, provider: testkit.Recorder(t, recorder.Options{Respond: s.respond}), apiLog: &lines{}, workLog: &lines{}}
+	if s.logLevel == "" {
+		s.logLevel = "debug"
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var running sync.WaitGroup
 	t.Cleanup(func() { cancel(); running.Wait() })
@@ -98,7 +102,7 @@ func start(t *testing.T, s setup) *system {
 		sub := redisClient(t, e.RedisURL)
 		running.Go(func() { events.Subscribe(ctx, sub, hub.Deliver, events.SubscribeOptions{Metrics: metrics.Subscribe}) })
 	}
-	sys.api = httptest.NewServer(api.NewHandler(observability.NewLogger(sys.apiLog, "api", "debug"), api.Options{
+	sys.api = httptest.NewServer(api.NewHandler(observability.NewLogger(sys.apiLog, "api", s.logLevel), api.Options{
 		Health: api.Health{Postgres: e.Pool.Ping, Redis: func(context.Context) error { return nil }},
 		Pool:   e.Pool, MaxAttempts: 6, Events: apiEvents, Metrics: metrics, Hub: hub, Tracing: s.apiTracing,
 	}))
@@ -120,7 +124,7 @@ func start(t *testing.T, s setup) *system {
 			Retry: dispatch.RetryPolicy{Base: 100 * time.Millisecond, Cap: time.Second, Soon: time.Second},
 			Provider: provider.Options{URL: sys.provider.URL + "/send", SendTimeout: 3 * time.Second, GateBudget: 2 * time.Second,
 				DialTimeout: time.Second, TLSHandshakeTimeout: time.Second, IdleConns: 10, IdleConnTimeout: 10 * time.Second},
-			Log: observability.NewLogger(sys.workLog, "worker", "debug"), Events: workerEvents, Tracing: s.wrkTracing,
+			Log: observability.NewLogger(sys.workLog, "worker", s.logLevel), Events: workerEvents, Tracing: s.wrkTracing,
 		}, store.NewQueue(pool), limiter)
 		if err != nil {
 			t.Fatal(err)
@@ -200,10 +204,11 @@ const smsJSON = `{"recipient": "+905551234567", "channel": "sms", "content": "Yo
 
 // §10: one correlation id follows a message from the API request to the provider: the API
 // answers it, stores it, the worker logs it on every line about the notification, and the
-// provider receives it on every attempt.
+// provider receives it on every attempt. Both processes log at info, the level that ships:
+// the request and each attempt, the one that delivered included, have a line (review F4).
 func TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider(t *testing.T) {
 	var tries atomic.Int64
-	sys := start(t, setup{respond: func(recorder.Request) recorder.Response {
+	sys := start(t, setup{logLevel: "info", respond: func(recorder.Request) recorder.Response {
 		if tries.Add(1) == 1 {
 			return recorder.Response{Status: 503} // a second attempt, with its own lines
 		}
@@ -239,8 +244,8 @@ func TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider(t *testing.T
 			t.Errorf("a worker line about the notification has the correlation id %v: %v", l["correlation_id"], l)
 		}
 	}
-	if about < 2 {
-		t.Errorf("%d worker lines about the notification, want one per attempt at least", about)
+	if about != 2 {
+		t.Errorf("%d worker lines at info about the notification, want one per attempt: 2", about)
 	}
 	requestLogged := false
 	for _, l := range sys.apiLog.all(t) {

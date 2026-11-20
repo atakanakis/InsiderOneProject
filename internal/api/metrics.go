@@ -80,15 +80,22 @@ func (c *cached[T]) get(read func() (T, error)) (T, error) {
 // figures reads the queue's figures and the attempts of each window, each at most once per
 // FiguresTTL.
 type figures struct {
-	store    *store.Notifications
-	log      *slog.Logger
+	readQueue    func(context.Context) (store.QueueStats, error)
+	readAttempts func(context.Context, time.Duration) (map[domain.Channel]*store.AttemptStats, error)
+	log          *slog.Logger
 	failures *observability.Every
 	queue    cached[store.QueueStats]
 	windows  map[string]*cached[map[domain.Channel]*store.AttemptStats]
 }
 
 func newFigures(s *store.Notifications, log *slog.Logger) *figures {
-	f := &figures{store: s, log: log, failures: observability.NewEvery(10 * time.Second),
+	return newFiguresFrom(s.QueueStats, s.AttemptStats, log)
+}
+
+// newFiguresFrom returns figures read by the given functions; tests give their own.
+func newFiguresFrom(readQueue func(context.Context) (store.QueueStats, error),
+	readAttempts func(context.Context, time.Duration) (map[domain.Channel]*store.AttemptStats, error), log *slog.Logger) *figures {
+	f := &figures{readQueue: readQueue, readAttempts: readAttempts, log: log, failures: observability.NewEvery(10 * time.Second),
 		windows: map[string]*cached[map[domain.Channel]*store.AttemptStats]{}}
 	for w := range MetricsWindows {
 		f.windows[w] = &cached[map[domain.Channel]*store.AttemptStats]{}
@@ -102,7 +109,7 @@ func (f *figures) queueStats(ctx context.Context) (store.QueueStats, error) {
 	return f.queue.get(func() (store.QueueStats, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), QueueReadTimeout)
 		defer cancel()
-		return f.store.QueueStats(ctx)
+		return f.readQueue(ctx)
 	})
 }
 
@@ -111,7 +118,7 @@ func (f *figures) attemptStats(ctx context.Context, name string, deadline time.D
 	return f.windows[name].get(func() (map[domain.Channel]*store.AttemptStats, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deadline)
 		defer cancel()
-		return f.store.AttemptStats(ctx, MetricsWindows[name])
+		return f.readAttempts(ctx, MetricsWindows[name])
 	})
 }
 

@@ -22,8 +22,9 @@ import (
 func TestMain(m *testing.M) { testkit.Main(m) }
 
 const (
-	rulesFile = "../../deploy/prometheus/alerts.yml"
-	testsFile = "../../deploy/prometheus/alerts_test.yml"
+	rulesFile  = "../../deploy/prometheus/alerts.yml"
+	testsFile  = "../../deploy/prometheus/alerts_test.yml"
+	configFile = "../../deploy/prometheus/prometheus.yml"
 )
 
 func readFile(t *testing.T, path string) []byte {
@@ -108,8 +109,12 @@ func TestTheCheckRefusesWhatNoBinaryExports(t *testing.T) {
 		{`sum by (instance_id) (rate(notifications_attempts_total[5m])) > 0`, false},        // grouped by a label it has not
 		{`max by (channel) (notifications_events_dropped_total) > 0`, false},                // the same, the other metric
 		{`sum(rate(notifications_attempts_total{outcome=~"sent.*"}[5m])) > 0`, false},       // a regex the check cannot read
+		{`up{job="api"} == 0`, true}, // Prometheus's own series, a job of the configuration
+		{`absent(up{job="worker"} == 1)`, true},
+		{`up{job="apiserver"} == 0`, false},              // a job the configuration does not have
+		{`max by (channel) (up{job="api"}) == 0`, false}, // up has no channel
 	} {
-		missing, err := unexported(rule(tc.expr), []byte(sampleScrape))
+		missing, err := unexported(rule(tc.expr), []string{"api", "worker"}, []byte(sampleScrape))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -195,7 +200,14 @@ func TestEveryAlertRuleUsesMetricsTheBinariesExport(t *testing.T) {
 		t.Cleanup(func() { cancel(); _ = cmd.Wait() })
 		scrapes = append(scrapes, scrapeWhenUp(t, run.url, out))
 	}
-	missing, err := unexported(readFile(t, rulesFile), scrapes...)
+	jobs, err := scrapeJobs(readFile(t, configFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(jobs, []string{"api", "worker"}) {
+		t.Errorf("the jobs of prometheus.yml: %v, want api and worker", jobs)
+	}
+	missing, err := unexported(readFile(t, rulesFile), jobs, scrapes...)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -550,3 +550,89 @@ func TestAWriteToAClientThatStopsReadingEndsAtItsDeadline(t *testing.T) {
 		t.Errorf("closed{slow} = %v, want 1", got)
 	}
 }
+
+// rawRequest sends a handshake by hand and returns the answer's status and body.
+func rawRequest(t *testing.T, base, request string) (int, string) {
+	t.Helper()
+	c, err := net.Dial("tcp", strings.TrimPrefix(base, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := io.WriteString(c, request); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, string(b)
+}
+
+// §9, session 7's review F6: an upgrade the library would refuse (HTTP/1.0, two keys) is a 400
+// in the error form before anything is read, not the library's plain-text refusal after the
+// database.
+func TestAnUpgradeTheLibraryWouldRefuseIsRefusedFirst(t *testing.T) {
+	a := newWSAPI(t, HubOptions{})
+	host := strings.TrimPrefix(a.url, "http://")
+	path := webSocketPath + "?" + notificationIDParam + "=" + uuid.NewString()
+	key := base64.StdEncoding.EncodeToString(make([]byte, 16))
+	for name, req := range map[string]string{
+		"HTTP/1.0": "GET " + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+			"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n\r\n",
+		"two keys": "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+			"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Key: " + key + "\r\n\r\n",
+	} {
+		code, body := rawRequest(t, a.url, req)
+		if code != http.StatusBadRequest || !strings.Contains(body, `"upgrade_required"`) {
+			t.Errorf("%s: %d %.120s; want a 400 in the error form", name, code, body)
+		}
+	}
+}
+
+// §9: a client's queue holds 256 messages; the 257th lets the client go.
+func TestAClientQueueHoldsItsBoundAndNoMore(t *testing.T) {
+	h := NewHub(HubOptions{})
+	id := uuid.New()
+	f, ok := h.follow([]uuid.UUID{id}, nil)
+	if !ok {
+		t.Fatal("the hub refused a client")
+	}
+	for range WebSocketQueue {
+		h.Deliver(events.Event{ID: id, Status: domain.Processing})
+	}
+	select {
+	case <-f.gone:
+		t.Fatalf("let go after %d messages, the bound", WebSocketQueue)
+	default:
+	}
+	h.Deliver(events.Event{ID: id, Status: domain.Sent})
+	select {
+	case <-f.gone:
+		if f.reason != "slow" {
+			t.Errorf("let go as %q, want slow", f.reason)
+		}
+	default:
+		t.Fatalf("still followed after %d messages", WebSocketQueue+1)
+	}
+}
+
+// §9, session 7's review F8: a client that closes its TCP connection without a close frame is
+// counted as the client's doing, also when a ping of the server was out.
+func TestAClientThatHangsUpIsCountedAsTheClients(t *testing.T) {
+	a := newWSAPI(t, HubOptions{PingInterval: 20 * time.Millisecond, PongTimeout: 2 * time.Second})
+	const n = 20
+	for range n {
+		conn, _ := rawWS(t, a.url, notificationIDParam+"="+uuid.NewString())
+		time.Sleep(30 * time.Millisecond) // a ping is out: the client never answers it
+		_ = conn.Close()
+	}
+	if !waitUntil(10*time.Second, func() bool { return closedBy(a.metrics, "client")+closedBy(a.metrics, "no_pong") == n }) {
+		t.Fatalf("%v closes counted, want %d", closedBy(a.metrics, "client")+closedBy(a.metrics, "no_pong"), n)
+	}
+	if got := closedBy(a.metrics, "client"); got != n {
+		t.Errorf("closed{client} = %v, closed{no_pong} = %v; want all %d as client", got, closedBy(a.metrics, "no_pong"), n)
+	}
+}

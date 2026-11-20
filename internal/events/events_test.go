@@ -136,7 +136,10 @@ func TestPublishNeverBlocksWhenRedisHangs(t *testing.T) {
 	}
 	total := time.Since(began)
 	t.Logf("%d events published in %v; the slowest call took %v", n, total, slowest)
-	if n < 3*Buffer || slowest > 10*time.Millisecond || total > time.Second {
+	// The slowest single call is compared with 100 ms, not 10: under make test every package
+	// runs at once and a call took 10.018 ms once (session 7's review, F5). A Publish that
+	// waits for Redis takes the context's 2 s.
+	if n < 3*Buffer || slowest > 100*time.Millisecond || total > time.Second {
 		t.Fatalf("Publish waited for Redis: %d of %d events in %v, the slowest call %v", n, 3*Buffer, total, slowest)
 	}
 	// The sender's first pipeline gives up at PublishTimeout (1 s), not at the client's own
@@ -426,5 +429,19 @@ func TestAMalformedOrOversizedEventIsDropped(t *testing.T) {
 	}
 	if n := testutil.ToFloat64(s.metrics.Received); n != 1 {
 		t.Errorf("received counter %v, want 1", n)
+	}
+}
+
+// §8, §9: an event is read up to MaxEventBytes, and one byte more is refused.
+func TestAnEventIsReadUpToItsBound(t *testing.T) {
+	at := func(size int) string {
+		e := `{"id":"` + uuid.NewString() + `","status":"sent","pad":"`
+		return e + strings.Repeat("x", size-len(e)-2) + `"}`
+	}
+	if _, err := Decode(at(MaxEventBytes)); err != nil {
+		t.Errorf("an event of %d bytes: %v, want it read", MaxEventBytes, err)
+	}
+	if _, err := Decode(at(MaxEventBytes + 1)); err == nil {
+		t.Errorf("an event of %d bytes was read", MaxEventBytes+1)
 	}
 }
