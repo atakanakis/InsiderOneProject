@@ -1001,14 +1001,19 @@ connection and subscribes again. Any error does the same, after a pause that sta
 subscribed to again without anyone's help; the events published meanwhile are lost
 (TestTheSubscriptionComesBackAfterRedisDropsIt, TestTheSubscriptionComesBackAfterAnOutage).
 An event larger than 1 KiB, or one that is not valid JSON with a UUID and a known status, is
-dropped and counted (TestAMalformedOrOversizedEventIsDropped).
+dropped before it is decoded and counted (TestAMalformedOrOversizedEventIsDropped,
+TestAnEventIsReadUpToItsBound). The Redis client has already read it; Redis is the service's
+own, so the bound is on what the API decodes and hands on.
 
 **The WebSocket endpoint** is `GET /v1/ws?notificationId=...&batchId=...`, behind the API key
 like every `/v1` path (TestWebSocketNeedsAnAPIKeyWhenConfigured). A client names what it
 wants to follow: up to 100 notification ids and up to 10 batch ids, each parameter repeated,
 at least one id; no id, too many, a value that is not a UUID, another parameter, or a request
-that is not a WebSocket upgrade is a 400 in the error form, before the upgrade
-(TestWebSocketFiltersAreBounded). A browser page of another origin (an `Origin` header whose
+that is not a WebSocket upgrade the library will take (HTTP/1.1 or later, `Connection:
+upgrade`, `Upgrade: websocket`, version 13, exactly one key of 16 bytes) is a 400 in the error
+form, before the connection bound and the database (TestWebSocketFiltersAreBounded). Until
+session 7's review an HTTP/1.0 upgrade or one with two keys passed these checks, read the
+database, and was then refused by the library in plain text (review F6). A browser page of another origin (an `Origin` header whose
 host is not the request's) is a 403, so a page cannot use a browser's network position to
 read statuses. There is no "every event" stream: each client receives only
 what it named.
@@ -1040,7 +1045,7 @@ hub, the subscription or another client wait.
 | What | Bound | When it is crossed | Test |
 |---|---|---|---|
 | Connections per API instance | 1000 (`api.MaxWebSockets`) | The next upgrade is a 503 in the error form, before the upgrade | TestWebSocketConnectionsAreBoundedPerInstance |
-| Messages waiting for one client | 256 (`api.WebSocketQueue`) | The client is disconnected (close code 1008, "too slow") and removed from the hub; the API's memory does not grow with what a client does not read | TestASlowWebSocketClientIsDisconnectedAndMemoryStaysBounded |
+| Messages waiting for one client | 256 (`api.WebSocketQueue`) | The client is disconnected (close code 1008, "too slow") and removed from the hub; the API's memory does not grow with what a client does not read. 256 is a burst allowance: a client that follows 10 batches at the full rate receives about 600 events per second, so it may fall about 0.4 s behind; the reviewer saw one such reader of 10 cut off during a burst with 990 other clients connected, and none in a second run (review F7). It reconnects and is sent the current state | TestAClientQueueHoldsItsBoundAndNoMore (256 kept, the 257th lets the client go), TestASlowWebSocketClientIsDisconnectedAndMemoryStaysBounded |
 | Time to write one message | 5 s | The connection is closed: a client that stops reading holds no goroutine or connection slot past it | TestAWriteToAClientThatStopsReadingEndsAtItsDeadline |
 | Messages from the client | none: the client sends nothing but control frames | The first data message closes the connection at once, its payload unread and without the close handshake: the library's handshake first reads the rest of the message, and a frame that announced 1 GiB and sent 100 bytes held the connection and its handler for as long as the client kept it open (found while building this test). A malformed frame (reserved bits, a control frame over 125 bytes) closes it with 1002, and an unmasked frame at once (RFC 6455, 5.1, requires the close, not a code). A control frame is at most 125 bytes | TestAWebSocketClientMustNotSendDataMessages |
 | Messages to the client | one event or one batch summary, under 1 KiB each | | the form above |
@@ -1048,7 +1053,9 @@ hub, the subscription or another client wait.
 | A quiet connection | no limit: a client may wait hours for a scheduled notification, as long as it answers pings. The server's request timeouts (section 8) end at the upgrade | | TestAWebSocketOutlivesTheServersRequestTimeouts |
 
 On shutdown the API closes every WebSocket with code 1001 ("going away"); a client reconnects
-to another instance and receives the current state again.
+to another instance and receives the current state again. A connection's end is counted by
+reason; a client that closes its TCP connection without a close frame is `client`, also when
+a ping of the server was out at that moment (review F8; TestAClientThatHangsUpIsCountedAsTheClients).
 
 ## 10. Observability
 
@@ -1056,11 +1063,17 @@ to another instance and receives the current state again.
 
 Structured JSON (`log/slog`). The API accepts or creates an `X-Correlation-ID`, stores it on
 the notification row, and the worker logs it on every line about that notification: the
-claim's row, the attempt, the result, a lost result write, the reaper's return. The provider
+attempt and its result, a result write that failed, the reaper's return. The provider
 receives the same id in `X-Correlation-ID` (section 7). So one id follows a message from the
 HTTP request to the provider call
 (TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider,
 TestEveryWorkerLineAboutANotificationCarriesItsCorrelationID).
+
+At the level that ships (`LOG_LEVEL=info`) the API writes one line per request and the worker
+one per attempt, whatever its outcome, each with the correlation id; at the full rate of three
+channels that is about 300 worker lines per second. Until session 7's review both were debug
+lines, so a notification that was delivered left no line at all at info, and only failures
+could be followed by their id (review F4). The test runs both processes at info.
 
 **A failing dependency is counted, not logged per try.** Session 5's reviewer made Postgres
 read-only: the worker wrote a warning for every retry of every result write, 3,200 lines in
@@ -1110,8 +1123,15 @@ is an increment or an observation in memory, made where the value is already kno
 `Classify`, in the gate, after `Finish`). The dispatcher's loop is unchanged.
 
 **The figures from Postgres** (queue depth and the oldest due row) are read by the API, once
-per 5 s at most, whatever the number of scrapes and requests; a scrape within 5 s of the last
-read is answered from it. The depth is one count over the rows in the four statuses, grouped
+per 5 s at most, whatever the number of scrapes and requests: one read at a time, which every
+caller in that time shares, and whose result is kept for 5 s whether it is a value or an
+error. A caller stops waiting at its own deadline: a scrape after 2 s, answered without these
+figures and with every other metric; a `/v1` request at its 5 s. So a stalled Postgres costs
+one read per 5 s, and no caller waits for another's turn. Until session 7's review a lock was
+held during the read and a failure was not kept: with Postgres paused, 20 callers of
+`/v1/metrics` each waited for the read before them and did their own, 11 got no answer
+within the server's 30 s, and scrapes of the API failed whole (review F3;
+TestAFailingFigureReadIsSharedKeptAndLeftByItsCallers). The depth is one count over the rows in the four statuses, grouped
 by channel and status, through the claim index and the reaper's index; the oldest due row is
 read from the claim index, one probe per channel and priority. The time is Postgres's
 (`now() - ready_at`, rule 7). The read has its own timeout of 2 s; when it fails, the figures
@@ -1126,11 +1146,14 @@ Per channel: the queue depth by status and the age of the oldest due row (as abo
 the attempts that started within the window, their number by outcome, the number of attempts
 per second, the share that delivered, and the 50th, 95th and 99th percentile of the attempt's
 duration and of the delivery latency (from the notification's creation to the start of the
-attempt that delivered it plus its duration). The attempts are found by a BRIN index on
+attempt that delivered it plus its duration). The latency counts every wait since creation:
+a scheduled notification's wait for its time, and the wait of one requeued by `/retry`
+(review F9); the time it was due is not stored apart from `ready_at`, which retries move. The attempts are found by a BRIN index on
 `delivery_attempts.started_at` (migration 5): attempt rows are only inserted, in time order,
 so the index is a few pages and needs no maintenance on the queue's path. An answer is
-computed at most once per 5 s per window and API instance, so any number of clients costs
-four queries every 5 s at most (TestTheMetricsEndpointReportsTheRecentWindow,
+computed at most once per 5 s per window and API instance, in the same way as the queue's
+figures. The queue's figures are two statements and a window's two more, so any number of
+clients costs at most ten statements per 5 s per instance (TestTheMetricsEndpointReportsTheRecentWindow,
 TestTheMetricsEndpointIsComputedOncePerFiveSeconds,
 TestTheWindowsAttemptsAreReadThroughTheirIndex). Measured with 2,080,000 notifications and an
 hour of attempts at the full rate (1,080,000): the counts and the percentiles of a 5-minute
@@ -1168,16 +1191,18 @@ the Compose `observability` profile. Each rule says what an operator does about 
 
 | Alert | Fires when | Means |
 |---|---|---|
-| `NotificationsBreakerOpen` | some worker's breaker of a channel has not been closed for 5 min | The provider fails for that channel (section 6) |
+| `NotificationsBreakerOpen` | some worker's breaker of a channel has not been closed for 5 min, while the channel has attempts | The provider fails for that channel (section 6). A breaker stays half-open on an idle channel until a row comes, because a claim that finds nothing marks no probe; with no attempt it is not an outage, and until session 7's review it paged (review F2) |
 | `NotificationsOldestDueRowTooOld` | the oldest due row of a channel has waited more than 5 min, for 5 min | Delivery is stalled or far behind |
 | `NotificationsGateRefusals` | more than 0.1 refusals per second at a channel's gate, for 10 min | More dispatchers per channel than the gate serves within its budget, or Redis is slow (section 13) |
 | `NotificationsFailedShareHigh` | more than 10% of a channel's finished attempts end `failed`, for 15 min | Messages are rejected or run out of attempts |
-| `NotificationsResultWritesFailing` | result writes fail, for 2 min | Postgres refuses writes; rows will be sent again after their lease (section 6) |
+| `NotificationsDatabaseFailing` | the workers' claims, result writes or reaps fail, for 2 min | Postgres refuses writes or does not answer; rows whose result was not stored are sent again after their lease (section 6). Made read-only, Postgres failed result writes only for the lease of the rows in flight, about a minute, and then claims on every loop; a rule on result writes alone went pending and resolved without firing (review F2) |
 | `NotificationsRateLimitUnavailable` | the rate-limit read fails, for 2 min | Redis is down or refuses writes; nothing is claimed (section 7) |
 | `NotificationsProviderClosesIdleConnections` | more than 0.05 attempts per second end `closed_idle`, for 15 min | The provider's keep-alive is shorter than `IDLE_CONN_TIMEOUT + GATE_BUDGET` (section 13) |
 | `NotificationsEventsDropped` | status events are dropped, for 10 min | Redis is down or slow for the publishers; delivery is not affected (section 9) |
+| `NotificationsAPIDown` | Prometheus cannot scrape the API, for 2 min | The API is down or stalled; the queue's figures, which only the API exports, are gone with it, so the rules on them cannot fire (review F2) |
+| `NotificationsNoWorker` | no worker answers its scrape, for 2 min | Nothing is delivered. Workers are found by DNS, so with none running there is no target at all: the rule asks for the absence of a worker that is up |
 
-Three checks keep a rule from being one that cannot fire (lesson 12):
+Four checks keep a rule from being one that cannot fire (lesson 12):
 
 1. Every rule has a `promtool` test (`deploy/prometheus/alerts_test.yml`) with a case where it
    fires. `make alerts` runs `promtool check rules` and `promtool test rules`; CI runs them.
@@ -1187,10 +1212,17 @@ Three checks keep a rule from being one that cannot fire (lesson 12):
    binaries: the test builds `cmd/api` and `cmd/worker`, runs them against Postgres, Redis and
    the recording provider, and reads their `/metrics`
    (TestEveryAlertRuleUsesMetricsTheBinariesExport). CI's compose job runs the same check
-   against the running stack.
+   against the running stack. `up` is Prometheus's own series, one per target; a rule's `job`
+   must be a job of `prometheus.yml`.
 3. Every metric a rule depends on is moved by a named test of the code path that produces it
    (the tests in the metrics table above, and TestAttemptsAndResultsAreCountedOnce,
    TestTheBreakerStateIsExportedWhenScraped, TestTheReaperCountsTheRowsItReturns).
+4. A rule's promtool input has the shape the failure produces on the running stack, not the
+   shape the rule expects. Checks 1 to 3 showed that a rule could fire on its own input; the
+   review showed that the result-write rule's input (errors for 10 minutes) was one a worker
+   never produces (review F2). Each rule was made to fire, or shown to stay quiet, on the
+   Compose stack, and its test's input follows what was seen there (session 7's review
+   record).
 
 ## 11. Invariants
 
@@ -1210,7 +1242,7 @@ the session that builds the part.
 | I8 | One send makes one connection, takes one permit and writes at most one request | Provider client (section 7, properties 1 to 5) | TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite (property 1), TestARefusedSendNeverReachesTheProvider and TestARefusedSendsConnectionIsClosedBeforeTheTransportGoesOn (property 2), TestADeadReusedConnectionIsNotReplayed (property 3), TestTheClientSpeaksHTTP11ToAServerThatOffersHTTP2 (property 4), TestRedirectsAreNotFollowed (property 5); the one deadline: TestOneDeadlineCoversConnectGateWriteAndResponse, TestAGateThatWaitsPastTheDeadlineTakesNoPermit |
 | I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule | The queue's part: TestClaimsInPriorityTurnTakeHigherPrioritiesFirst, TestClaimTakesOnlyItsChannelAndPriority. The loop (session 5): TestHighPriorityOvertakesBacklog; the claim batch rule: TestAWorkerHasAtMostOneClaimBatchWaitingForPermits. |
 | I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash; `ON CONFLICT DO NOTHING` then the stored hash decides | The database part: TestIdempotencyKeysAreUniqueInTheDatabase. The hash: TestTheRequestHashIgnoresFormAndDefaults. Through the API (session 6): TestConcurrentIdenticalRequestsCreateOneNotification (20 identical requests at once: one 201, 19 times 200, one row), TestAKeyReusedWithAnotherRequestIsAConflict, TestConcurrentIdenticalBatchesCreateOneBatch (10 identical batches of 100 at once: one batch, the same ids in the same order; another batch under the key is a 409). |
-| I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8; decoding that stops at the bound; the rendered length measured before rendering; one error writer | Request headers and the correlation id (section 8). Session 6, each at the bound, one under and one over: TestRequestBodiesAreBoundedAtTheirLimit, TestBatchSizeIsBoundedAtAThousand, TestContentIsBoundedPerChannelInCharacters, TestTemplateBodyBounds, TestVariablesAreCountedWhileDecoded, TestVariableNamesAreBounded, TestTheRenderedTotalOfARequestIsBounded, TestIdempotencyKeyAndTemplateNameBounds, TestRecipientFormatsPerChannel, TestFieldErrorsAreKeptUpToTheirBound, TestTheListIsOrderedAndPagedByCursor, TestTheTemplateListIsPagedWithoutBodies, TestTheAttemptHistoryIsBounded. What the server allocates, from the process's allocation counter: TestABatchOfManyEmptyItemsIsRefusedWithoutDecodingThemAll (8 MiB of `{}`, 2.8 million items: under 1 MiB), TestManyVariablesAreRefusedWhileDecoding (1 MiB of variables: 4 MiB), TestARequestOverTheRenderedTotalIsRefusedBeforeRendering (a batch that would render 384 MB: 4 MiB), TestATemplateIsCompiledOncePerRequest (500 items of a template with 16,000 placeholders, 8 MB rendered and stored: 72 MiB) (`go test -count=1 -v -run 'Decoding|BeforeRendering|CompiledOnce' ./internal/api`). Across requests (session 6's review, F1): TestConcurrentRequestsRenderInBoundedMemory (40 batches at once, each rendering 8 MB from 44 KB: the heap grows by 144 to 199 MiB, 745 MiB without the slots; `go test -count=6 -v -run TestConcurrentRequestsRenderInBoundedMemory ./internal/api`). Time: TestSlowRequestBodiesAreCutOff, TestAnswersToAClientThatDoesNotReadAreCutOff, TestARequestEndsAtItsDeadlineWhenPostgresStalls, TestAListPageReadsTheIndexFromItsCursor. Inputs that cannot be answered: TestAScheduledAtFromTheYear10000IsRefused, TestAnAnswerThatCannotBeEncodedIsA500, TestACursorOutsideTheTimeRangeIsRefused. What it returns: TestErrorBodiesStayWithinTheirBoundForAnyRequest. |
+| I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8; decoding that stops at the bound; the rendered length measured before rendering; one error writer | Request headers and the correlation id (section 8). Session 6, each at the bound, one under and one over: TestRequestBodiesAreBoundedAtTheirLimit, TestBatchSizeIsBoundedAtAThousand, TestContentIsBoundedPerChannelInCharacters, TestTemplateBodyBounds, TestVariablesAreCountedWhileDecoded, TestVariableNamesAreBounded, TestTheRenderedTotalOfARequestIsBounded, TestIdempotencyKeyAndTemplateNameBounds, TestRecipientFormatsPerChannel, TestFieldErrorsAreKeptUpToTheirBound, TestTheListIsOrderedAndPagedByCursor, TestTheTemplateListIsPagedWithoutBodies, TestTheAttemptHistoryIsBounded. What the server allocates, from the process's allocation counter: TestABatchOfManyEmptyItemsIsRefusedWithoutDecodingThemAll (8 MiB of `{}`, 2.8 million items: under 1 MiB), TestManyVariablesAreRefusedWhileDecoding (1 MiB of variables: 4 MiB), TestARequestOverTheRenderedTotalIsRefusedBeforeRendering (a batch that would render 384 MB: 4 MiB), TestATemplateIsCompiledOncePerRequest (500 items of a template with 16,000 placeholders, 8 MB rendered and stored: 72 MiB) (`go test -count=1 -v -run 'Decoding|BeforeRendering|CompiledOnce' ./internal/api`). Across requests (session 6's review, F1): TestConcurrentRequestsRenderInBoundedMemory (40 batches at once, each rendering 8 MB from 44 KB: the heap grows by 144 to 199 MiB, 745 MiB without the slots; `go test -count=6 -v -run TestConcurrentRequestsRenderInBoundedMemory ./internal/api`). Time: TestSlowRequestBodiesAreCutOff, TestAnswersToAClientThatDoesNotReadAreCutOff, TestARequestEndsAtItsDeadlineWhenPostgresStalls, TestAListPageReadsTheIndexFromItsCursor. Inputs that cannot be answered: TestAScheduledAtFromTheYear10000IsRefused, TestAnAnswerThatCannotBeEncodedIsA500, TestACursorOutsideTheTimeRangeIsRefused. What it returns: TestErrorBodiesStayWithinTheirBoundForAnyRequest. Session 7, the WebSocket (section 9): TestWebSocketConnectionsAreBoundedPerInstance, TestASlowWebSocketClientIsDisconnectedAndMemoryStaysBounded (1,000,000 events to a client that does not read: the heap did not grow), TestAWriteToAClientThatStopsReadingEndsAtItsDeadline, TestAWebSocketClientMustNotSendDataMessages (a frame that claims 1 GiB holds nothing), TestAWebSocketClientThatDoesNotAnswerPingsIsClosed, TestWebSocketFiltersAreBounded; events read from Redis: TestAMalformedOrOversizedEventIsDropped; the metrics: TestTheMetricsEndpointReportsTheRecentWindow (four windows), TestTheMetricsEndpointIsComputedOncePerFiveSeconds, TestMetricLabelsHaveBoundedValues. |
 | I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script | Queue: TestClaimSetsTheLeaseOnTheDatabaseClock, TestFinishStoresEachResultOnTheDatabaseClock. Redis: TestTheLimiterSendsRedisNoClockTime checks that no argument the limiter sends is a time, so the only clock a script can read is `TIME`; a script that read no clock would fail TestNoWindowHoldsMoreThanTheLimit. |
 | I13 | A status event is best-effort: publishing it never waits and never fails, so a lost or slow event never delays or changes a send, a result write or an answer of the API (session 7) | `events.Redis.Publish`: a bounded buffer and one sender with its own Redis client and a 1 s pipeline | TestPublishNeverBlocksWhenRedisHangs (12,288 events at once against a Redis that never answers: none waits, what does not fit is dropped and counted, the first pipeline is given up at 1 s); TestLostEventsDoNotAffectDelivery (300 rows sent at the limit with every event going to that Redis, and no slot held after the last result; with a publisher that waited, 30 of 300 were sent in 15 s); TestTheAPIAnswersWhileRedisHangs (a create, a batch of 1000 and a cancel each answered within 1 s); on the Compose stack with Redis stopped for 4 minutes, rows were created and the API stayed ready (session 7's record) |
 
