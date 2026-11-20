@@ -145,5 +145,7 @@ Measured again after the fixes, on the author's machine:
 | Worker told a grace period shorter than its shutdown timeout | exit 2, `STOP_GRACE_PERIOD (20s) must be longer than SHUTDOWN_TIMEOUT (25s), ...` | `docker compose run --rm --no-deps -e STOP_GRACE_PERIOD=20s worker` |
 | Worker stops cleanly | exit 0 in 0.18 s | `time docker compose stop worker`; `docker compose ps -a worker` |
 
-CI on the final pushed commit: see the commit list on GitHub; the run is checked with
-`gh run view` before the session is closed.
+CI on `42a3539` (the last code and document commit of the session), run 44706873109: lint,
+test, guards and compose all succeeded; the guards job printed `53 guards, 53 real, 0 failed`
+(`gh run view 44706873109`, and `--log` of the guards job). The commit that adds this
+paragraph changes only this file.
