@@ -100,7 +100,29 @@ What it cost and what it bought: two design reviews and three drafts, with no co
 Every one of the eight major findings would have been a defect and then a patch in the first
 version's way of working.
 
-### Session 1 and later
+### Session 1: skeleton (2026-11-20)
+
+The module, configuration, schema, health endpoints, worker and mock provider, the Compose
+stack and CI. Record: [sessions/01-skeleton.md](sessions/01-skeleton.md).
+
+- **Every guard was disabled on purpose.** `make guards` now does it as a command: for each
+  of 53 guards it breaks the line, checks that the package still compiles, and expects a
+  named test to fail. CI runs it on every push. A rule in a document became a check.
+- **The timing budget is enforced.** A worker whose lease is shorter than the send timeout
+  plus 30 s could send a message twice; it now refuses to start and names the relation.
+- **The one review found a major defect in a place the tests looked at but could not see.**
+  The readiness test used a fake dependency that behaved well; the real Redis client ignored
+  the deadline, and `/readyz` took 5 s instead of 2 s. The fix was a class fix: one place
+  builds every Redis client, and a test forbids any other. The same property guards the
+  rate limiter's wait in session 3. The lesson is the first version's again: test the real
+  part where its effect happens.
+- **The review also changed the design once.** The API had been made unready when Redis was
+  down, although it needs only Postgres to accept requests. The design was changed first,
+  then the code.
+- **One process change.** From this session on, each session has one review, run once after
+  the code is green; its fixes are proven by tests and the guard check, not by another review.
+
+### Session 2 and later
 
 Recorded here as each session finishes.
 
