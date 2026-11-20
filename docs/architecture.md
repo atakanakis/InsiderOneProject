@@ -478,6 +478,41 @@ unreachable `Available()` fails too, so nothing is even claimed. When only the p
 fails (a read-only replica after a failover, Redis out of memory), sends are refused, and
 those refusals open the breaker.
 
+**The limiter in detail** (`internal/ratelimit`, session 3). One key per channel,
+`ratelimit:<channel>`: a sorted set whose members are permits and whose scores are the Redis
+times at which they were granted, in microseconds.
+
+- **`Wait(ctx, channel)`** runs the take script. The script reads the clock with `TIME`,
+  removes the permits that are one window old or older, and grants one permit if fewer than
+  the limit remain: it adds a member (a random token from the caller, so two permits in one
+  microsecond are two members) and sets the key to expire one window later. If it refuses, it
+  returns the time until the oldest permit leaves the window, and `Wait` sleeps that long, or
+  until its context ends, and asks again. A permit granted at Redis time `t` counts for every
+  `now < t + window`, so any `limit + 1` permits span at least one window, and no half-open
+  window `[a, a + 1 s + margin)` holds more than the limit.
+- **Go passes no time to Redis.** The script is given the limit, the window as a duration and
+  the token; the clock is Redis's (I12). Workers' clocks do not matter.
+- **Microseconds, not milliseconds.** The first version stamped permits in milliseconds; the
+  truncation let two permits that were one window apart in milliseconds be up to 1 ms less
+  than a window apart in real time. Lua formats numbers with 14 significant digits, so the
+  scripts build the bound of a score range with `string.format('%d', ...)`, not `..`.
+- **`Available(ctx, channel)`** returns the number of free permits now. It is a separate
+  script, declared `#!lua flags=no-writes` and run with `EVAL_RO`: it reads `TIME` and counts
+  the permits younger than the window, and Redis itself refuses any write inside it. It
+  changes nothing, and it keeps working when only the take script fails: on a read-only
+  replica after a failover, and when Redis is out of memory (the take script is declared
+  `#!lua` without `allow-oom`, so Redis refuses it before it runs). This is the half-failure
+  that the breaker must see (section 6): `Available` says there is room, `Wait` refuses.
+- **Errors are never permits.** A Redis error, a script error or a malformed reply makes
+  `Wait` return an error. When the context ends while `Wait` sleeps, it returns the context's
+  error and has taken nothing. When the context ends during the script call, Redis may have
+  granted a permit whose reply never arrived; it counts against the limit and nothing is sent
+  on it. That costs at most one permit per cut-off call and never adds a request.
+- **The bound.** The set of a channel holds at most `limit` members, because a refused call
+  adds nothing, and the key expires one window after the last permit.
+- **No permit is given back** (CLAUDE.md, rule 4). The first version's `Refund`, and its
+  batch `Take`, are not carried over.
+
 There is no other place where a permit is taken, held, checked for age or given back.
 
 **Limits of the guarantee.** In each case the provider's 429 is the backstop: it is retried
@@ -540,6 +575,7 @@ known enum values. Errors name the field.
 | List page | 100 items; items are summaries without `content` |
 | Metrics window | 1 hour |
 | Database time per API request | Statement timeout of 5 s |
+| Rate-limit window in Redis (section 7) | At most `limit` permits per channel; the key expires one window after the last permit (TestTheWindowHoldsAtMostTheLimitAndExpires) |
 | Text stored from a delivery result (section 5) | Error and outcome 1 KiB, provider message id 256 bytes, valid UTF-8 (TestFinishStoresTextAtItsBound, TestFinishStoresAnyErrorTextWithinItsBound) |
 | WebSocket | 1000 connections per API instance; a client that cannot keep up is disconnected |
 | `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged (TestCorrelationIDBound, TestCorrelationIDIsAcceptedOrReplaced) |
