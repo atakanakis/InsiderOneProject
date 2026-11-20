@@ -4,13 +4,12 @@ A service that accepts notification requests (SMS, email, push) over an HTTP API
 them to an external provider, with a rate limit of 100 messages per second per channel,
 priorities, retries and live status tracking. Written in Go, with PostgreSQL and Redis.
 
-> **Status: build in progress.** The skeleton runs: the stack starts, the API answers its
-> health endpoints, the worker starts and stops, and the mock provider records what it
-> receives. The queue's five operations exist and are tested on Postgres, the rate limiter
-> exists and is tested on Redis, and the provider client with its send gate is tested
-> against a recording server through real connections. Nothing is delivered yet, because the
-> dispatcher that joins them comes in session 5. This README says only what exists; the
-> table below is updated at the end of every session.
+> **Status: build in progress.** The stack starts with two workers, and the workers deliver:
+> the queue (Postgres), the rate limiter (Redis), the provider client with its send gate,
+> and the dispatcher with its circuit breaker and reaper are built and tested, the last
+> under random faults. The API endpoints do not exist yet (session 6): until then rows are
+> added straight into the database with `make enqueue`. This README says only what exists;
+> the table below is updated at the end of every session.
 
 | # | Session | Status |
 |---|---|---|
@@ -19,8 +18,8 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 | 2 | Queue: the five operations | done ([record](docs/sessions/02-queue.md)) |
 | 3 | Rate limiter | done ([record](docs/sessions/03-ratelimit.md)) |
 | 4 | Provider client and the send gate | done ([record](docs/sessions/04-provider.md)) |
-| 5 | Dispatcher, breaker, reaper; fault tests | next |
-| 6 | API | |
+| 5 | Dispatcher, breaker, reaper; fault tests | done ([record](docs/sessions/05-dispatcher.md)) |
+| 6 | API | next |
 | 7 | Events, WebSocket, metrics, tracing, alerts | |
 | 8 | Hardening: independent review, soak, load test | |
 | 9 | Walkthrough and final documents | |
@@ -30,11 +29,19 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 Needs Docker and Go 1.27.
 
 ```sh
-make up          # Postgres, Redis, migrations, API, worker, mock provider
+make up          # Postgres, Redis, migrations, API, two workers, mock provider
 curl localhost:8080/healthz    # {"status":"ok"}
 curl localhost:8080/readyz     # {"postgres":"ok","redis":"ok","status":"ready"}
-curl localhost:9090/stats      # what the mock provider has received
+make enqueue N=1000            # 1000 notifications per channel, straight into the database
+make status                    # notifications by status: all sent after about 10 s
+curl localhost:9090/stats      # what the mock provider received; at most 100 per channel in any second
 make down        # stop and delete the data
+```
+
+The mock provider can fail on purpose, to watch retries and the circuit breaker:
+
+```sh
+MOCK_FAIL_RATE=0.2 MOCK_THROTTLE_RATE=0.05 MOCK_LATENCY=30ms docker compose up -d mockprovider
 ```
 
 | Command | What it does |

@@ -190,7 +190,47 @@ connection is ready and before the request is written. Record:
   Go hands over the raw connection and stops applying the request's deadline; the client
   waited as long as the provider kept the connection open. It no longer reads that body.
 
-### Session 5 and later
+### Session 5: dispatcher, breaker, reaper; fault tests (2026-11-20)
+
+The loop that joins the queue, the rate limiter and the provider client, with its circuit
+breaker and reaper. This is the part of the first version that received the most patches.
+Record: [sessions/05-dispatcher.md](sessions/05-dispatcher.md).
+
+- **The test that checks the invariants came first.** The randomised fault test was written
+  and committed against a stub, before the dispatcher, as lesson 15 asks. It runs two or three
+  workers through the real provider client and checks, at the provider's side, the limit, that
+  nothing is lost and nothing is accepted twice.
+- **The loop stayed small.** 29 lines, the shape the design drew before any code. Nothing is
+  reserved ahead: the breaker's probe is marked when a row really starts and cleared at its
+  single exit, so the seven hand-back paths of the first version have no counterpart.
+- **A long run found a duplicate, and the design already named it.** One scenario of 53 saw
+  four notifications accepted twice. Each had an attempt that ended with no response: the
+  test's own fault had closed a connection after the provider read the request. That is the
+  third at-least-once case of the design; the test now checks the guarantee as written, and
+  still fails on any other duplicate.
+- **A measurement replaced two models.** The design review and session 3's reviewer had
+  estimated waits of 2 to 3 s at the gate with 12 workers. The real dispatchers waited about
+  one window (1.05 s) with no refusal, because the limiter's hint stops all claims while the
+  window is full.
+- **The margin question was answered with numbers.** Session 4's CI saw 106 in one second
+  under the race detector. Through the dispatchers the delay from permit to arrival was at
+  most 2.3 ms without the race detector and 28.6 ms with it, against a margin of 50 ms. The
+  margin stays; a starved CPU is the case the design lists, and no margin bounds it.
+- **Six guards proved nothing on their first run,** each a fault of the guard: mutations that
+  did not compile, one that changed nothing, one that hung its test, one that mutated a line
+  its test never reaches. Each was fixed until its named test turned red.
+- **The review found the breaker's limits.** An address that accepts and closes connections
+  looked like an idle connection to Go and drained the queue with the breaker closed; it now
+  counts only on a reused connection. A Redis that refused writes let rows end `failed` with no
+  send; the fix removed a part: the limiter's read now fails exactly when its write would, so
+  nothing is claimed. With little traffic a per-worker breaker cannot save every row from a
+  wrong URL, and the design now says so instead of implying it.
+- **CI found three tests that trusted the machine.** Under the race detector on a busy runner a
+  lateness count, a deadline test and a test that read a pipe while waiting all failed. Each was
+  fixed as a class, and the timing guarantees are checked without the race detector, where CI
+  also measures them.
+
+### Session 6 and later
 
 Recorded here as each session finishes.
 

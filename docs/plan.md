@@ -15,8 +15,8 @@ early parts were lost by the time later parts were built.
 | 2 | Queue: the five operations | **done** (2026-11-20, [record](sessions/02-queue.md)) |
 | 3 | Rate limiter | **done** (2026-11-20, [record](sessions/03-ratelimit.md)) |
 | 4 | Provider client and the send gate | **done** (2026-11-20, [record](sessions/04-provider.md)) |
-| 5 | Dispatcher, breaker, reaper; fault tests | next |
-| 6 | API: notifications, batches, templates, idempotency | |
+| 5 | Dispatcher, breaker, reaper; fault tests | **done** (2026-11-20, [record](sessions/05-dispatcher.md)) |
+| 6 | API: notifications, batches, templates, idempotency | next |
 | 7 | Events, WebSocket, metrics, tracing, alerts | |
 | 8 | Hardening: full independent review, soak, load test | |
 | 9 | Walkthrough and final documents | |
