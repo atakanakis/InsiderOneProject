@@ -830,11 +830,15 @@ in `text`. Errors name the field (`notifications[3].recipient`).
 
 **Errors** have one form, written in one place:
 `{"error": {"code", "message", "fields": [{"field", "message"}], "moreFields"}}`. A message
-never quotes a value from the request; a field name that comes from the request (an unknown
-field, a variable name) is cut to 64 bytes, with every byte outside printable ASCII, `"` and
-`\` replaced. So the size of an error body does not depend on the request
-(TestErrorBodiesStayWithinTheirBoundForAnyRequest). The first version echoed the value of a
-too-long field into its message: a 99 KB request produced a 68 MB error.
+is a fixed text and never quotes a value from the request; a name that comes from the request
+(an unknown field, a variable name) passes through one function, `domain.Echo`, which keeps
+its first 64 bytes. With at most 100 fields the size of an error body does not depend on the
+request: 1000 items with every field wrong answer 8,690 bytes, and 1000 items each with a
+64-byte variable name that JSON escapes to six bytes a character, the largest the form
+allows, 28,494 bytes (TestErrorBodiesStayWithinTheirBoundForAnyRequest,
+`go test -count=1 -v -run TestErrorBodiesStayWithinTheirBoundForAnyRequest ./internal/api`).
+The first version echoed the value of a too-long field into its message: a 99 KB request
+produced a 68 MB error.
 
 **Decoding is bounded too.** The body is read through a limit (`http.MaxBytesReader`). The
 batch array is decoded one item at a time and the 1,001st item ends the request; the
@@ -854,7 +858,7 @@ items.
 | Template variables per notification | 50; names up to 64 characters |
 | Total rendered content per request | 16 MiB, calculated before rendering |
 | Template name, idempotency key | 64 and 128 characters |
-| Error response | 100 fields, the field name and the message 300 bytes each, plus a count of the rest; the whole body at most 64 KiB |
+| Error response | 100 fields, plus a count of the rest; a name from the request 64 bytes; the whole body at most 64 KiB (TestErrorBodiesStayWithinTheirBoundForAnyRequest, TestFieldErrorsAreKeptUpToTheirBound) |
 | List page | 100 items; items are summaries without `content` |
 | Template list page | 100 names, without bodies |
 | Attempt history in a status answer | The last 100 attempts, with the total count (`/retry` can add attempts without end) |
@@ -884,8 +888,8 @@ wait at the gate (section 7) depends on the same property
 
 **Authentication** is optional and off by default for local use: when `API_KEYS` is set (keys
 separated by commas), every `/v1` request needs one of them, in `Authorization: Bearer` or
-`X-API-Key`; otherwise 401. The keys are compared in constant time, each against every
-configured key. `/healthz`, `/readyz`, `/docs` and `/openapi.yaml` stay open.
+`X-API-Key`; otherwise 401 (TestAPIKeysAreRequiredWhenConfigured). The keys are compared in
+constant time, each against every configured key. `/healthz`, `/readyz`, `/docs` and `/openapi.yaml` stay open.
 
 **OpenAPI.** `GET /openapi.yaml` serves the specification, embedded in the binary; `GET /docs`
 a viewer. Every path, method and status code in it is produced by the real server in a test,
@@ -932,8 +936,8 @@ the session that builds the part.
 | I7 | `attempts` only goes up. Each claim is one attempt, and no attempt number is used twice. | Claim; Requeue raises `max_attempts` | TestAttemptsNeverGoDown (600 random steps of all five operations on six rows; a row that becomes final is replaced, the seed changes per run and is logged, and the test fails if any operation never took effect), TestRequeueRaisesMaxAttemptsByTheBudget |
 | I8 | One send makes one connection, takes one permit and writes at most one request | Provider client (section 7, properties 1 to 5) | TestTheGateRunsOnceWhenTheConnectionIsReadyAndBeforeTheWrite (property 1), TestARefusedSendNeverReachesTheProvider and TestARefusedSendsConnectionIsClosedBeforeTheTransportGoesOn (property 2), TestADeadReusedConnectionIsNotReplayed (property 3), TestTheClientSpeaksHTTP11ToAServerThatOffersHTTP2 (property 4), TestRedirectsAreNotFollowed (property 5); the one deadline: TestOneDeadlineCoversConnectGateWriteAndResponse, TestAGateThatWaitsPastTheDeadlineTakesNoPermit |
 | I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule | The queue's part: TestClaimsInPriorityTurnTakeHigherPrioritiesFirst, TestClaimTakesOnlyItsChannelAndPriority. The loop (session 5): TestHighPriorityOvertakesBacklog; the claim batch rule: TestAWorkerHasAtMostOneClaimBatchWaitingForPermits. |
-| I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash | The database part: TestIdempotencyKeysAreUniqueInTheDatabase. The request hash: session 6. |
-| I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8 | Request headers and the correlation id (section 8). The rest: session 6. |
+| I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash; `ON CONFLICT DO NOTHING` then the stored hash decides | The database part: TestIdempotencyKeysAreUniqueInTheDatabase. The hash: TestTheRequestHashIgnoresFormAndDefaults. Through the API (session 6): TestConcurrentIdenticalRequestsCreateOneNotification (20 identical requests at once: one 201, 19 times 200, one row), TestAKeyReusedWithAnotherRequestIsAConflict, TestConcurrentIdenticalBatchesCreateOneBatch (10 identical batches of 100 at once: one batch, the same ids in the same order; another batch under the key is a 409). |
+| I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8; decoding that stops at the bound; the rendered length measured before rendering; one error writer | Request headers and the correlation id (section 8). Session 6, each at the bound, one under and one over: TestRequestBodiesAreBoundedAtTheirLimit, TestBatchSizeIsBoundedAtAThousand, TestContentIsBoundedPerChannelInCharacters, TestTemplateBodyBounds, TestVariablesAreCountedWhileDecoded, TestVariableNamesAreBounded, TestTheRenderedTotalOfARequestIsBounded, TestIdempotencyKeyAndTemplateNameBounds, TestRecipientFormatsPerChannel, TestFieldErrorsAreKeptUpToTheirBound, TestTheListIsOrderedAndPagedByCursor, TestTheTemplateListIsPagedWithoutBodies, TestTheAttemptHistoryIsBounded. What the server allocates, from the process's allocation counter: TestABatchOfManyEmptyItemsIsRefusedWithoutDecodingThemAll (8 MiB of `{}`, 2.8 million items: under 1 MiB), TestManyVariablesAreRefusedWhileDecoding (1 MiB of variables: 4 MiB), TestARequestOverTheRenderedTotalIsRefusedBeforeRendering (a batch that would render 384 MB: 4 MiB), TestATemplateIsCompiledOncePerRequest (1000 items of a template with 16,000 placeholders, 16 MB rendered and stored: 134 MiB) (`go test -count=1 -v -run 'Decoding|BeforeRendering|CompiledOnce' ./internal/api`). What it returns: TestErrorBodiesStayWithinTheirBoundForAnyRequest. |
 | I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script | Queue: TestClaimSetsTheLeaseOnTheDatabaseClock, TestFinishStoresEachResultOnTheDatabaseClock. Redis: TestTheLimiterSendsRedisNoClockTime checks that no argument the limiter sends is a time, so the only clock a script can read is `TIME`; a script that read no clock would fail TestNoWindowHoldsMoreThanTheLimit. |
 
 Tests of I1, I4, I5 and I8 observe the system **from the provider's side**: a recording HTTP
@@ -1040,27 +1044,27 @@ Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on
 
 | Requirement | Where | Session |
 |---|---|---|
-| Create, with recipient, channel, content, priority | Section 8 | 6 |
-| Batch creation up to 1000 | Section 8 | 6 |
-| Status by id or batch id | Section 8 | 6 |
-| Cancel pending | Sections 5, 8 | 2, 6 |
-| List with filters and pagination | Section 8 | 6 |
+| Create, with recipient, channel, content, priority | Section 8: TestCreateAndReadANotification, TestEveryFieldIsValidatedAndNamed | 6 |
+| Batch creation up to 1000 | Section 8: TestBatchSizeIsBoundedAtAThousand, TestABatchIsValidatedWholeBeforeAnyIsStored | 6 |
+| Status by id or batch id | Section 8: TestCreateAndReadANotification, TestTheBatchSummaryCountsEveryStatus | 6 |
+| Cancel pending | Sections 5, 8: TestCancelOnlyFromWaitingStatusesThroughTheAPI | 2, 6 |
+| List with filters and pagination | Section 8: TestTheListIsOrderedAndPagedByCursor | 6 |
 | Asynchronous processing by queue workers | Sections 5, 6 | 2, 5 |
 | Rate limit of 100 per second per channel | Section 7 | 3, 4, 5 |
 | Priority queue | Sections 5, 6 | 2, 5 |
-| Content validation | Section 8 | 6 |
-| Idempotency | Sections 6, 8 | 5, 6 |
+| Content validation | Section 8: TestEveryFieldIsValidatedAndNamed, TestRecipientFormatsPerChannel, TestContentIsBoundedPerChannelInCharacters, TestContentAndVariablesMustNotContainNUL | 6 |
+| Idempotency | Sections 6, 8: I10 | 5, 6 |
 | Delivery and retry logic | Section 6 | 4, 5 |
 | Metrics endpoint | Section 10 | 7 |
 | Structured logging with correlation ids | Section 10 | 1, 7 |
 | Health check | Section 8 | 1 |
-| Bonus: failure handling (breaker, dead-letter state, retry endpoint) | Section 6 | 5, 6 |
-| Bonus: scheduled notifications | Sections 3, 5 | 2, 6 |
-| Bonus: templates | Section 8 | 6 |
+| Bonus: failure handling (breaker, dead-letter state, retry endpoint) | Section 6; `/retry`: TestRetryRequeuesOnlyAFailedNotification | 5, 6 |
+| Bonus: scheduled notifications | Sections 3, 5: TestAScheduledNotificationWaitsUntilItsTime | 2, 6 |
+| Bonus: templates | Section 8: TestTemplatesAreCreatedOnceAndRendered, TestTheRenderedLengthIsMeasuredBeforeRendering | 6 |
 | Bonus: WebSocket updates | Section 9 | 7 |
 | Bonus: distributed tracing | Section 10 | 7 |
 | Bonus: GitHub Actions | [Plan](plan.md) | 1 |
-| Docker Compose, OpenAPI, migrations, single-command tests | [Plan](plan.md) | 1, 6 |
+| Docker Compose, OpenAPI, migrations, single-command tests | [Plan](plan.md); OpenAPI: TestOpenAPIMatchesTheServer; the stack end to end through the API: CI's compose job (`tools/e2e`) | 1, 6 |
 
 ## 16. Deliberately left out
 

@@ -479,18 +479,11 @@ func ValidTemplateName(s string) bool {
 // variable name (architecture §8, "Errors").
 const MaxEchoedName = 64
 
-// Echo returns a name from the request as it may appear in an error: at most 64 bytes, with
-// every byte outside printable ASCII, and the quote and backslash that JSON would escape,
-// replaced. So an error's size does not depend on the request.
+// Echo returns a name from the request as it may appear in an error: its first 64 bytes. So
+// an error's size does not depend on the request (architecture §8, "Errors").
 func Echo(name string) string {
 	if len(name) > MaxEchoedName {
-		name = name[:MaxEchoedName]
+		return name[:MaxEchoedName]
 	}
-	b := []byte(name)
-	for i, c := range b {
-		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
-			b[i] = '?'
-		}
-	}
-	return string(b)
+	return name
 }

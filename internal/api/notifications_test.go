@@ -551,6 +551,14 @@ func TestErrorBodiesStayWithinTheirBoundForAnyRequest(t *testing.T) {
 			return a.post(t, "/v1/notifications", map[string]any{"recipient": "+905551234567", "channel": "sms", "template": "t",
 				"variables": map[string]string{"a": "x", strings.Repeat("Q", 500_000): "x"}})
 		},
+		// 1000 items each with a 64-byte name that JSON escapes to 6 bytes a character: the
+		// largest error the form allows.
+		"names that JSON escapes": func() reply {
+			return a.post(t, "/v1/notifications/batch", items(1000, func(int) map[string]any {
+				return map[string]any{"recipient": "+905551234567", "channel": "sms", "template": "t",
+					"variables": map[string]string{"a": "x", strings.Repeat("\"\x01<", 30): "x"}}
+			}))
+		},
 		"a long string where an object belongs": func() reply {
 			return a.do(t, http.MethodPost, "/v1/notifications", []byte(`{"variables":"`+strings.Repeat("Q", 500_000)+`"}`))
 		},
@@ -590,6 +598,8 @@ func TestErrorBodiesStayWithinTheirBoundForAnyRequest(t *testing.T) {
 		t.Errorf("%d fields kept, %v more", n, e["moreFields"])
 	}
 	t.Logf("every field of 1000 items wrong: %d bytes", len(r.raw))
+	r = cases["names that JSON escapes"]()
+	t.Logf("names that JSON escapes: %d bytes", len(r.raw))
 }
 
 func TestUnknownFieldsAndWrongTypesAreRefusedByName(t *testing.T) {
@@ -602,8 +612,9 @@ func TestUnknownFieldsAndWrongTypesAreRefusedByName(t *testing.T) {
 	if r := a.do(t, http.MethodPost, "/v1/notifications", []byte(`{"recipient":5}`)); r.code != http.StatusBadRequest || fmt.Sprint(r.errorFields(t)) != "[recipient]" {
 		t.Errorf("wrong type: %d %s", r.code, r.raw)
 	}
-	if r := a.do(t, http.MethodPost, "/v1/notifications", []byte(`{} {}`)); r.code != http.StatusBadRequest {
-		t.Errorf("two values: %d %s", r.code, r.raw)
+	valid, _ := json.Marshal(sms("x"))
+	if r := a.do(t, http.MethodPost, "/v1/notifications", append(valid, []byte(` {}`)...)); r.code != http.StatusBadRequest {
+		t.Errorf("a valid object and a second value: %d %s", r.code, r.raw)
 	}
 }
 

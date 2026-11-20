@@ -31,7 +31,6 @@ const (
 	MaxPage           = 100
 	DefaultPage       = 50
 	MaxErrorBodyBytes = 64 << 10
-	maxErrorText      = 300 // bytes of a field name or a message in an error
 	maxEchoedName     = domain.MaxEchoedName
 )
 
@@ -162,26 +161,10 @@ type apiError struct {
 	Status     string              `json:"status,omitempty"`
 }
 
-// clean bounds a text of an error answer: at most maxErrorText bytes of printable ASCII, with
-// nothing JSON would escape. With 100 fields the body stays under MaxErrorBodyBytes.
-func clean(s string) string {
-	if len(s) > maxErrorText {
-		s = s[:maxErrorText]
-	}
-	b := []byte(s)
-	for i, c := range b {
-		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
-			b[i] = '?'
-		}
-	}
-	return string(b)
-}
-
+// writeError writes the one error form. Its size does not depend on the request: a message is
+// a fixed text, and a name from the request has passed domain.Echo (64 bytes). At most 100
+// fields are kept, so the body stays under MaxErrorBodyBytes.
 func writeError(w http.ResponseWriter, code int, e apiError) {
-	e.Code, e.Message, e.Status = clean(e.Code), clean(e.Message), clean(e.Status)
-	for i := range e.Fields {
-		e.Fields[i] = domain.FieldError{Field: clean(e.Fields[i].Field), Message: clean(e.Fields[i].Message)}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
@@ -336,7 +319,8 @@ func decodeBatch(dec *json.Decoder) ([]domain.Input, *failure) {
 	return items, nil
 }
 
-// lookup reads and compiles, once each, the templates the items name (architecture §8).
+// lookup reads the templates the items name in one query, and compiles each on its first
+// use, once per request (architecture §8).
 func (s *server) lookup(r *http.Request, items []domain.Input) (domain.Lookup, error) {
 	var names []string
 	seen := map[string]bool{}
@@ -346,27 +330,34 @@ func (s *server) lookup(r *http.Request, items []domain.Input) (domain.Lookup, e
 			names = append(names, in.Template)
 		}
 	}
-	type compiled struct {
-		c  *domain.Compiled
-		ch domain.Channel
+	type template struct {
+		domain.Template
+		compiled *domain.Compiled
 	}
-	byName := map[string]compiled{}
+	byName := map[string]*template{}
 	if len(names) > 0 {
 		list, err := s.store.TemplatesNamed(r.Context(), names)
 		if err != nil {
 			return nil, err
 		}
 		for _, t := range list {
-			c, err := domain.CompileTemplate(t.Body)
-			if err != nil {
-				return nil, fmt.Errorf("stored template %s does not compile: %w", t.Name, err)
-			}
-			byName[t.Name] = compiled{c, t.Channel}
+			byName[t.Name] = &template{Template: t}
 		}
 	}
 	return func(name string) (*domain.Compiled, domain.Channel, bool) {
 		t, ok := byName[name]
-		return t.c, t.ch, ok
+		if !ok {
+			return nil, "", false
+		}
+		if t.compiled == nil {
+			c, err := domain.CompileTemplate(t.Body)
+			if err != nil { // a stored body always compiles: it was checked when created
+				s.log.ErrorContext(r.Context(), "stored template does not compile", "template", t.Name, "error", err)
+				return nil, "", false
+			}
+			t.compiled = c
+		}
+		return t.compiled, t.Channel, true
 	}, nil
 }
 

@@ -202,7 +202,7 @@ func TestVariableNamesAreBounded(t *testing.T) {
 	if _, err := CompileTemplate("{{." + at + "n}}"); err == nil {
 		t.Errorf("a name of %d characters accepted", MaxVariableNameLen+1)
 	}
-	for _, bad := range []string{"{{ .a }}", "{{.1a}}", "{{if .a}}x{{end}}", "{{.a", "{{"} {
+	for _, bad := range []string{"{{ .a }}", "{{.1a}}", "{{if .a}}x{{end}}", "{{.a", "{{", "{{xa}}", "{{-a}}"} {
 		if _, err := CompileTemplate(bad); err == nil {
 			t.Errorf("body %q accepted", bad)
 		}
@@ -322,9 +322,11 @@ func TestTheRequestHashIgnoresFormAndDefaults(t *testing.T) {
 	if bytes.Equal(Hash(a, b), Hash(a)) || bytes.Equal(Hash(a, t1), Hash(t1, a)) {
 		t.Error("a batch hash ignores the items or their order")
 	}
-	// Field boundaries are part of the hash: moving text from one field to the next changes it.
-	x := Input{Recipient: "ab", Channel: "sms", Content: str("c")}
-	y := Input{Recipient: "a", Channel: "sms", Content: str("bc")}
+	// Field boundaries are part of the hash: moving text from one field to the next changes
+	// it. A variable's value is followed by the priority; written without lengths, "bc" and
+	// "normal" read the same as "b" and "cnormal".
+	x := Input{Recipient: "+905551234567", Channel: "sms", Template: "t", Variables: Variables{{"a", "bc"}}}
+	y := Input{Recipient: "+905551234567", Channel: "sms", Template: "t", Variables: Variables{{"a", "b"}}, Priority: "cnormal"}
 	if bytes.Equal(Hash(x), Hash(y)) {
 		t.Error("the hash does not separate fields")
 	}
