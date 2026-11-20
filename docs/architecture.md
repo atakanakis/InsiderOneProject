@@ -181,11 +181,14 @@ RETURNING ...
   made, so there is no combined result that a later failure could drop.
 - The rows come back from `RETURNING` in no particular order; `Claim` sorts the at most `n`
   rows by `ready_at` in Go, so the statement keeps the plan above, with no sort in the
-  database.
+  database. The order is also in the SQL, not only in the index the planner happens to
+  choose: with index scans switched off the claim still takes the oldest rows
+  (TestClaimReturnsTheEarliestRowsInReadyAtOrder, TestClaimTakesTheEarliestDueRowsWithoutTheIndex).
 - The `id = ANY(ARRAY(...))` form is deliberate. The design review measured the more common
   `id IN (SELECT ...)` form under a forced generic plan (the plan a cached prepared statement
   can switch to): it scanned the whole table, 293 ms on 2 million rows. The `ANY(ARRAY(...))`
-  form stayed under 1 ms.
+  form stayed under 1 ms. The permanent test is TestClaimPlanReadsTheIndexInOrder (A3), and
+  `make guards` checks that it fails on the `IN` form.
 
 **The attempt number.** `attempts` after a claim is that claim's attempt number. It does two
 jobs with one rule: **it only ever goes up.** It counts attempts against `max_attempts`, and it
@@ -204,9 +207,15 @@ exception to this rule, for any kind of result. A final status stays final.
 
 A result is `sent`, `failed` or "retry in d". A retry on the last allowed attempt
 (`attempts >= max_attempts`) is stored as `failed`. The update decides this from the row's
-own counters, in the same statement, so no caller can get it wrong. The attempt row's
-`started_at` is `now()` minus the duration the caller measured: Go passes the duration, not
-the start time.
+own counters, in the same statement, so no caller can get it wrong
+(TestARetryOnTheLastAttemptIsStoredAsFailed). The attempt row's `started_at` is `now()` minus
+the duration the caller measured: Go passes the duration, not the start time
+(TestFinishStoresEachResultOnTheDatabaseClock).
+
+The text a result stores is bounded: the error 1 KiB, the provider's message id 256 bytes, cut
+at a character boundary, with invalid UTF-8 replaced and NUL removed. Postgres refuses both in
+`text`, and a result write that fails every time would get the row sent again after its lease
+(TestFinishStoresAnyErrorTextWithinItsBound).
 
 Finish returns the row's new status, or "stale". The caller publishes a status event only when
 the status really changed. If the reply to a Finish is lost and the caller writes the same
@@ -221,7 +230,9 @@ returns the ids and new statuses, for the status events.
 
 **Cancel** sets `cancelled` only `WHERE status IN ('scheduled', 'pending', 'retrying')`. A row
 that is being sent cannot be cancelled; the API answers 409. Cancel tells "no such row" apart
-from "not in a cancellable status", and returns the status it found.
+from "not in a cancellable status", and returns the status it found
+(TestCancelOnlyFromWaitingStatuses). A cancelled row is final: a late result, the reaper, a
+claim and a requeue all leave it alone (TestACancelledRowCannotBeRevived).
 
 **Requeue** (`POST /retry`) moves a `failed` row to `pending`, due now, and sets
 `max_attempts = attempts + the default budget`. It does not reset `attempts`, which keeps the
@@ -236,6 +247,7 @@ ignores the caller's cancellation (`context.WithoutCancel`, so the correlation i
 has its own timeout (10 s). A claim that is interrupted half-way could otherwise leave rows
 `processing` with nobody holding them. Cancel and Requeue follow the same rule: one rule for
 every queue write is simpler than a list of exceptions, and both are one short statement.
+(TestQueueWritesAreNotCutOffByACancelledCaller, TestQueueWritesHaveTheirOwnTimeout.)
 
 **Known behaviours.**
 - If the reply to a claim is lost after the statement committed (a dropped connection), the
@@ -573,17 +585,17 @@ the session that builds the part.
 | # | Invariant | Enforced in | Tests so far |
 |---|---|---|---|
 | I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | |
-| I2 | A row is never claimed by a second worker while its lease is valid | `SKIP LOCKED` and the status filter in Claim | |
-| I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish | The database part: TestAnAttemptNumberIsRecordedOnce (a repeated Finish cannot add a second attempt row). The `WHERE` of Finish: session 2. |
-| I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | |
+| I2 | A row is never claimed by a second worker while its lease is valid | `SKIP LOCKED` and the status filter in Claim | TestConcurrentClaimsNeverTakeTheSameRow (32 claimers, 2,000 rows), TestClaimTakesExactlyTheClaimableStatuses |
+| I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish | The database part: TestAnAttemptNumberIsRecordedOnce. The `WHERE` of Finish: TestFinishFromAStaleAttemptChangesNothing, TestFinishOnARowThatIsNoLongerProcessingChangesNothing, TestRepeatedFinishAddsNoSecondAttemptRow |
+| I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | Reap: TestReapReturnsExpiredRowsToPendingOrFailed, TestTwoReapersAtOnceReturnEachRowOnce. The single exit: session 5. |
 | I5 | An accepted notification is never lost: it ends as `sent`, `failed` or `cancelled` | I4 + retries + the `failed` state | |
 | I6 | A provider response always decides the verdict | `Classify` | |
-| I7 | `attempts` only goes up. Each claim is one attempt, and no attempt number is used twice. | Claim; Requeue raises `max_attempts` | |
+| I7 | `attempts` only goes up. Each claim is one attempt, and no attempt number is used twice. | Claim; Requeue raises `max_attempts` | TestAttemptsNeverGoDown (600 random steps of all five operations), TestRequeueRaisesMaxAttemptsByTheBudget |
 | I8 | One send makes one connection, takes one permit and writes at most one request | Provider client (section 7, properties 1 to 5) | |
-| I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule | |
+| I9 | A due row of a higher priority is claimed before a due row of a lower one. A worker has at most one claim batch that is claimed and not yet permitted. | Dispatcher loop order; the claim batch rule | The queue's part: TestClaimsInPriorityTurnTakeHigherPrioritiesFirst, TestClaimTakesOnlyItsChannelAndPriority. The loop: session 5. |
 | I10 | The same idempotency key never creates a second notification or batch | Unique indexes + request hash | The database part: TestIdempotencyKeysAreUniqueInTheDatabase. The request hash: session 6. |
 | I11 | No request can make the server allocate or return more than its stated bound | Bounds table, section 8 | Request headers and the correlation id (section 8). The rest: session 6. |
-| I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script | |
+| I12 | Queue times come from the Postgres clock; rate-limit times from the Redis clock | Queue SQL; Lua script | Queue: TestClaimSetsTheLeaseOnTheDatabaseClock, TestFinishStoresEachResultOnTheDatabaseClock. Redis: session 3. |
 
 Tests of I1, I4, I5 and I8 observe the system **from the provider's side**: a recording HTTP
 server stamps each request at the moment it arrives. They run through the real provider
@@ -595,7 +607,7 @@ client. The test kit does not contain a fake provider that could skip the send g
 |---|---|---|
 | A1 | Closing the connection in `GotConn`, then cancelling, stops a refused request from reaching the server. Cancelling alone does not. | **Measured** before the design was fixed: cancel alone let 13 of 40,000 refused requests through; close and cancel, 0 of 40,000 ([experiment 01](experiments/01-gate-refusal.md)). Permanent test in session 4. |
 | A2 | With `GetBody = nil` the transport never replays a request, so one send is one `GotConn` and at most one write | **Measured** by the design reviewer (one hook call, one request received). Permanent test in session 4. |
-| A3 | The claim reads the index in order with no sort and no full scan, under a custom plan and under a generic plan, also with many tied `ready_at` values and many rows that are not due yet | **Measured** by the second design reviewer on the final query: 2.8 million rows, 1 million of them future high-priority rows; 0.15 to 0.59 ms under both plans; a claim that finds nothing due reads 3 index pages. Permanent test in session 2. |
+| A3 | The claim reads the index in order with no sort and no full scan, under a custom plan and under a generic plan, also with many tied `ready_at` values and many rows that are not due yet | **Measured** by the second design reviewer on the final query: 2.8 million rows, 1 million of them future high-priority rows; 0.15 to 0.59 ms under both plans; a claim that finds nothing due reads 3 index pages. **Permanent test** (session 2): TestClaimPlanReadsTheIndexInOrder, on 300,000 rows (50,000 due with one `ready_at`, 200,000 not due, 50,000 finished). Under both plans: one ordered index scan, no sort, no sequential or bitmap scan of the claim index; a claim of 10 reads 4 index pages in 0.13 to 0.31 ms, a claim that finds nothing reads 3 pages in 0.03 ms (`go test -count=1 -v -run TestClaimPlanReadsTheIndexInOrder ./internal/store`). With the rejected `IN (SELECT ...)` form the generic plan is a sequential scan with a hash join, 32.5 ms (the same test, mutation applied by `make guards`). |
 | A4 | The time from permit to arrival at the provider varies by less than the 50 ms margin, on new and on reused connections | To measure in sessions 4 and 5 at the recording server |
 | A5 | With the claim batch rule, the wait at the gate stays near one window plus `10 × W / 100` seconds and nothing is refused, for up to 12 workers; throughput stays near the top speed | Simulated in the design review (93 to 96 sends per second, no refusals, worst wait 2.04 s at 12 workers). To measure on the real system in session 5. |
 | A6 | The sliding-window script grants at most the limit per window under concurrent callers | Carried over from the first version, where it held in 203 randomised fault scenarios. Re-proven in session 3. |
@@ -665,7 +677,8 @@ internal/observability logging, metrics, tracing
 internal/config        settings and the checks of section 13
 internal/recorder      the recording provider server: stamps each request on arrival,
                        injects responses, latency, slow TLS setup and closed connections
-internal/testkit       test database and test Redis (testcontainers); starts the recorder
+internal/testkit       test database and test Redis (testcontainers, or servers that
+                       make guards starts once); starts the recorder
 tools/guards           `make guards`: disables each guard and expects a named test to fail
 tools/testnames        checks that every test named in docs/ exists in the code
 ```
