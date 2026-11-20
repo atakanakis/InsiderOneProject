@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/events"
@@ -57,6 +58,8 @@ type Options struct {
 	// Hub hands status events to WebSocket clients (architecture §9); nil: a hub with the
 	// bounds of §9 that no event reaches.
 	Hub *Hub
+	// Tracing is the tracer provider (architecture §10); nil: one that records nothing.
+	Tracing trace.TracerProvider
 }
 
 //go:embed openapi.yaml

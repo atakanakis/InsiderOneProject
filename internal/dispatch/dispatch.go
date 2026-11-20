@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/events"
@@ -56,6 +57,8 @@ type Options struct {
 	Events      events.Publisher // nil: events are dropped
 	// Metrics are the worker's (architecture §10); nil: counted on a registry of their own.
 	Metrics *observability.WorkerMetrics
+	// Tracing is the tracer provider (architecture §10); nil: one that records nothing.
+	Tracing trace.TracerProvider
 }
 
 // Dispatcher serves one channel, with its own slots, breaker and waiting mark.
