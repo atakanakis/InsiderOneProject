@@ -66,23 +66,24 @@ func main() {
 		os.Exit(130)
 	}()
 
-	if os.Getenv(testkit.PostgresURLVar) == "" || os.Getenv(testkit.RedisURLVar) == "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		pgURL, redisURL, stop, err := testkit.StartServers(ctx)
-		cancel()
-		if err != nil {
-			stop()
-			fmt.Fprintf(os.Stderr, "start Postgres and Redis: %v\n", err)
-			os.Exit(1)
-		}
-		_ = os.Setenv(testkit.PostgresURLVar, pgURL)
-		_ = os.Setenv(testkit.RedisURLVar, redisURL)
-		code := run(*only)
+	// The servers are this run's own, and their URLs go only to the test processes it
+	// starts, never to the environment of the shell: each test process empties that Redis.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	pgURL, redisURL, stop, err := testkit.StartServers(ctx)
+	cancel()
+	if err != nil {
 		stop()
-		os.Exit(code)
+		fmt.Fprintf(os.Stderr, "start Postgres and Redis: %v\n", err)
+		os.Exit(1)
 	}
-	os.Exit(run(*only))
+	testEnv = append(os.Environ(), testkit.PostgresURLVar+"="+pgURL, testkit.RedisURLVar+"="+redisURL)
+	code := run(*only)
+	stop()
+	os.Exit(code)
 }
+
+// testEnv is the environment of the test processes: this run's servers.
+var testEnv []string
 
 func run(only string) int {
 	failed := 0
@@ -159,6 +160,7 @@ func goTest(pkg, run string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "test", "-count=1", "-v", "-run", run, pkg)
+	cmd.Env = testEnv
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

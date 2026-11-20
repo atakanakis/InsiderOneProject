@@ -2,11 +2,12 @@
 // testcontainers. A package that uses it calls Main from its TestMain; each test calls Setup.
 // The containers start on the first Setup; with `go test -short`, Setup skips the test.
 //
-// When TESTKIT_POSTGRES_URL and TESTKIT_REDIS_URL are set, no container is started: the test
+// When GUARDS_POSTGRES_URL and GUARDS_REDIS_URL are set, no container is started: the test
 // process creates its own new database on that Postgres server, migrates it and drops it at the
-// end, and uses that Redis. `make guards` starts the two servers once (StartServers) and runs
-// every test process against them, one at a time; Redis is emptied by each Setup, so the
-// variables are for sequential runs only.
+// end, and uses that Redis. Only `make guards` sets them: it starts the two servers once
+// (StartServers) and gives their URLs to the test processes it runs, one at a time, and to no
+// other process. Each Setup empties that Redis, so the variables must never name a Redis that
+// holds anything else.
 //
 // The recording provider server is in package recorder; Recorder below starts one for a test.
 package testkit
@@ -92,8 +93,8 @@ func Setup(t testing.TB) *Env {
 
 // Variables that point the tests at servers that are already running.
 const (
-	PostgresURLVar = "TESTKIT_POSTGRES_URL"
-	RedisURLVar    = "TESTKIT_REDIS_URL"
+	PostgresURLVar = "GUARDS_POSTGRES_URL"
+	RedisURLVar    = "GUARDS_REDIS_URL"
 )
 
 func start() (*Env, error) {
