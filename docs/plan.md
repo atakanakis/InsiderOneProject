@@ -32,8 +32,9 @@ Roles:
   claim against the repository, and writes the session record.
 - **Builder subagents** (Claude Opus) implement well-specified pieces from the brief when the
   lead delegates them.
-- **A reviewer subagent** (Claude Opus, a fresh instance each time, read-only) reviews the
-  session's change with no knowledge of the author's reasoning. It never reviews its own work.
+- **A reviewer subagent** (Claude Opus, a fresh instance, read-only) reviews the session's
+  change with no knowledge of the author's reasoning. It never reviews its own work. It runs
+  once per session.
 
 Steps:
 
@@ -41,8 +42,11 @@ Steps:
    the earlier sessions unless the brief names it.
 2. **Tests of the session's invariants first**, then the code.
 3. Run everything in "Definition of done".
-4. Independent review of the session's diff. Findings are fixed as classes, not as single
-   reproductions; a finding that shows the design is wrong changes `architecture.md` first.
+4. One independent review per session, run once, after the code is written and green. There
+   is no second round and no review of the fixes. The lead fixes the findings as classes, not
+   as single reproductions; a finding that shows the design is wrong changes `architecture.md`
+   first. Each fix is verified by its own named test and by the guard check (`make guards`),
+   not by a second review.
 5. Write the session record in `docs/sessions/NN-name.md`: what was built, what was measured,
    what the review found, what changed in the design, what is still open.
 6. Update the status table above, commit, push.
@@ -56,7 +60,8 @@ Steps:
       red. A guard that is disabled without any test failing is a failed session.
 - [ ] Every bound of `architecture.md` §8 that the session touches has a test at the bound.
 - [ ] Numbers written into documents come from a command that is written next to them.
-- [ ] The independent review is recorded in `docs/reviews/`, with each finding's resolution.
+- [ ] The session's one independent review (run once, after the code was green) is recorded in
+      `docs/reviews/`, with each finding's resolution and the test or guard that verifies it.
 - [ ] The session record exists and the status table is updated.
 - [ ] The dispatcher loop still fits on one screen (from session 5 on).
 

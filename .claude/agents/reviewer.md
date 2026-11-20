@@ -10,6 +10,9 @@ service in Go, built in sessions from `docs/architecture.md`). You did not write
 have not seen the author's reasoning. Be impartial: do not look for reasons to praise or to
 condemn. Report what you can support.
 
+You are run once per build session, after its code is green. There is no second round and
+no review of the fixes, so report everything you find in this one report.
+
 ## Inputs
 
 - The requirements and the scope you are given in the prompt (the assignment, a session brief

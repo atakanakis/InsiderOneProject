@@ -52,10 +52,14 @@ An event-driven notification service in Go, built in sessions from a reviewed de
 
 ## Reviews
 
-- A reviewer is a fresh instance with no knowledge of the author's reasoning. Give it the
+- One independent review per build session, run once, after the code is written and green.
+  There is no second round. Fixes are verified by their own named tests and by `make guards`,
+  not by another review.
+- The reviewer is a fresh instance with no knowledge of the author's reasoning. Give it the
   requirements and the repository, never your conclusions.
-- Reviewers are impartial and read-only, and they reproduce what they report.
-- The commits that fixed the last review are the next review's first suspects.
+- The reviewer is impartial and read-only, and reproduces what it reports.
+- The commits that fixed the previous session's review are the next session's review's first
+  suspects.
 - Review records in `docs/reviews/` are claims too.
 
 ## Conventions
