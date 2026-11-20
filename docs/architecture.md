@@ -851,7 +851,7 @@ items.
 | What | Limit |
 |---|---|
 | Request headers | 64 KiB, request line included, arriving within 5 s (TestRequestHeadersOverTheBoundAreRefused, TestSlowRequestHeadersAreCutOff) |
-| Request body | 1 MiB (8 MiB for a batch); one byte over is a 413. The whole request, body included, must arrive within 30 s, and the answer must be written within 30 s of the request's headers, so a client that sends or reads slowly cannot hold a connection and a handler (TestSlowRequestBodiesAreCutOff, TestAnswersToAClientThatDoesNotReadAreCutOff) |
+| Request body | 1 MiB (8 MiB for a batch); one byte over is a 413. The whole request, body included, must arrive within 30 s, and the answer must be written within 30 s of the request's headers, so a client that sends or reads slowly cannot hold a connection and a handler (TestSlowRequestBodiesAreCutOff, TestAnswersToAClientThatDoesNotReadAreCutOff, TestTheServerHasTheTimeoutsOfTheDesign) |
 | Batch size | 1000 notifications; the 1,001st ends the decoding |
 | Content after rendering | Per channel: SMS 1600 characters, push 4096, email 100,000 |
 | Template body | The content bound of its channel; at most 50 distinct variables |

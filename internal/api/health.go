@@ -87,6 +87,8 @@ func newServer(addr string, h http.Handler, t timeouts) *http.Server {
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: t.header,
+		ReadTimeout:       t.request,
+		WriteTimeout:      t.answer,
 		MaxHeaderBytes:    MaxHeaderBytes - headerSlack,
 		IdleTimeout:       60 * time.Second,
 	}

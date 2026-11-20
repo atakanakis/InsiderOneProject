@@ -1194,4 +1194,19 @@ var guards = []Guard{
 		Old: "if c.MaxAttempts <= 0 {", New: "if false {",
 		Package: "./internal/config", Test: "TestMaxAttemptsMustBePositive",
 	},
+	{
+		Name: "api: the whole request, body included, has a timeout", File: "internal/api/health.go",
+		Old: "ReadTimeout:       t.request,", New: "",
+		Package: "./internal/api", Test: "TestSlowRequestBodiesAreCutOff",
+	},
+	{
+		Name: "api: writing the answer has a timeout", File: "internal/api/health.go",
+		Old: "WriteTimeout:      t.answer,", New: "",
+		Package: "./internal/api", Test: "TestAnswersToAClientThatDoesNotReadAreCutOff",
+	},
+	{
+		Name: "api: the binary's server has the request timeout", File: "internal/api/health.go",
+		Old: "timeouts{header: HeaderTimeout, request: RequestTimeout, answer: AnswerTimeout}", New: "timeouts{header: HeaderTimeout, request: 0, answer: AnswerTimeout}",
+		Package: "./internal/api", Test: "TestTheServerHasTheTimeoutsOfTheDesign",
+	},
 }

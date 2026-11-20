@@ -897,6 +897,7 @@ func TestSlowRequestBodiesAreCutOff(t *testing.T) {
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	began := time.Now()
 	_, err = io.ReadAll(conn)
+	t.Logf("connection ended after %s", time.Since(began).Round(time.Millisecond))
 	if took := time.Since(began); took > 2*time.Second {
 		t.Fatalf("connection held for %s by an unfinished body (err %v)", took, err)
 	}
@@ -928,5 +929,13 @@ func TestAnswersToAClientThatDoesNotReadAreCutOff(t *testing.T) {
 	t.Logf("received %d of %d bytes", n, all)
 	if n > all/2 {
 		t.Errorf("the server kept writing to a client that did not read: %d of %d bytes", n, all)
+	}
+}
+
+// The server the API binary runs has the timeouts of architecture §8.
+func TestTheServerHasTheTimeoutsOfTheDesign(t *testing.T) {
+	srv := NewServer(":0", http.NotFoundHandler())
+	if srv.ReadHeaderTimeout != 5*time.Second || srv.ReadTimeout != 30*time.Second || srv.WriteTimeout != 30*time.Second {
+		t.Errorf("header %s, request %s, answer %s", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.WriteTimeout)
 	}
 }
