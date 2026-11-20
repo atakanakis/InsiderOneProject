@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"strconv"
@@ -77,9 +78,12 @@ func mustAvailable(t *testing.T, l *Limiter, ch domain.Channel) int {
 }
 
 // A6: many callers, on several connections, as several workers would be, ask for permits as
-// fast as they can. In the permits' own times (the Redis clock, as stored) no half-open window
-// of one second plus the margin holds more than the limit. The run must also reach the limit
-// in at least three windows, so that the check is not passed by a limiter that grants little.
+// fast as they can. Half of them wait in Wait's loop and so arrive when a permit frees; the
+// other half arrive at random moments, as new sends do, and ask once each time. In the
+// permits' own times (the Redis clock, as stored) no half-open window of one second plus the
+// margin holds more than the limit. The run must also reach the limit in a window and grant
+// at least three windows' worth, so that the check is not passed by a limiter that grants
+// little.
 func TestNoWindowHoldsMoreThanTheLimit(t *testing.T) {
 	const (
 		limit   = 100
@@ -108,8 +112,13 @@ func TestNoWindowHoldsMoreThanTheLimit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for range callers {
-			wg.Go(func() {
+		record := func(at int64) {
+			mu.Lock()
+			ats = append(ats, at)
+			mu.Unlock()
+		}
+		for range callers / 2 {
+			wg.Go(func() { // waits for each permit
 				for ctx.Err() == nil {
 					at, err := l.wait(ctx, domain.SMS)
 					if err != nil {
@@ -118,9 +127,22 @@ func TestNoWindowHoldsMoreThanTheLimit(t *testing.T) {
 						}
 						return
 					}
-					mu.Lock()
-					ats = append(ats, at)
-					mu.Unlock()
+					record(at)
+				}
+			})
+			wg.Go(func() { // arrives at random moments and asks once
+				for ctx.Err() == nil {
+					granted, at, _, err := l.take(ctx, domain.SMS)
+					if err != nil {
+						if ctx.Err() == nil {
+							t.Errorf("take: %v", err)
+						}
+						return
+					}
+					if granted {
+						record(at)
+					}
+					time.Sleep(time.Duration(rand.IntN(20_000)) * time.Microsecond)
 				}
 			})
 		}
@@ -227,7 +249,7 @@ func TestWaitWithAnEndedContextTakesNoPermit(t *testing.T) {
 // returns an error, never a permit, so the refusals reach the breaker (architecture §6, §7).
 func TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails(t *testing.T) {
 	cases := []struct {
-		name          string
+		name            string
 		breakIt, mendIt []any
 	}{
 		{"read-only replica", []any{"replicaof", "127.0.0.1", "1"}, []any{"replicaof", "no", "one"}},
