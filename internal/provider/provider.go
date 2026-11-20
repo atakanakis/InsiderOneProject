@@ -70,9 +70,9 @@ type Result struct {
 	Refusal error
 	// ConnReused is true when the send ran on a kept-alive connection.
 	ConnReused bool
-	// ClosedIdle is true when no response arrived because the provider closed the kept-alive
-	// connection before the request was written on it: Go's "server closed idle connection".
-	// Nothing reached the provider (architecture §6, "no response" case 2).
+	// ClosedIdle is true when no response arrived because the provider closed a kept-alive
+	// connection (ConnReused) before the request was written on it: Go's "server closed idle
+	// connection". Nothing reached the provider (architecture §6, "no response" case 2).
 	ClosedIdle bool
 
 	// Err is why no response arrived (connect, timeout, reset, refusal), or, when Responded
@@ -108,7 +108,7 @@ func New(o Options) (*Client, error) {
 	// The URL is the same for every message: a URL that cannot make a request would fail
 	// every one of them, so it is refused here (architecture §6, "no response" case 3).
 	if u, err := url.Parse(o.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("provider: %q is not an absolute http or https URL", o.URL)
+		return nil, errors.New("provider: the URL is not an absolute http or https URL with a host") // not quoted: it can hold a secret
 	}
 	if o.SendTimeout <= 0 || o.GateBudget <= 0 || o.DialTimeout <= 0 || o.TLSHandshakeTimeout <= 0 ||
 		o.IdleConns <= 0 || o.IdleConnTimeout <= 0 {
@@ -195,7 +195,9 @@ func (c *Client) send(ctx context.Context, m Message, gate Gate) Result {
 		if r.Refusal != nil {
 			r.Err = fmt.Errorf("refused at the send gate: %w", r.Refusal)
 		}
-		r.ClosedIdle = r.Refusal == nil && closedIdle(err)
+		// Only a kept-alive connection: on a new one the same error means an address that
+		// accepts connections and closes them, a broken channel (architecture §6).
+		r.ClosedIdle = r.Refusal == nil && r.ConnReused && closedIdle(err)
 		return r
 	}
 	defer func() { _ = resp.Body.Close() }()

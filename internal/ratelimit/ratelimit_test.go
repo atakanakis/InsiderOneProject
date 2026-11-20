@@ -247,7 +247,11 @@ func TestWaitWithAnEndedContextTakesNoPermit(t *testing.T) {
 // Only the take script fails while reads still work: a read-only replica after a failover, or
 // a Redis out of memory. Available keeps answering (the dispatcher keeps claiming), and Wait
 // returns an error, never a permit, so the refusals reach the breaker (architecture §6, §7).
-func TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails(t *testing.T) {
+// Architecture §7: when Redis refuses writes (a read-only replica after a failover, Redis out
+// of memory), Available fails exactly as the take script does, so nothing is claimed and no
+// attempt is spent at a gate that cannot give a permit. Until session 5's review Available kept
+// working in this case (review F2).
+func TestAvailableFailsWhenTheTakeScriptWould(t *testing.T) {
 	cases := []struct {
 		name            string
 		breakIt, mendIt []any
@@ -269,8 +273,8 @@ func TestAvailableWorksAndWaitFailsWhenOnlyTheScriptFails(t *testing.T) {
 			}
 			t.Cleanup(mend)
 
-			if n, err := l.Available(ctxFor(t, 5*time.Second), domain.SMS); err != nil || n != 4 {
-				t.Fatalf("Available = %d, %v; want 4 and no error", n, err)
+			if n, err := l.Available(ctxFor(t, 5*time.Second), domain.SMS); err == nil {
+				t.Fatalf("Available = %d while Redis refuses writes; want an error", n)
 			}
 			if err := l.Wait(ctxFor(t, 2*time.Second), domain.SMS); err == nil {
 				t.Fatal("Wait returned a permit while the script fails")

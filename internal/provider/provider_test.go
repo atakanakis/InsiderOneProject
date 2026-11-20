@@ -905,6 +905,33 @@ func TestAConnectionClosedByTheProviderAtTheGateIsReportedAsClosedIdle(t *testin
 	if r.Responded || !r.ConnReused || !r.ClosedIdle {
 		t.Errorf("a kept-alive connection closed at the gate: %+v, want no response, reused, ClosedIdle", r)
 	}
+	// An address that accepts a new connection and closes it before the request: Go reports
+	// the same error, but it is a broken channel, not an idle connection (session 5's review,
+	// F1).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	closing := newClient(t, testOptions("http://"+ln.Addr().String()+"/send"))
+	for range 20 {
+		r := closing.Send(bg(t), message(domain.SMS), func(context.Context) error {
+			time.Sleep(20 * time.Millisecond) // the close reaches the client
+			return nil
+		})
+		if r.Responded || r.ConnReused || r.ClosedIdle {
+			t.Fatalf("a new connection closed by the provider: %+v, want no response and not ClosedIdle", r)
+		}
+	}
 	closeAfterRequest.Store(true)
 	for _, reused := range []bool{false, true} {
 		if !reused {
@@ -923,8 +950,11 @@ func TestNewRefusesAURLThatIsNotAbsoluteHTTP(t *testing.T) {
 	for _, u := range []string{"", "localhost:9090/send", "/send", "ftp://provider/send", "http://", "http//provider",
 		"https:///send", "http://provider:port/send", "http://provider/%zz"} {
 		o := testOptions(u)
-		if _, err := New(o); err == nil {
+		_, err := New(o)
+		if err == nil {
 			t.Errorf("New accepted the URL %q", u)
+		} else if u != "" && strings.Contains(err.Error(), u) {
+			t.Errorf("the error quotes the URL, which can hold a secret: %v", err)
 		}
 	}
 	for _, u := range []string{"http://provider/send", "https://provider", "http://127.0.0.1:9090/send?x=1"} {
@@ -953,5 +983,13 @@ func TestACorrelationIDOutsideItsBoundIsNotSent(t *testing.T) {
 	}
 	if srv.Received() != 4 {
 		t.Errorf("the provider received %d requests, want 4", srv.Received())
+	}
+	at := message(domain.SMS) // exactly at the bound: sent
+	at.CorrelationID = strings.Repeat("a", 64)
+	if r := c.Send(bg(t), at, allow); !r.Responded {
+		t.Fatalf("a correlation id of 64 characters: %+v", r)
+	}
+	if got := srv.Requests()[4].Header.Get("X-Correlation-ID"); got != at.CorrelationID {
+		t.Errorf("a correlation id of 64 characters arrived as %q", got)
 	}
 }

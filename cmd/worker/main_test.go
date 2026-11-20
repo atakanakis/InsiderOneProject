@@ -309,3 +309,28 @@ func TestAKilledWorkersRowComesBackThroughTheReaper(t *testing.T) {
 		t.Errorf("exit status %d", code)
 	}
 }
+
+// The provider URL can hold a secret (a webhook.site path, credentials in the URL); the
+// worker logs only its scheme and host (session 5's review, a nit).
+func TestTheWorkerLogsOnlyTheProvidersHost(t *testing.T) {
+	e := testkit.Setup(t)
+	var out syncBuffer
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, envOf(map[string]string{"DATABASE_URL": e.DatabaseURL, "REDIS_URL": e.RedisURL,
+			"PROVIDER_URL": "http://user:hunter2@127.0.0.1:1/b8a1f00d-secret-path"}), &out)
+	}()
+	waitFor(t, &out, "worker started")
+	stop()
+	<-done
+	log := out.String()
+	if !strings.Contains(log, "http://127.0.0.1:1") {
+		t.Errorf("the log does not name the provider's host:\n%s", log)
+	}
+	for _, secret := range []string{"hunter2", "b8a1f00d", "user"} {
+		if strings.Contains(log, secret) {
+			t.Errorf("the log contains %q from the provider URL:\n%s", secret, log)
+		}
+	}
+}

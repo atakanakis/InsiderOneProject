@@ -230,14 +230,15 @@ func (s *stamps) sortedWaits() []time.Duration {
 
 // workerSpec describes one worker of a test.
 type workerSpec struct {
-	channels   []domain.Channel
-	limit      int
-	margin     time.Duration
-	opts       Options
-	provider   provider.Options
-	wrapQueue  func(Queue) Queue
-	stamps     *stamps
-	reaperTick time.Duration // 0: no reaper
+	channels     []domain.Channel
+	limit        int
+	margin       time.Duration
+	opts         Options
+	provider     provider.Options
+	wrapQueue    func(Queue) Queue
+	stamps       *stamps
+	reaperTick   time.Duration    // 0: no reaper
+	reaperEvents events.Publisher // nil: the reaper's events are dropped
 }
 
 type runningWorker struct {
@@ -263,10 +264,6 @@ func startWorker(t testing.TB, env *testkit.Env, spec workerSpec) *runningWorker
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := provider.New(spec.provider)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var q Queue = store.NewQueue(pool)
 	if spec.wrapQueue != nil {
 		q = spec.wrapQueue(q)
@@ -280,8 +277,8 @@ func startWorker(t testing.TB, env *testkit.Env, spec workerSpec) *runningWorker
 	var wg sync.WaitGroup
 	for _, ch := range spec.channels {
 		o := spec.opts
-		o.Channel = ch
-		d, err := New(o, q, l, client)
+		o.Channel, o.Provider = ch, spec.provider
+		d, err := New(o, q, l)
 		if err != nil {
 			cancel()
 			t.Fatal(err)
@@ -290,12 +287,11 @@ func startWorker(t testing.TB, env *testkit.Env, spec workerSpec) *runningWorker
 		wg.Go(func() { d.Run(ctx) })
 	}
 	if spec.reaperTick > 0 {
-		r := Reaper{Queue: store.NewQueue(pool), Tick: spec.reaperTick, Log: spec.opts.Log, Events: events.Discard{}}
+		r := Reaper{Queue: store.NewQueue(pool), Tick: spec.reaperTick, Log: spec.opts.Log, Events: spec.reaperEvents}
 		wg.Go(func() { r.Run(ctx) })
 	}
 	go func() {
 		wg.Wait()
-		client.CloseIdleConnections()
 		_ = rdb.Close()
 		pool.Close()
 		close(w.done)
@@ -430,17 +426,18 @@ func attemptOutcomes(t testing.TB, pool *pgxpool.Pool, id uuid.UUID) []string {
 }
 
 // everyClaimReachedFinish checks I4's first half from the database: every claim (the sum of
-// attempts) has its attempt row, written only by Finish, and no lease expired.
+// attempts) has its attempt row, which only Finish writes. That a lease expired cannot be read
+// from the rows, because a later Finish overwrites last_error; the callers count the reapers'
+// events instead.
 func everyClaimReachedFinish(t testing.TB, pool *pgxpool.Pool) {
 	t.Helper()
-	var claims, finished, expired int
+	var claims, finished int
 	if err := pool.QueryRow(bg(t), `SELECT
     (SELECT coalesce(sum(attempts), 0) FROM notifications),
-    (SELECT count(*) FROM delivery_attempts),
-    (SELECT count(*) FROM notifications WHERE last_error = 'lease expired')`).Scan(&claims, &finished, &expired); err != nil {
+    (SELECT count(*) FROM delivery_attempts)`).Scan(&claims, &finished); err != nil {
 		t.Fatal(err)
 	}
-	if claims != finished || expired != 0 {
-		t.Errorf("%d claims, %d attempt rows written by Finish, %d leases expired: a claimed row did not reach Finish", claims, finished, expired)
+	if claims != finished {
+		t.Errorf("%d claims, %d attempt rows written by Finish: a claimed row did not reach Finish", claims, finished)
 	}
 }

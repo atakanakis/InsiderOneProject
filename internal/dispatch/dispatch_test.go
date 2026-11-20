@@ -128,7 +128,9 @@ func TestTheVerdictTableHoldsForRealSends(t *testing.T) {
 }
 
 // A broken configuration stops the channel; it does not drain the queue into failed.
-// 404 and 401 are failures of the channel: the breaker opens and the rows wait.
+// 404 and 401 are failures of the channel: each worker's breaker opens, and while it is open
+// a worker spends one attempt per open period, on its probe. Two workers, through two open
+// periods: no row of the backlog fails (architecture §6, "What the breaker protects").
 func TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue(t *testing.T) {
 	for _, code := range []int{http.StatusNotFound, http.StatusUnauthorized} {
 		t.Run(http.StatusText(code), func(t *testing.T) {
@@ -137,54 +139,61 @@ func TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue(t *testing.T
 				return recorder.Response{Status: code}
 			}})
 			insertRows(t, e.Pool, domain.SMS, 100, always(domain.Normal), 3)
-			w := oneWorker(t, e, srv, testOptions(t))
-			d := w.dispatchers[domain.SMS]
-			if !waitFor(5*time.Second, func() bool { return d.breaker.State() == Open }) {
-				t.Fatalf("the breaker did not open; the provider received %d requests", srv.Received())
+			opts := testOptions(t)
+			opts.BreakerOpen = 1500 * time.Millisecond
+			var ds []*Dispatcher
+			for range 2 {
+				ds = append(ds, oneWorker(t, e, srv, opts).dispatchers[domain.SMS])
 			}
-			time.Sleep(time.Second)
+			if !waitFor(5*time.Second, func() bool { return ds[0].breaker.State() != Closed && ds[1].breaker.State() != Closed }) {
+				t.Fatalf("the breakers did not open; the provider received %d requests", srv.Received())
+			}
+			// Rows that started before a breaker opened may still arrive; count from when none is
+			// in flight (as in TestTheHalfOpenBreakerLetsExactlyOneRowThrough).
+			if !waitFor(5*time.Second, func() bool { return statusCounts(t, e.Pool)[domain.Processing] == 0 }) {
+				t.Fatal("rows of before the opening are still in flight")
+			}
+			opened, began := srv.Received(), time.Now()
+			time.Sleep(2*opts.BreakerOpen + 500*time.Millisecond) // two open periods and more
 			counts := statusCounts(t, e.Pool)
 			if counts[domain.Failed] != 0 {
 				t.Errorf("%d rows failed: a %d drained the queue", counts[domain.Failed], code)
 			}
-			if n := srv.Received(); n > 50 {
-				t.Errorf("the provider received %d requests while the breaker was meant to stop the channel", n)
+			// Each worker sends at most one probe per open period that began in the window.
+			most := 2 * (int(time.Since(began)/opts.BreakerOpen) + 1)
+			if probes := srv.Received() - opened; probes > most {
+				t.Errorf("%d requests in %v of two workers whose breakers are open; want at most the probes, %d",
+					probes, time.Since(began).Round(100*time.Millisecond), most)
 			}
-			t.Logf("received %d; statuses %v", srv.Received(), counts)
+			t.Logf("received %d before the breakers opened, %d after; statuses %v", opened, srv.Received()-opened, counts)
 		})
 	}
 }
 
-// The half-failure of architecture §7: Available works, the take script fails (Redis out of
-// memory). Every send is refused with a limiter error, which opens the breaker; nothing is
-// sent and no row fails.
-func TestABrokenTakeScriptOpensTheBreakerAndFailsNoRowWithoutASend(t *testing.T) {
+// Architecture §7: a Redis that refuses writes (out of memory here) makes Available fail as
+// well, so nothing is claimed, no attempt is spent and nothing is sent, for longer than an
+// open period of the breaker (session 5's review, F2: with Available still answering, every
+// probe spent an attempt and rows ended failed without a send).
+func TestARedisThatRefusesWritesClaimsNothing(t *testing.T) {
 	e := testkit.Setup(t)
 	srv := testkit.Recorder(t, recorder.Options{})
 	if err := e.Redis.ConfigSet(bg(t), "maxmemory", "1").Err(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = e.Redis.ConfigSet(context.Background(), "maxmemory", "0").Err() })
-	insertRows(t, e.Pool, domain.SMS, 30, always(domain.Normal), 6)
-	st := newStamps()
-	w := startWorker(t, e, workerSpec{
-		channels: []domain.Channel{domain.SMS}, limit: 100, margin: 50 * time.Millisecond,
-		opts: testOptions(t), provider: providerOptions(srv, false), stamps: st,
-	})
-	d := w.dispatchers[domain.SMS]
-	if !waitFor(5*time.Second, func() bool { return d.breaker.State() == Open }) {
-		t.Fatalf("the breaker did not open; %d limiter errors", st.limiterErr.Load())
-	}
-	time.Sleep(time.Second)
+	insertRows(t, e.Pool, domain.SMS, 30, always(domain.Normal), 2)
+	opts := testOptions(t)
+	opts.BreakerOpen = time.Second
+	oneWorker(t, e, srv, opts)
+	time.Sleep(3 * time.Second)
 	var attempts int
 	if err := e.Pool.QueryRow(bg(t), `SELECT sum(attempts) FROM notifications`).Scan(&attempts); err != nil {
 		t.Fatal(err)
 	}
 	counts := statusCounts(t, e.Pool)
-	if srv.Received() != 0 || counts[domain.Failed] != 0 || attempts > 20 {
-		t.Errorf("received %d, failed %d, attempts %d; want 0, 0 and at most two claim batches", srv.Received(), counts[domain.Failed], attempts)
+	if srv.Received() != 0 || attempts != 0 || counts[domain.Failed] != 0 {
+		t.Errorf("received %d, attempts %d, failed %d while Redis refused writes; want none", srv.Received(), attempts, counts[domain.Failed])
 	}
-	t.Logf("limiter errors %d, attempts %d, statuses %v", st.limiterErr.Load(), attempts, counts)
 }
 
 // flakyFinish fails the first result writes of every row: the first before it commits, the
@@ -400,12 +409,8 @@ func TestAWorkerHasAtMostOneClaimBatchWaitingForPermits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := provider.New(providerOptions(srv, true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	opts.Channel = domain.SMS
-	d, err := New(opts, countingQueue{Queue: store.NewQueue(e.Pool), c: c}, countingLimiter{Limiter: lim, c: c}, client)
+	opts.Channel, opts.Provider = domain.SMS, providerOptions(srv, true)
+	d, err := New(opts, countingQueue{Queue: store.NewQueue(e.Pool), c: c}, countingLimiter{Limiter: lim, c: c})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,6 +447,14 @@ func TestTheHalfOpenBreakerLetsExactlyOneRowThrough(t *testing.T) {
 	d := w.dispatchers[domain.SMS]
 	if !waitFor(5*time.Second, func() bool { return d.breaker.State() == Open }) {
 		t.Fatal("the breaker did not open")
+	}
+	// Rows that started before the breaker opened may still reach the provider; the probe is
+	// the first request after all of them (session 5's review, F3).
+	if !waitFor(5*time.Second, func() bool { return statusCounts(t, e.Pool)[domain.Processing] == 0 }) {
+		t.Fatal("rows of before the opening are still in flight")
+	}
+	if d.breaker.State() != Open {
+		t.Fatal("the breaker is no longer open; the test came too late")
 	}
 	opened := srv.Received()
 	const probeTime = 800 * time.Millisecond
@@ -557,10 +570,6 @@ func TestTheReaperReturnsExpiredRowsAndPublishesTheirStatus(t *testing.T) {
 // New refuses settings that would make the loop misbehave, and a missing part.
 func TestNewRefusesSettingsThatAreNotPositive(t *testing.T) {
 	srv := testkit.Recorder(t, recorder.Options{})
-	client, err := provider.New(providerOptions(srv, false))
-	if err != nil {
-		t.Fatal(err)
-	}
 	rdb, err := redisclient.New("redis://127.0.0.1:1/0") // never dialled
 	if err != nil {
 		t.Fatal(err)
@@ -573,10 +582,10 @@ func TestNewRefusesSettingsThatAreNotPositive(t *testing.T) {
 	q := store.NewQueue(nil)
 	valid := func() Options {
 		o := testOptions(t)
-		o.Channel = domain.SMS
+		o.Channel, o.Provider = domain.SMS, providerOptions(srv, false)
 		return o
 	}
-	if _, err := New(valid(), q, lim, client); err != nil {
+	if _, err := New(valid(), q, lim); err != nil {
 		t.Fatalf("New refused valid options: %v", err)
 	}
 	for i, mutate := range []func(*Options){
@@ -591,20 +600,18 @@ func TestNewRefusesSettingsThatAreNotPositive(t *testing.T) {
 		func(o *Options) { o.Retry.Cap = 0 },
 		func(o *Options) { o.Retry.Soon = 0 },
 		func(o *Options) { o.Channel = "fax" },
+		func(o *Options) { o.Provider.URL = "" },
 	} {
 		o := valid()
 		mutate(&o)
-		if _, err := New(o, q, lim, client); err == nil {
+		if _, err := New(o, q, lim); err == nil {
 			t.Errorf("case %d: New accepted %+v", i, o)
 		}
 	}
-	if _, err := New(valid(), q, lim, nil); err == nil {
-		t.Error("New accepted no provider client")
-	}
-	if _, err := New(valid(), nil, lim, client); err == nil {
+	if _, err := New(valid(), nil, lim); err == nil {
 		t.Error("New accepted no queue")
 	}
-	if _, err := New(valid(), q, nil, client); err == nil {
+	if _, err := New(valid(), q, nil); err == nil {
 		t.Error("New accepted no limiter")
 	}
 }

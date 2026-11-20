@@ -17,7 +17,9 @@ package dispatch
 //     Go's server marks a connection active only after it has read the whole request
 //     (net/http server.go, lines 2079 to 2082), so a request can be read, handled and
 //     accepted on a connection that is closed under it;
-//   - I4: every claim reached Finish (an attempt row for every attempt, no expired lease).
+//   - I4: every claim reached Finish: an attempt row for every attempt, and the reapers
+//     returned no row;
+//   - a row ends failed only when the provider rejected it (422).
 //
 // The faults: claims that return late, result writes that fail before they commit and
 // results whose commit is lost on the way back, 503 and 429 answers, latency, answers that
@@ -65,14 +67,15 @@ type scenario struct {
 	failP          float64 // the provider answers 503
 	throttleP      float64 // the provider answers 429 with Retry-After: 1
 	closeP         float64 // the provider closes the connection without an answer
+	rejectP        float64 // the provider answers 422: the message is rejected and ends failed
 	latencyMax     time.Duration
 	closeIdleEvery time.Duration // the provider closes its idle kept-alive connections; 0 never
 }
 
 func (s scenario) String() string {
-	return fmt.Sprintf("seed=%d workers=%d tls=%v handshake=%v stall=%.2f/%v writeFail=%.2f writeLost=%.2f 503=%.2f 429=%.2f close=%.2f latency<%v closeIdle=%v",
+	return fmt.Sprintf("seed=%d workers=%d tls=%v handshake=%v stall=%.2f/%v writeFail=%.2f writeLost=%.2f 503=%.2f 429=%.2f 422=%.2f close=%.2f latency<%v closeIdle=%v",
 		s.seed, s.workers, s.tls, s.handshakeDelay, s.stallP, s.stallMax, s.writeFailP, s.writeLostP,
-		s.failP, s.throttleP, s.closeP, s.latencyMax, s.closeIdleEvery)
+		s.failP, s.throttleP, s.rejectP, s.closeP, s.latencyMax, s.closeIdleEvery)
 }
 
 func randomScenario(seed uint64) scenario {
@@ -88,6 +91,7 @@ func randomScenario(seed uint64) scenario {
 		failP:      0.1 * r.Float64(),
 		throttleP:  0.05 * r.Float64(),
 		closeP:     0.05 * r.Float64(),
+		rejectP:    0.03 * r.Float64(),
 		latencyMax: time.Duration(5+r.IntN(80)) * time.Millisecond,
 	}
 	if s.tls {
@@ -196,6 +200,8 @@ func runScenario(t *testing.T, sc scenario) {
 				resp.Status = http.StatusServiceUnavailable
 			case d.chance(sc.throttleP):
 				resp.Status, resp.Header = http.StatusTooManyRequests, http.Header{"Retry-After": {"1"}}
+			case d.chance(sc.rejectP):
+				resp.Status = http.StatusUnprocessableEntity
 			}
 			return resp
 		}),
@@ -221,9 +227,10 @@ func runScenario(t *testing.T, sc scenario) {
 	}
 	st := newStamps()
 	opts := testOptions(t)
+	reaped := &recordingEvents{got: map[uuid.UUID]domain.Status{}}
 	for range sc.workers {
 		startWorker(t, e, workerSpec{
-			channels: channels, limit: limit, margin: margin, opts: opts,
+			channels: channels, limit: limit, margin: margin, opts: opts, reaperEvents: reaped,
 			provider: providerOptions(srv, sc.tls), stamps: st, reaperTick: 500 * time.Millisecond,
 			wrapQueue: func(q Queue) Queue { return faultyQueue{Queue: q, d: d, s: sc} },
 		})
@@ -282,6 +289,29 @@ func runScenario(t *testing.T, sc scenario) {
 		}
 	}
 	everyClaimReachedFinish(t, e.Pool)
+	if n := reaped.count(); n != 0 {
+		t.Errorf("the reapers returned %d rows: a claimed row did not reach Finish within its lease (%s)", n, sc)
+	}
+	// A failed row was rejected by the provider (422) on its last attempt: no row has used its
+	// 25 attempts, and a row the provider accepted is sent.
+	frows, err := e.Pool.Query(bg(t), `SELECT id FROM notifications WHERE status = 'failed'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failed []uuid.UUID
+	for frows.Next() {
+		var id uuid.UUID
+		if err := frows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		failed = append(failed, id)
+	}
+	frows.Close()
+	for _, id := range failed {
+		if o := attemptOutcomes(t, e.Pool, id); len(o) == 0 || o[len(o)-1] != "rejected" {
+			t.Errorf("%s is failed after attempts %v; only a rejection should end a row here (%s)", id, o, sc)
+		}
+	}
 	n, median, longest := st.waitStats()
 	t.Logf("statuses %v; %d requests received; %d waits at the gate, median %v, longest %v; %d refused for no permit in time, %d limiter errors",
 		counts, received, n, median.Round(time.Millisecond), longest.Round(time.Millisecond), st.noPermit.Load(), st.limiterErr.Load())

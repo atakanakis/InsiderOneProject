@@ -7,7 +7,7 @@
 // limit (A6, TestNoWindowHoldsMoreThanTheLimit). Next to the set, a second key holds the limit
 // and the window the set was filled with; a worker with other settings is refused.
 //
-// The scripts use #!lua flags and EVAL_RO: Redis 7.0 or later.
+// The scripts use #!lua shebangs: Redis 7.0 or later.
 //
 // Wait is the send gate's call; the provider client (session 4) is the only caller. Available
 // is the dispatcher's hint; it only reads.
@@ -77,12 +77,14 @@ func New(rdb *redis.Client, limit int, margin time.Duration) (*Limiter, error) {
 }
 
 // readScript returns the number of free permits, or an error for a worker whose settings differ
-// from the window's. Declared no-writes and run with EVAL_RO, it works on a read-only replica
-// and when memory is full, and Redis refuses any write in it.
+// from the window's. It has no write command, so it changes nothing. It is declared with no
+// flags, so Redis treats it as a script that may write: on a read-only replica and when memory
+// is full it is refused, exactly as the take script is, and nothing is claimed (architecture
+// §7, "fails closed"; until session 5's review it was declared no-writes and kept answering).
 //
 // KEYS[1] the channel's set; KEYS[2] the set's settings; ARGV[1] the limit; ARGV[2] the window
 // in microseconds.
-var readScript = redis.NewScript(`#!lua flags=no-writes
+var readScript = redis.NewScript(`#!lua
 local held = redis.call('GET', KEYS[2])
 if held and held ~= ARGV[1] .. '/' .. ARGV[2] then
   return redis.error_reply('rate limit: this worker has limit/window ' .. ARGV[1] .. '/' .. ARGV[2] .. ', the window has ' .. held)
@@ -97,7 +99,7 @@ return math.max(0, tonumber(ARGV[1]) - used)
 // answer is a hint that can be wrong a moment later (architecture §6). An unreachable Redis is
 // an error.
 func (l *Limiter) Available(ctx context.Context, ch domain.Channel) (int, error) {
-	n, err := readScript.RunRO(ctx, l.rdb, []string{key(ch), settingsKey(ch)}, l.limit, l.window.Microseconds()).Int()
+	n, err := readScript.Run(ctx, l.rdb, []string{key(ch), settingsKey(ch)}, l.limit, l.window.Microseconds()).Int()
 	if err != nil {
 		return 0, fmt.Errorf("rate limit read: %w", err)
 	}

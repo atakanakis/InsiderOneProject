@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -76,16 +77,11 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		log.Error("rate limit", "error", err)
 		return 2
 	}
-	client, err := provider.New(provider.Options{
+	providerOptions := provider.Options{ // each dispatcher builds its own client from these
 		URL: cfg.ProviderURL, SendTimeout: budget.SendTimeout, GateBudget: budget.GateBudget,
 		DialTimeout: budget.DialTimeout, TLSHandshakeTimeout: budget.TLSHandshakeTimeout,
 		IdleConns: budget.IdleConns, IdleConnTimeout: budget.IdleConnTimeout,
-	})
-	if err != nil {
-		log.Error("provider", "error", err)
-		return 2
 	}
-	defer client.CloseIdleConnections()
 	queue := store.NewQueue(pool)
 	publisher := events.Discard{} // the Redis publisher comes in session 7
 
@@ -94,9 +90,9 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 		d, err := dispatch.New(dispatch.Options{
 			Channel: ch, Slots: budget.Slots, ClaimBatch: budget.ClaimBatch, Lease: budget.Lease,
 			PauseBusy: budget.PauseBusy, PauseIdle: budget.PauseIdle, BreakerOpen: budget.BreakerOpen,
-			Retry: dispatch.RetryPolicy{Base: budget.BackoffBase, Cap: budget.BackoffCap, Soon: time.Second},
-			Log:   log, Events: publisher,
-		}, queue, limiter, client)
+			Retry:    dispatch.RetryPolicy{Base: budget.BackoffBase, Cap: budget.BackoffCap, Soon: time.Second},
+			Provider: providerOptions, Log: log, Events: publisher,
+		}, queue, limiter)
 		if err != nil {
 			log.Error("dispatcher", "channel", ch, "error", err)
 			return 2
@@ -106,7 +102,7 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 	reaper := dispatch.Reaper{Queue: queue, Tick: budget.ReaperTick, Log: log, Events: publisher}
 	running.Go(func() { reaper.Run(ctx) })
 
-	log.Info("worker started", "provider_url", cfg.ProviderURL,
+	log.Info("worker started", "provider", providerHost(cfg.ProviderURL),
 		"lease", budget.Lease.String(), "send_timeout", budget.SendTimeout.String(),
 		"shutdown_timeout", budget.ShutdownTimeout.String())
 	<-ctx.Done()
@@ -125,4 +121,14 @@ func run(ctx context.Context, getenv func(string) string, out io.Writer) int {
 			"shutdown_timeout", budget.ShutdownTimeout.String())
 		return 1
 	}
+}
+
+// providerHost is the provider URL's scheme and host. The rest of the URL can hold a secret (a
+// webhook.site path, credentials) and is never logged (architecture §7).
+func providerHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(not a URL)"
+	}
+	return u.Scheme + "://" + u.Host
 }

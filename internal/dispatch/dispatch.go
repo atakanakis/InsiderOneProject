@@ -49,6 +49,7 @@ type Options struct {
 	PauseIdle   time.Duration // the pause when a claim found nothing
 	BreakerOpen time.Duration
 	Retry       RetryPolicy
+	Provider    provider.Options // the dispatcher builds its own client: no pool is shared
 	Log         *slog.Logger     // nil: no logs
 	Events      events.Publisher // nil: events are dropped
 }
@@ -58,20 +59,20 @@ type Dispatcher struct {
 	o        Options
 	queue    Queue
 	limiter  Limiter
-	provider *provider.Client // a concrete type: no provider can skip the send gate (rule 9)
+	provider *provider.Client // its own, built by New: no provider can skip the send gate (rule 9)
 	breaker  *Breaker
 	slots    chan struct{} // one token per send in flight
 	waiting  atomic.Int64  // rows claimed and not yet back from the gate
 	inflight sync.WaitGroup
 }
 
-// New returns a dispatcher for o.Channel.
-func New(o Options, q Queue, l Limiter, c *provider.Client) (*Dispatcher, error) {
+// New returns a dispatcher for o.Channel, with its own provider client built from o.Provider.
+func New(o Options, q Queue, l Limiter) (*Dispatcher, error) {
 	if _, err := domain.ParseChannel(string(o.Channel)); err != nil {
 		return nil, fmt.Errorf("dispatch: %w", err)
 	}
-	if q == nil || l == nil || c == nil {
-		return nil, errors.New("dispatch: a queue, a limiter and a provider client are needed")
+	if q == nil || l == nil {
+		return nil, errors.New("dispatch: a queue and a limiter are needed")
 	}
 	if o.Slots <= 0 || o.ClaimBatch <= 0 || o.ClaimBatch > o.Slots || o.Lease <= 0 || o.PauseBusy <= 0 ||
 		o.PauseIdle <= 0 || o.BreakerOpen <= 0 || o.Retry.Base <= 0 || o.Retry.Cap <= 0 || o.Retry.Soon <= 0 {
@@ -83,6 +84,10 @@ func New(o Options, q Queue, l Limiter, c *provider.Client) (*Dispatcher, error)
 	if o.Events == nil {
 		o.Events = events.Discard{}
 	}
+	c, err := provider.New(o.Provider)
+	if err != nil {
+		return nil, fmt.Errorf("dispatch: %w", err)
+	}
 	return &Dispatcher{o: o, queue: q, limiter: l, provider: c, breaker: NewBreaker(o.BreakerOpen, time.Now),
 		slots: make(chan struct{}, o.Slots)}, nil
 }
@@ -90,6 +95,7 @@ func New(o Options, q Queue, l Limiter, c *provider.Client) (*Dispatcher, error)
 // Run claims and sends until ctx ends, then waits for the rows in flight; their sends and
 // result writes are not cancelled (architecture §6, shutdown). This is the loop of §6.
 func (d *Dispatcher) Run(ctx context.Context) {
+	defer d.provider.CloseIdleConnections()
 	defer d.inflight.Wait()
 	for ctx.Err() == nil {
 		n := d.room(ctx)
