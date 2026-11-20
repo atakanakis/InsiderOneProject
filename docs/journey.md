@@ -230,7 +230,45 @@ Record: [sessions/05-dispatcher.md](sessions/05-dispatcher.md).
   fixed as a class, and the timing guarantees are checked without the race detector, where CI
   also measures them.
 
-### Session 6 and later
+### Session 6: the API (2026-11-20)
+
+The front door: create, batch, status, list, cancel, retry, templates, API keys, OpenAPI.
+Record: [sessions/06-api.md](sessions/06-api.md).
+
+- **The first version's worst API defect was the starting point.** A 99 KB request there
+  produced a 68 MB error, because an error message quoted the value it refused. Here every
+  input and every output has a bound in the design before any code, with a test at the bound,
+  one under and one over; error texts are fixed and a name from the request passes one
+  function that keeps 64 bytes. The largest error the form allows measured 28,494 bytes.
+- **Bounds on what the server allocates, not only on what it accepts.** 8 MiB of `{}` is 2.8
+  million batch items; the batch is decoded one item at a time and refused at the 1,001st,
+  with under 1 MiB allocated. A template's rendered length is calculated from its compiled
+  parts before anything is rendered, so a 100 KB batch that would render 384 MB is refused
+  with 4 MiB allocated. The tests read the process's allocation counter.
+- **Idempotency is one statement, not a check and a write.** `INSERT ... ON CONFLICT DO
+  NOTHING`, then the stored request hash decides between "the same request" and a conflict. 20
+  identical requests at once made one row; 10 identical batches, one batch with the same ids
+  in the same order.
+- **A part was removed from the design before it was built.** The design listed a service
+  layer; every use case turned out to be "validate, then one statement", so it went.
+- **The guards found weak tests, and a full disk.** Every API test passed on its first run.
+  The guard run then showed three guards that proved nothing: two tests that did not test the
+  line they named, and a mutation that did not compile. A second cleaning step in the error
+  writer could not be reached by any request, so no guard could prove it, and it was removed.
+  The machine's disk filled during the run (22 GB of Go build cache), which stopped Docker;
+  the cache was cleared and the run repeated.
+- **The review found what bounds per request do not cover.** The reviewer, with no time
+  limit and the stack running, confirmed idempotency under 200 concurrent requests and every
+  bound it probed, then found three classes the tests had missed: nothing bounded rendering
+  across requests (40 small requests took the API to 1.1 GiB), a send's error still quoted the
+  provider URL's secret path and the API now showed it (session 5 had fixed two instances of
+  that class, not the class), and the list cursor was a filter rather than an index bound
+  (300 ms per page at 1.9 million rows). Each was answered in the design first, then with a
+  red test: 4 rendering slots and an 8 MiB rendered bound (745 MiB became 144 to 199 MiB), the
+  URL dropped where an error leaves the provider client, and one redundant condition that
+  turned 14 ms into 0.02 ms.
+
+### Session 7 and later
 
 Recorded here as each session finishes.
 
