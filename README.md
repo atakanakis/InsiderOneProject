@@ -60,8 +60,9 @@ tests before the code. The full account is in [the journey](docs/journey.md).
 ## How it is built
 
 - **Sessions.** One session builds one part from a written brief, with a fresh context.
-- **Agents.** A lead agent (Claude Fable) holds the architecture. Builder and reviewer
-  subagents (Claude Opus) implement and review. A reviewer is always a fresh instance that has
+- **Agents.** The design was written by a lead agent on Claude Fable and reviewed by Claude
+  Opus. Each build session is led by an agent on Claude Opus, with Opus builder and reviewer
+  subagents. A reviewer is always a fresh instance that has
   not seen the author's reasoning, cannot edit, and has to reproduce what it reports.
 - **Evidence.** A session is done when each of its guards has been disabled on purpose and a
   named test failed. Numbers in documents have the command next to them. Assumptions are

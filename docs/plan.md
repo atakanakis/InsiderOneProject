@@ -27,8 +27,9 @@ Roles:
 
 - **The candidate** decides scope and trade-offs, reads the result of every session, and
   starts the next session only after being able to explain the last one.
-- **The lead** (Claude Fable, the main session) owns the architecture, writes or directs the
-  code, checks every claim against the repository, and writes the session record.
+- **The lead** (the main agent of the session; Claude Opus for the build sessions, each in a
+  new conversation) builds from the architecture, writes or directs the code, checks every
+  claim against the repository, and writes the session record.
 - **Builder subagents** (Claude Opus) implement well-specified pieces from the brief when the
   lead delegates them.
 - **A reviewer subagent** (Claude Opus, a fresh instance each time, read-only) reviews the

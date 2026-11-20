@@ -59,8 +59,9 @@ So the first version was renamed as the trial, its lessons were written down
 - **I** decide scope and trade-offs, read every session's result, and start the next session
   only when I can explain the last one. Being able to explain the core without the agent is a
   requirement of this rebuild, because the first version failed it.
-- **The lead agent** (Claude Fable) holds the architecture, writes or directs the code, and
-  checks claims against the repository.
+- **The lead agent** of a session holds to the architecture, writes or directs the code, and
+  checks claims against the repository. The design session (session 0) was led on Claude
+  Fable. The build sessions are led on Claude Opus, each in a new conversation.
 - **Builder subagents** (Claude Opus) implement well-specified pieces.
 - **Reviewer subagents** (Claude Opus, a fresh instance each time, read-only, no knowledge of
   the author's reasoning) review each session. Agent definitions are in
