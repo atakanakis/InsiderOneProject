@@ -4,14 +4,18 @@ up: ## Build and start the stack: Postgres, Redis, migrate, API, worker, mock pr
 	docker compose up --build -d --wait api worker mockprovider
 	@echo "API: http://localhost:8080/readyz   Mock provider: http://localhost:9090/stats"
 
+up-observability: ## The stack with Prometheus (localhost:9091, the alert rules) and Jaeger (localhost:16686); tracing on
+	OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile observability up --build -d --wait
+	@echo "Prometheus: http://localhost:9091/alerts   Jaeger: http://localhost:16686"
+
 down: ## Stop the stack and delete its data
-	docker compose down -v
+	docker compose --profile observability down -v
 
 logs:
 	docker compose logs -f api worker
 
 N ?= 100
-e2e: ## Send N notifications per channel through the API and wait until all are sent; KEY=... when API_KEYS is set
+e2e: ## Follow one notification over the WebSocket, send N per channel through the API, wait until all are sent; KEY=... when API_KEYS is set
 	go run ./tools/e2e -n $(N) $(if $(KEY),-key $(KEY))
 
 status: ## Count the notifications by status

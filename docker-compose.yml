@@ -1,8 +1,12 @@
 # One command: docker compose up --build
 #
-#   API            http://localhost:8080/healthz, http://localhost:8080/readyz
+#   API            http://localhost:8080/healthz, /readyz, /metrics, /v1/metrics, /v1/ws
 #   Mock provider  http://localhost:9090/stats
-#   Workers        two (WORKER_REPLICAS); make e2e sends through the API, make status counts
+#   Workers        two (WORKER_REPLICAS), each with /metrics on port 9100 inside the network;
+#                  make e2e sends through the API and follows one over the WebSocket
+#
+# make up-observability adds Prometheus (http://localhost:9091, with the alert rules of
+# deploy/prometheus) and Jaeger (http://localhost:16686), and turns tracing on.
 #
 # Every setting of internal/config can be set in an optional .env file.
 
@@ -18,6 +22,8 @@ x-app: &app
     DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
     REDIS_URL: redis://redis:6379/0
     LOG_LEVEL: ${LOG_LEVEL:-info}
+    # Empty: tracing is off. make up-observability sets it to the Jaeger below.
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
 services:
   postgres:
@@ -107,6 +113,22 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # The "observability" profile: docker compose --profile observability up (make up-observability).
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [observability]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9091:9090"]
+    depends_on: [api, worker]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.5.0
+    profiles: [observability]
+    ports: ["16686:16686"]
 
 volumes:
   pgdata:

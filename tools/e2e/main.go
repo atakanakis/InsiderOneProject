@@ -1,7 +1,9 @@
 // Command e2e sends notifications through the real API and waits until every one is sent.
 //
-// It creates one SMS notification with an idempotency key and repeats the request, which must
-// answer 200 with the same id. It then posts one batch of n notifications per channel (sms,
+// It first follows one notification over the WebSocket (architecture §9): it creates an SMS
+// scheduled 3 s ahead, opens GET /v1/ws for it, and expects the current state, scheduled, then
+// the worker's processing and sent. It then creates one SMS notification with an idempotency
+// key and repeats the request, which must answer 200 with the same id. It then posts one batch of n notifications per channel (sms,
 // email, push), with mixed priorities and an Idempotency-Key header, and polls
 // GET /v1/batches/{id} every 500 ms until every batch has sent all of its notifications, and
 // GET /v1/notifications/{id} until the single one is sent with one attempt. It prints one line
@@ -24,6 +26,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 const pollEvery = 500 * time.Millisecond
@@ -75,6 +79,9 @@ func (c counts) String() string {
 
 func run(ctx context.Context, c *client, n int) error {
 	began := time.Now()
+	if err := followOne(ctx, c); err != nil {
+		return err
+	}
 	single, err := createSingle(ctx, c)
 	if err != nil {
 		return err
@@ -141,7 +148,7 @@ func run(ctx context.Context, c *client, n int) error {
 			}
 		}
 		if left == 0 {
-			fmt.Printf("all %d notifications sent in %s\n", 3*n+1, time.Since(began).Round(10*time.Millisecond))
+			fmt.Printf("all %d notifications sent in %s\n", 3*n+2, time.Since(began).Round(10*time.Millisecond))
 			return nil
 		}
 		select {
@@ -159,6 +166,46 @@ func run(ctx context.Context, c *client, n int) error {
 		case <-time.After(pollEvery):
 		}
 	}
+}
+
+// followOne creates a notification scheduled 3 s ahead and follows it over the WebSocket: the
+// current state first, scheduled, then processing and sent, from the worker through Redis.
+func followOne(ctx context.Context, c *client) error {
+	at := time.Now().Add(3 * time.Second).UTC().Format(time.RFC3339Nano)
+	var created struct {
+		ID string `json:"id"`
+	}
+	req := map[string]any{"recipient": "+905551234567", "channel": "sms", "content": "e2e followed", "scheduledAt": at}
+	if err := c.call(ctx, "POST", "/v1/notifications", req, nil, http.StatusCreated, &created); err != nil {
+		return fmt.Errorf("create the followed notification: %w", err)
+	}
+	header := http.Header{}
+	if c.key != "" {
+		header.Set("X-API-Key", c.key)
+	}
+	wsURL := "ws" + strings.TrimPrefix(c.base, "http") + "/v1/ws?notificationId=" + created.ID
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		return fmt.Errorf("open the WebSocket: %w", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	var seen []string
+	for len(seen) == 0 || seen[len(seen)-1] != "sent" {
+		_, b, err := conn.Read(ctx)
+		if err != nil {
+			return fmt.Errorf("WebSocket of %s after %v: %w", created.ID, seen, err)
+		}
+		var m struct{ Type, ID, Status string }
+		if err := json.Unmarshal(b, &m); err != nil || m.Type != "status" || m.ID != created.ID {
+			return fmt.Errorf("WebSocket of %s: an unexpected message %.200s", created.ID, b)
+		}
+		seen = append(seen, m.Status)
+	}
+	if seen[0] != "scheduled" || !strings.Contains(strings.Join(seen, ","), "processing,sent") {
+		return fmt.Errorf("WebSocket of %s: %v, want scheduled first, then processing and sent", created.ID, seen)
+	}
+	fmt.Printf("websocket: notification %s: %s\n", created.ID, strings.Join(seen, ", "))
+	return nil
 }
 
 // createSingle creates one notification with an idempotency key, repeats the request, and

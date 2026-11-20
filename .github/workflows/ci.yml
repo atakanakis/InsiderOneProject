@@ -86,15 +86,37 @@ jobs:
           curl -sf localhost:8080/readyz
           curl -sf localhost:9090/stats
       - name: Two workers deliver what the API accepted, within the limit at the provider
-        # tools/e2e: one notification with an idempotency key and its repeat, then a batch of
-        # 500 per channel, all through the API; it waits until every one is sent. The mock
-        # provider must have received exactly those 1501, at most 100 per second per channel.
+        # tools/e2e: one notification followed over the WebSocket (scheduled, processing,
+        # sent), one with an idempotency key and its repeat, then a batch of 500 per channel,
+        # all through the API; it waits until every one is sent. The mock provider must have
+        # received exactly those 1502, at most 100 per second per channel.
         run: |
           test "$(docker compose ps worker --format '{{.Name}}' | wc -l)" -eq 2
           go run ./tools/e2e -n 500 -timeout 120s
           make status
           curl -s localhost:9090/stats | tee stats.json
-          python3 -c 'import json, sys; s = json.load(open("stats.json")); p = s["maxInAnyOneSecondWindow"]; sys.exit(0 if s["received"] == 1501 and max(p[c] for c in ("sms", "email", "push")) <= 100 else 1)'
+          python3 -c 'import json, sys; s = json.load(open("stats.json")); p = s["maxInAnyOneSecondWindow"]; sys.exit(0 if s["received"] == 1502 and max(p[c] for c in ("sms", "email", "push")) <= 100 else 1)'
+      - name: The metrics agree with the provider, and every alert rule names what is exported
+        # The sent attempts the two workers count add up to what the provider received; the
+        # API's queue figures are exported; tools/alertcheck reads the three scrapes.
+        run: |
+          curl -sf localhost:8080/metrics > api.prom
+          docker compose exec -T --index 1 worker wget -qO- http://localhost:9100/metrics > worker1.prom
+          docker compose exec -T --index 2 worker wget -qO- http://localhost:9100/metrics > worker2.prom
+          curl -sf localhost:8080/v1/metrics | tee v1metrics.json
+          python3 - <<'PY'
+          import json, sys
+          sent = sum(float(l.split()[-1]) for f in ("worker1.prom", "worker2.prom") for l in open(f)
+                     if l.startswith("notifications_attempts_total{") and 'outcome="sent"' in l)
+          received = json.load(open("stats.json"))["received"]
+          api = open("api.prom").read()
+          figures = json.load(open("v1metrics.json"))["channels"]
+          window = sum(c["attempts"]["byOutcome"]["sent"] for c in figures.values())
+          print(f"sent attempts by the workers' counters {sent:.0f}, by /v1/metrics {window}, received by the provider {received}")
+          ok = sent == received == window and 'notifications_queue_depth{channel="sms",status="pending"} 0' in api
+          sys.exit(0 if ok else 1)
+          PY
+          go run ./tools/alertcheck api.prom worker1.prom worker2.prom
       - name: The workers stop cleanly
         run: |
           docker compose stop worker
