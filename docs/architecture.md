@@ -135,7 +135,7 @@ Indexes, each for one query:
 |---|---|
 | `(channel, priority, ready_at) WHERE status IN ('scheduled', 'pending', 'retrying')` | The claim |
 | `(locked_until) WHERE status = 'processing'` | The reaper |
-| `(created_at DESC, id)`, `(batch_id)` | List and batch queries |
+| `(created_at DESC, id)`, `(batch_id)` | List and batch queries. The list is ordered `created_at DESC, id ASC`, the order of the index; its cursor compares `(created_at, id)` in that mixed order. (Noted in session 1's review, for session 6.) |
 
 Migrations are versioned, append-only files run by a one-shot `migrate` command.
 
@@ -226,10 +226,14 @@ otherwise leave rows `processing` with nobody holding them.
   rows stay `processing` until the lease ends, and that claim still counts as an attempt.
 - Rows that left the queue leave dead entries at the head of the claim index until vacuum
   removes them. The review measured the cost: after 500,000 processed rows under a
-  long-running transaction a claim took 12 to 14 ms, where it normally takes under 1 ms. The
-  database is configured with `idle_in_transaction_session_timeout`, and the API with a
-  statement timeout, so the service's own sessions cannot hold vacuum back for long. A session
-  from outside the service (a backup, an analytics query) still can.
+  long-running transaction a claim took 12 to 14 ms, where it normally takes under 1 ms. Every
+  session the service opens sets `idle_in_transaction_session_timeout` to 10 s (its
+  transactions are one statement, or Finish's two, and take milliseconds), and the API's
+  sessions also set a statement timeout of 5 s (section 8). So the service's own sessions
+  cannot hold vacuum back for long. The settings are made per session by `store.Connect`, so
+  they hold on any Postgres, not only the Compose one (TestServiceSessionsCarryTheirTimeouts).
+  A session from outside the service (a backup, an analytics query) still can hold vacuum
+  back.
 
 ## 6. The dispatcher
 
@@ -461,7 +465,7 @@ and it counts towards the breaker.
 | `POST /v1/templates`, `GET /v1/templates`, `GET /v1/templates/{name}` | Templates |
 | `GET /v1/metrics` | Queue depth, success and failure rates, latency |
 | `GET /v1/ws` | WebSocket: live status events, filtered by notification or batch |
-| `GET /healthz`, `GET /readyz` | Liveness; readiness (Postgres and Redis each answer a ping within 2 s) |
+| `GET /healthz`, `GET /readyz` | Liveness; readiness: Postgres answers a ping within 2 s. Redis is pinged and reported too, but does not decide. |
 | `GET /metrics` | Prometheus |
 | `GET /docs`, `GET /openapi.yaml` | OpenAPI specification and viewer |
 
@@ -488,7 +492,7 @@ known enum values. Errors name the field.
 
 | What | Limit |
 |---|---|
-| Request headers | 64 KiB, arriving within 5 s (TestRequestHeadersOverTheBoundAreRefused, TestSlowRequestHeadersAreCutOff) |
+| Request headers | 64 KiB, request line included, arriving within 5 s (TestRequestHeadersOverTheBoundAreRefused, TestSlowRequestHeadersAreCutOff) |
 | Request body | 1 MiB (8 MiB for a batch) |
 | Batch size | 1000 notifications |
 | Content after rendering | Per channel: SMS 1600 characters, push 4096, email 100,000 |
@@ -501,9 +505,21 @@ known enum values. Errors name the field.
 | WebSocket | 1000 connections per API instance; a client that cannot keep up is disconnected |
 | `X-Correlation-ID` header | 1 to 64 characters, letters, digits, `-`, `_` and `.`; any other value is replaced by a new id, never stored or logged (TestCorrelationIDBound, TestCorrelationIDIsAcceptedOrReplaced) |
 
-Readiness answers within its 2 s per dependency even when one hangs
-(TestReadyzAnswersWithinItsTimeoutWhenADependencyHangs), and does not show dependency errors
-(TestReadyzDoesNotShowDependencyErrors).
+**Readiness.** The API needs only Postgres to accept and answer requests: it writes rows, and
+status events through Redis are best-effort (section 9). So an API whose Redis is unreachable
+stays ready and keeps accepting notifications; `/readyz` reports `"redis": "unreachable"` for
+the operator (TestReadyzStaysReadyWhenOnlyRedisIsUnreachable). Until session 1's review the
+design made Redis decide too, which would have taken every API instance out of service during
+a Redis outage for no reason. Each ping is bounded by 2 s, with the real clients against a
+server that accepts connections and never answers
+(TestReadyzAnswersWithinItsTimeoutWhenRealClientsHang). Dependency errors are logged, not
+shown (TestReadyzDoesNotShowDependencyErrors).
+
+**Every Redis client is built in one place** (`internal/redisclient`), with context deadlines
+switched on. The go-redis default ignores a context's deadline on the socket, so a 2 s
+deadline waited 5 s against a paused Redis (found in session 1's review). The rate limiter's
+wait at the gate (section 7) depends on the same property
+(TestRedisClientHonoursContextDeadlines).
 
 **Authentication** is optional and off by default for local use: when `API_KEYS` is set,
 every `/v1` request needs a key (`Authorization: Bearer` or `X-API-Key`).
@@ -583,6 +599,7 @@ column does not hold.
 | Lease | `LEASE` | 60 s | ≥ send timeout + 30 s for the result write | TestLeaseMustCoverSendTimeoutPlusResultWrite |
 | Breaker open time | `BREAKER_OPEN` | 30 s | > send timeout | TestBreakerOpenTimeMustExceedSendTimeout |
 | Shutdown timeout | `SHUTDOWN_TIMEOUT` | 25 s | ≥ send timeout + 5 s | TestShutdownTimeoutMustCoverSendTimeoutPlusFiveSeconds |
+| Stop grace period: how long the platform waits after SIGTERM before it kills the worker | `STOP_GRACE_PERIOD` | 30 s | > shutdown timeout | TestShutdownTimeoutMustEndBeforeTheStopGracePeriod |
 | Result write retries | (the lease) | up to one lease length after the send | | |
 | Concurrent sends (slots) per channel per worker | `SLOTS` | 50 | | |
 | Idle connections kept per provider host | `IDLE_CONNS` | 50 | = slots | TestIdleConnectionsMustEqualSlots |
@@ -598,12 +615,17 @@ between two settings means nothing if one of them is zero. The defaults are the 
 and exits with status 2 naming each broken relation
 (TestWorkerRefusesToStartWithALeaseShorterThanSendTimeoutPlus30s).
 
-Three relations cannot be checked by a single worker. They are stated here and watched by
+The stop grace period is set by the platform (Docker, Kubernetes), not by the worker. The
+worker is told its value through `STOP_GRACE_PERIOD`, so that it can check the relation.
+`docker-compose.yml` takes both the container's `stop_grace_period` and the worker's
+`STOP_GRACE_PERIOD` from the same variable, so a `.env` file cannot change one without the
+other (TestComposeGivesTheWorkerItsStopGracePeriod). Until session 1's review this relation
+was checked only against the Compose file, and a `.env` that raised the shutdown timeout
+broke it silently.
+
+Two relations cannot be checked by a single worker. They are stated here and watched by
 metrics:
 
-- The container's stop grace period (30 s, in `docker-compose.yml`) must be longer than the
-  shutdown timeout. A test reads the Compose file for this one
-  (TestComposeStopGracePeriodExceedsShutdownTimeout).
 - One worker can run at most `slots ÷ provider latency` sends per second. With 50 slots that
   is the full rate up to a provider latency of about 500 ms; a slower provider needs more
   slots or more workers.
@@ -616,6 +638,7 @@ metrics:
 cmd/api, cmd/worker, cmd/migrate, cmd/mockprovider
 internal/domain        types, statuses, validation, templates; no I/O
 internal/store         all SQL; queue.go holds the five queue operations; migrations/
+internal/redisclient   the one place a Redis client is built; context deadlines are on
 internal/ratelimit     the Redis sliding window: Available, Wait
 internal/provider      the HTTP client with the send gate; Result
 internal/dispatch      the loop, Classify, retry policy, breaker, reaper
