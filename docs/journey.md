@@ -124,7 +124,28 @@ stack and CI. Record: [sessions/01-skeleton.md](sessions/01-skeleton.md).
 - **One process change.** From this session on, each session has one review, run once after
   the code is green; its fixes are proven by tests and the guard check, not by another review.
 
-### Session 2 and later
+### Session 2: queue (2026-11-20)
+
+The five queue operations on Postgres: claim, finish, reap, cancel, requeue. Record:
+[sessions/02-queue.md](sessions/02-queue.md).
+
+- **The tests came first, and the history shows it.** The 25 tests were committed against a
+  stub that compiled and returned errors; 24 were red. The code came in the next commit.
+- **A design decision became a permanent measurement.** The design review had chosen the
+  `id = ANY(ARRAY(...))` form of the claim over the common `id IN (SELECT ...)`, from one
+  experiment. A test now reads the query plan on every run, under the plan a cached statement
+  can switch to: 4 index pages and 0.13 to 0.31 ms on 300,000 rows. With the common form the
+  same test sees a full table scan and 32.5 ms, and `make guards` checks that it does.
+- **The review found a guard that guarded too much.** The guard for `SKIP LOCKED` removed the
+  whole `FOR UPDATE SKIP LOCKED`, which breaks the lock and so failed the right test for the
+  wrong half. Plain `FOR UPDATE` passed everything while claims waited behind each other. The
+  lesson is about guards themselves: a mutation must disable only the line it names.
+- **A bound without a test at its edge had an off-by-one.** An error text of exactly 1,024
+  bytes made the result write panic, the very failure the bound was there to prevent.
+- **The guard check got faster.** Postgres and Redis now start once per `make guards` run, not
+  twice per guard; a database guard takes about 3.5 s instead of 10 s.
+
+### Session 3 and later
 
 Recorded here as each session finishes.
 
