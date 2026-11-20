@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -937,5 +939,23 @@ func TestTheServerHasTheTimeoutsOfTheDesign(t *testing.T) {
 	srv := NewServer(":0", http.NotFoundHandler())
 	if srv.ReadHeaderTimeout != 5*time.Second || srv.ReadTimeout != 30*time.Second || srv.WriteTimeout != 30*time.Second {
 		t.Errorf("header %s, request %s, answer %s", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.WriteTimeout)
+	}
+}
+
+// A cursor is opaque but comes from the client. One built by hand with a time no row can
+// have is a 400; before this test it answered an empty page, as if the list had ended.
+func TestACursorOutsideTheTimeRangeIsRefused(t *testing.T) {
+	a := newAPI(t)
+	for _, micro := range []uint64{1 << 63, 1<<63 - 1, 1 << 62} {
+		b := binary.BigEndian.AppendUint64(nil, micro)
+		cursor := base64.RawURLEncoding.EncodeToString(append(b, uuid.New().String()[:16]...))
+		if r := a.get(t, "/v1/notifications?cursor="+cursor); r.code != http.StatusBadRequest {
+			t.Errorf("cursor at %d µs: %d %.200s", micro, r.code, r.raw)
+		}
+	}
+	// A cursor the API gave is accepted, and so is one at the edge of the range it allows.
+	at := encodeCursor(store.Cursor{CreatedAt: time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC), ID: uuid.New()})
+	if r := a.get(t, "/v1/notifications?cursor="+at); r.code != http.StatusOK {
+		t.Errorf("cursor in the year 9999: %d %.200s", r.code, r.raw)
 	}
 }

@@ -773,7 +773,8 @@ and it counts towards the breaker.
   summaries without `content`, newest first: `ORDER BY created_at DESC, id ASC`, the order of
   the list index. The cursor is the `(created_at, id)` of the last item, opaque to the
   client; the next page is `created_at < c OR (created_at = c AND id > i)`. `nextCursor` is
-  present only when the page is full.
+  present only when the page is full. A cursor the API could not have given (malformed, or a
+  time after the year 9999) is a 400 (TestACursorOutsideTheTimeRangeIsRefused).
 - **Cancel** and **retry** answer 200 with the new status, 404 for an unknown id, and 409
   with the status found when the row is not in a status that allows it. Cancel is allowed
   from `scheduled`, `pending` and `retrying`; retry from `failed` only, and it calls Requeue

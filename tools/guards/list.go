@@ -1209,4 +1209,9 @@ var guards = []Guard{
 		Old: "timeouts{header: HeaderTimeout, request: RequestTimeout, answer: AnswerTimeout}", New: "timeouts{header: HeaderTimeout, request: 0, answer: AnswerTimeout}",
 		Package: "./internal/api", Test: "TestTheServerHasTheTimeoutsOfTheDesign",
 	},
+	{
+		Name: "api: a cursor's time is within the years a row can have", File: "internal/api/notifications.go",
+		Old: "if micros > lastCursorMicros {", New: "if false {",
+		Package: "./internal/api", Test: "TestACursorOutsideTheTimeRangeIsRefused",
+	},
 }

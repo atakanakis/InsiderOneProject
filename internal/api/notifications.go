@@ -538,13 +538,20 @@ func encodeCursor(c store.Cursor) string {
 	return base64.RawURLEncoding.EncodeToString(append(b, c.ID[:]...))
 }
 
+// lastCursorMicros is the end of the year 9999: a cursor's time lies between 1970 and then.
+var lastCursorMicros = uint64(time.Date(9999, 12, 31, 23, 59, 59, 999_999_000, time.UTC).UnixMicro())
+
 func decodeCursor(s string) (store.Cursor, bool) {
 	b, err := base64.RawURLEncoding.DecodeString(s)
 	if len(s) != 32 || err != nil || len(b) != 24 {
 		return store.Cursor{}, false
 	}
+	micros := binary.BigEndian.Uint64(b[:8])
+	if micros > lastCursorMicros {
+		return store.Cursor{}, false
+	}
 	id, _ := uuid.FromBytes(b[8:])
-	return store.Cursor{CreatedAt: time.UnixMicro(int64(binary.BigEndian.Uint64(b[:8]))).UTC(), ID: id}, true
+	return store.Cursor{CreatedAt: time.UnixMicro(int64(micros)).UTC(), ID: id}, true //nolint:gosec // bounded above
 }
 
 func (s *server) list(w http.ResponseWriter, r *http.Request) {
