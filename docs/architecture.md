@@ -914,6 +914,13 @@ deadline (TestARequestEndsAtItsDeadlineWhenPostgresStalls). Whether a write that
 committed is then unknown to the API as well as to the client; a client that retries with an
 idempotency key gets the stored row or a new one, never two. Cancel and retry are queue
 writes with their own 10 s timeout (section 5, rule 8), so they can take up to 10 s.
+The deadline starts before a create or a batch waits for its rendering slot (below), and the
+wait ends with it: a request that has not got a slot within its deadline is a 500 too
+(TestARequestWaitingForASlotEndsAtItsDeadline). Until session 8's review the slot was waited
+for on the request's own context, before the deadline was made: with Postgres paused, 40
+concurrent creates were answered four at a time, at 5, 10, ... 30 s, and the last 16 got no
+answer at all within the server's 30 s although their rows were written (review F1). It was
+the case of session 6's review F5 again, brought back by the fix of its F1.
 
 **Errors** of the handlers have one form, written in one place:
 `{"error": {"code", "message", "fields": [{"field", "message"}], "moreFields"}}`. A message
