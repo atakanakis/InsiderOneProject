@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,18 +73,49 @@ func TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers(t *testing.T) {
 // A5_FULL=1 runs all four counts for 12 s each:
 //
 //	A5_FULL=1 go test -count=1 -run TestGateWaitAndThroughputWithManyDispatchers -v ./internal/dispatch
+//
+// Session 8 measured past those settings with A5_COUNTS (dispatchers, comma-separated),
+// A5_LATENCY (the provider's answer time), A5_LIMIT and A5_RUN, for example:
+//
+//	A5_COUNTS=12,24,36 A5_LATENCY=200ms A5_RUN=12s go test -count=1 -timeout 30m -run TestGateWaitAndThroughputWithManyDispatchers -v ./internal/dispatch
 func TestGateWaitAndThroughputWithManyDispatchers(t *testing.T) {
-	const limit, margin = 100, 50 * time.Millisecond
+	limit, margin, latency := 100, 50*time.Millisecond, 20*time.Millisecond
 	counts, run := []int{1, 12}, 6*time.Second
 	if os.Getenv("A5_FULL") != "" {
 		counts, run = []int{1, 3, 6, 12}, 12*time.Second
+	}
+	if v := os.Getenv("A5_COUNTS"); v != "" {
+		counts = nil
+		for _, f := range strings.Split(v, ",") {
+			n, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil || n < 1 {
+				t.Fatalf("A5_COUNTS=%q: %q is not a positive count", v, f)
+			}
+			counts = append(counts, n)
+		}
+	}
+	for name, dst := range map[string]*time.Duration{"A5_LATENCY": &latency, "A5_RUN": &run} {
+		if v := os.Getenv(name); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil || d <= 0 {
+				t.Fatalf("%s=%q is not a positive duration", name, v)
+			}
+			*dst = d
+		}
+	}
+	if v := os.Getenv("A5_LIMIT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			t.Fatalf("A5_LIMIT=%q is not a positive limit", v)
+		}
+		limit = n
 	}
 	top := float64(limit) / (time.Second + margin).Seconds()
 	for _, w := range counts {
 		t.Run(fmt.Sprintf("%d dispatchers", w), func(t *testing.T) {
 			e := testkit.Setup(t)
 			srv := testkit.Recorder(t, recorder.Options{Respond: func(recorder.Request) recorder.Response {
-				return recorder.Response{Delay: 20 * time.Millisecond}
+				return recorder.Response{Delay: latency}
 			}})
 			insertRows(t, e.Pool, domain.SMS, int(run.Seconds()+3)*limit, always(domain.Normal), 6)
 			st := newStamps()
@@ -117,9 +150,9 @@ func TestGateWaitAndThroughputWithManyDispatchers(t *testing.T) {
 			rate := float64(last-first) / arrived[last].Sub(arrived[first]).Seconds()
 			waits := st.sortedWaits()
 			peak := srv.Peak(time.Second, string(domain.SMS))
-			t.Logf("A5 W=%d: %.1f sends/s (top speed %.1f); gate wait over %d sends: median %v, p99 %v, max %v; "+
+			t.Logf("A5 W=%d, limit %d, provider %v: %.1f sends/s (top speed %.1f); gate wait over %d sends: median %v, p99 %v, max %v; "+
 				"refused for no permit in time %d, limiter errors %d; peak %d within one second",
-				w, rate, top, len(waits), percentile(waits, 50).Round(time.Millisecond), percentile(waits, 99).Round(time.Millisecond),
+				w, limit, latency, rate, top, len(waits), percentile(waits, 50).Round(time.Millisecond), percentile(waits, 99).Round(time.Millisecond),
 				percentile(waits, 100).Round(time.Millisecond), st.noPermit.Load(), st.limiterErr.Load(), peak)
 			if st.noPermit.Load() != 0 || st.limiterErr.Load() != 0 {
 				t.Errorf("refusals at the gate: %d without a permit in time, %d limiter errors", st.noPermit.Load(), st.limiterErr.Load())
