@@ -1,4 +1,4 @@
-.PHONY: up up-observability down logs e2e status test test-unit lint guards check-docs alerts build
+.PHONY: up up-observability down logs e2e load status test test-unit lint guards check-docs alerts build
 
 up: ## Build and start the stack: Postgres, Redis, migrate, API, worker, mock provider
 	docker compose up --build -d --wait api worker mockprovider
@@ -17,6 +17,10 @@ logs:
 N ?= 100
 e2e: ## Follow one notification over the WebSocket, send N per channel through the API, wait until all are sent; KEY=... when API_KEYS is set
 	go run ./tools/e2e -n $(N) $(if $(KEY),-key $(KEY))
+
+LOAD_N ?= 30000
+load: ## A burst of LOAD_N notifications against the running stack; prints acceptance, memory, drain, high-priority latency and the provider's peak (tools/load)
+	go run ./tools/load -n $(LOAD_N) $(if $(KEY),-key $(KEY))
 
 status: ## Count the notifications by status
 	docker compose exec -T postgres psql -U notifications -c \
