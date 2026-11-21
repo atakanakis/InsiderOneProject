@@ -1689,4 +1689,26 @@ var guards = []Guard{
 		Old: "\t\t\tcase data := <-read:\n\t\t\t\tif data {\n\t\t\t\t\treturn \"data_message\"\n\t\t\t\t}\n\t\t\t\treturn \"client\"\n\t\t\tdefault:\n\t\t\t}", New: "\t\t\tdefault:\n\t\t\t}",
 		Package: "./internal/api", Test: "TestAClientThatHangsUpIsCountedAsTheClients",
 	},
+
+	// Session 8: the mock provider counts duplicates where they happen.
+	{
+		Name: "recorder: Respond sees the whole request in Lean mode", File: "internal/recorder/recorder.go",
+		Old: "resp = rec.opts.Respond(req)", New: "resp = rec.opts.Respond(kept)",
+		Package: "./internal/recorder", Test: "TestALeanRecorderStillShowsRespondTheWholeRequest",
+	},
+	{
+		Name: "mockprovider: a key accepted again is counted", File: "cmd/mockprovider/main.go",
+		Old: "case n == 1:\n\t\ta.twice++", New: "case n == -1:\n\t\ta.twice++",
+		Package: "./cmd/mockprovider", Test: "TestMockProviderCountsWhatItAcceptedTwice",
+	},
+	{
+		Name: "mockprovider: the keys it remembers are bounded", File: "cmd/mockprovider/main.go",
+		Old: "case err != nil, !known && len(a.seen) >= maxTrackedKeys:", New: "case err != nil, !known && false:",
+		Package: "./cmd/mockprovider", Test: "TestMockProviderTracksABoundedNumberOfKeys",
+	},
+	{
+		Name: "mockprovider: an acceptance is counted", File: "cmd/mockprovider/main.go",
+		Old: "\t\t\tacc.add(r.Header.Get(\"Idempotency-Key\"))\n", New: "",
+		Package: "./cmd/mockprovider", Test: "TestMockProviderCountsWhatItAcceptedTwice",
+	},
 }

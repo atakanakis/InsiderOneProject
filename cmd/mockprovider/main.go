@@ -6,8 +6,12 @@
 //	POST /<any path>  a message; answered with {"messageId", "status": "accepted", "timestamp"},
 //	                  or with an injected 503 or 429 (see below)
 //	GET  /stats       requests received, and the most that arrived in any one-second window,
-//	                  per channel, over the requests kept (at least the last 100,000); and
-//	                  how many injected failures and throttles were answered
+//	                  per channel, over the requests kept (at least the last 100,000); how
+//	                  many injected failures and throttles were answered; and what it
+//	                  accepted (answered 202): in all, the Idempotency-Keys accepted more
+//	                  than once ("acceptedTwice", each key counted once), the keys it
+//	                  remembers ("keysTracked", at most 1,000,000), and the acceptances whose
+//	                  key it does not remember (no UUID key, or the bound reached)
 //	POST /reset       forget everything
 //	GET  /healthz
 //
@@ -34,9 +38,12 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/atakanakis/InsiderOneProject/internal/domain"
 	"github.com/atakanakis/InsiderOneProject/internal/observability"
@@ -130,10 +137,11 @@ type settings struct {
 // for concurrent use; a POST is injected when its draw is below the rate.
 func newHandler(s settings, random func() float64) http.Handler {
 	var failures, throttles atomic.Int64
+	acc := &acceptances{seen: map[uuid.UUID]int{}}
 	rec := recorder.New(recorder.Options{
 		MaxKept: kept,
 		Lean:    true,
-		Respond: func(recorder.Request) recorder.Response {
+		Respond: func(r recorder.Request) recorder.Response {
 			switch {
 			case random() < s.failRate:
 				failures.Add(1)
@@ -146,6 +154,7 @@ func newHandler(s settings, random func() float64) http.Handler {
 					Header: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"1"}},
 					Body:   []byte(`{"error":"injected throttle"}`)}
 			}
+			acc.add(r.Header.Get("Idempotency-Key"))
 			return recorder.Response{Delay: s.latency}
 		},
 	})
@@ -157,7 +166,12 @@ func newHandler(s settings, random func() float64) http.Handler {
 			peaks[string(c)] = rec.Peak(time.Second, string(c))
 		}
 		w.Header().Set("Content-Type", "application/json")
+		accepted, twice, tracked, untracked := acc.counts()
 		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accepted":                accepted,
+			"acceptedTwice":           twice,
+			"keysTracked":             tracked,
+			"acceptedUntracked":       untracked,
 			"received":                rec.Received(),
 			"kept":                    len(rec.Requests()),
 			"maxInAnyOneSecondWindow": peaks,
@@ -166,6 +180,7 @@ func newHandler(s settings, random func() float64) http.Handler {
 	})
 	mux.HandleFunc("POST /reset", func(w http.ResponseWriter, _ *http.Request) {
 		rec.Reset()
+		acc.reset()
 		failures.Store(0)
 		throttles.Store(0)
 		w.WriteHeader(http.StatusNoContent)
@@ -174,4 +189,41 @@ func newHandler(s settings, random func() float64) http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 	return mux
+}
+
+// acceptances counts what the mock provider accepted, by Idempotency-Key (the notification
+// id), so that a run can count duplicates at the provider. It remembers at most
+// maxTrackedKeys keys.
+type acceptances struct {
+	mu                         sync.Mutex
+	seen                       map[uuid.UUID]int
+	accepted, twice, untracked int
+}
+
+func (a *acceptances) add(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.accepted++
+	id, err := uuid.Parse(key)
+	n, known := a.seen[id]
+	switch {
+	case err != nil, !known && len(a.seen) >= maxTrackedKeys:
+		a.untracked++
+		return
+	case n == 1:
+		a.twice++
+	}
+	a.seen[id] = n + 1
+}
+
+func (a *acceptances) counts() (accepted, twice, tracked, untracked int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.accepted, a.twice, len(a.seen), a.untracked
+}
+
+func (a *acceptances) reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.seen, a.accepted, a.twice, a.untracked = map[uuid.UUID]int{}, 0, 0, 0
 }

@@ -62,7 +62,8 @@ type Options struct {
 	// MaxKept, when positive, keeps only the most recent requests. Received still counts all.
 	MaxKept int
 	// Lean keeps neither the body nor the headers of a request, only its stamp, connection,
-	// method, path and channel. It bounds what a long-running mock provider holds.
+	// method, path and channel. It bounds what a long-running mock provider holds. Respond
+	// still sees the whole request.
 	Lean bool
 
 	// TLS serves HTTPS, offering HTTP/2 and HTTP/1.1. Only used by Start.
@@ -107,10 +108,11 @@ func (rec *Recorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Proto: r.Proto, Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(),
 		Body: body, Channel: channelOf(body),
 	}
-	if rec.opts.Lean {
-		req.Body, req.Header = nil, nil
+	kept := req
+	if rec.opts.Lean { // Lean bounds what is kept; Respond still sees the whole request
+		kept.Body, kept.Header = nil, nil
 	}
-	rec.record(req)
+	rec.record(kept)
 
 	if readErr != nil {
 		var tooLarge *http.MaxBytesError
