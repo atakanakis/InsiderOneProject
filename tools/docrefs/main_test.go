@@ -51,12 +51,12 @@ var (
 		"[here](#01)",                                    // 8: no such heading in this file
 	}, "\n")+"\n")
 	write(t, root, "docs/walkthrough.md", strings.Join([]string{
-		"# Walkthrough",                                                                    // 1
+		"# Walkthrough", // 1
 		"**Code:** [`internal/queue/queue.go`](../internal/queue/queue.go): `(*Queue).Claim`, `claimSQL`, `ErrNotFound`.", // 2
-		"**Code:** [`cmd/worker/main.go`](../cmd/worker/main.go): `run`, `start`.",          // 3: start is not there
-		"Prose: `queue.NewQueue`, `queue.(*Queue).Claim`, `queue.Missing`, `(*Queue).Finish`.", // 4: two missing
-		"Paths: `internal/queue/`, `cmd/api/main.go`, `docs/design.md`, `queue.onlyInATest`.", // 5: two missing
-		"Not checked: `http.ErrUseLastResponse`, `GotConn`, `sms/email/push`, `/v1/notifications`.", // 6
+		"**Code:** [`cmd/worker/main.go`](../cmd/worker/main.go): `run`, `start`.",                                        // 3: start is not there
+		"Prose: `queue.NewQueue`, `queue.(*Queue).Claim`, `queue.Missing`, `(*Queue).Finish`.",                            // 4: two missing
+		"Paths: `internal/queue/`, `cmd/api/main.go`, `docs/design.md`, `queue.onlyInATest`.",                             // 5: two missing
+		"Not checked: `http.ErrUseLastResponse`, `GotConn`, `sms/email/push`, `/v1/notifications`.",                       // 6
 	}, "\n")+"\n")
 	write(t, root, "README.md", "See [the design](docs/design.md) and [nothing](docs/none.md).\n")
 

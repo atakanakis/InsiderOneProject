@@ -288,6 +288,43 @@ var guards = []Guard{
 		Package: "./tools/testnames", Test: "TestTestNamesCheckReportsATestThatDoesNotExist",
 	},
 
+	// Session 9: the check that the documents' links, paths and Go names exist.
+	{
+		Name: "docrefs: a link to a missing file is reported", File: "tools/docrefs/main.go",
+		Old: "if _, err := os.Stat(filepath.Join(root, rel)); err != nil {", New: "if _, err := os.Stat(filepath.Join(root, rel)); false && err != nil {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a link to a missing heading is reported", File: "tools/docrefs/main.go",
+		Old: "if !anchors[rel][anchor] {", New: "if false && !anchors[rel][anchor] {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a missing path is reported", File: "tools/docrefs/main.go",
+		Old: "if _, err := os.Stat(filepath.Join(root, ref)); err != nil {", New: "if _, err := os.Stat(filepath.Join(root, ref)); false && err != nil {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a name of a step is declared in the file the step links", File: "tools/docrefs/main.go",
+		Old: "if !declaredIn(d, linked, name) {", New: "if false && !declaredIn(d, linked, name) {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a method is declared on its type", File: "tools/docrefs/main.go",
+		Old: "if !d.methods[mm[1]+\".\"+mm[2]] {", New: "if false && !d.methods[mm[1]+\".\"+mm[2]] {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a qualified name is declared in its package", File: "tools/docrefs/main.go",
+		Old: "if !names[name] {", New: "if false && !names[name] {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a name declared only in a test does not count", File: "tools/docrefs/main.go",
+		Old: "!strings.HasSuffix(rel, \"_test.go\") && ", New: "",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+
 	// Session 2: the queue of architecture §5.
 	{
 		Name: "queue: claims lock the rows they take (I2)", File: "internal/store/queue.go",

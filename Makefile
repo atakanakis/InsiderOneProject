@@ -38,8 +38,9 @@ lint:
 guards: ## Disable each guard in turn and check that its named test fails (tools/guards)
 	go run ./tools/guards
 
-check-docs: ## Every test named in docs/ and README.md exists in the code
+check-docs: ## Every test named in docs/ and README.md exists in the code; every link, path and Go name the documents point at exists
 	go run ./tools/testnames
+	go run ./tools/docrefs
 
 PROMETHEUS_IMAGE = prom/prometheus:v3.5.0
 PROMTOOL = docker run --rm -v "$(CURDIR)/deploy/prometheus":/rules:ro -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE)
