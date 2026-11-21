@@ -28,7 +28,9 @@ curl -s localhost:8080/readyz    # {"postgres":"ok","redis":"ok","status":"ready
 ```
 
 `docker compose up --build` does the same in the foreground. The API listens on port 8080, the
-mock provider on 9090. `make down` stops the stack and deletes its data.
+mock provider on 9090. `make down` stops the stack and deletes its data. On the first start,
+Compose looks for the image `insider-notifications:local` in a registry before it builds it,
+and prints "pull access denied" for it; that is expected, and the build follows.
 
 ## Try the API
 
@@ -44,7 +46,8 @@ curl -s localhost:8080/v1/notifications -H 'Content-Type: application/json' \
 #      "content":"Your code is 4242","priority":"high","status":"pending","attempts":0,"maxAttempts":6,...,
 #      "correlationId":"b3267ee3-...","attemptHistory":[],"attemptHistoryTotal":0}
 
-# Its status, with the attempt history. By now a worker has delivered it.
+# Its status, with the attempt history. An idle worker looks for work every 200 ms, so it is
+# delivered within about 0.2 s; asked sooner, it is still pending.
 curl -s localhost:8080/v1/notifications/<id>
 # 200 {"id":"86538422-...","status":"sent","attempts":1,...,"sentAt":"...","providerMessageId":"4226e5ea-...",
 #      "attemptHistory":[{"number":1,"startedAt":"...","durationMs":2,"statusCode":202,"outcome":"sent"}],...}
@@ -268,7 +271,7 @@ docker compose up -d mockprovider   # without the variables: a provider that doe
 ```
 
 `make e2e` and `make load` check a provider that does not fail; against this one they report the
-retries as a failure and exit with status 1.
+retries as a failure, and `make` stops with an error.
 
 ## How it was built
 
