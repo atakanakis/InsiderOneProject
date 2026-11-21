@@ -47,6 +47,10 @@ import (
 // between trims, each without body or headers, and headers are bounded at 64 KiB.
 const kept = 100_000
 
+// maxTrackedKeys bounds the Idempotency-Keys the mock provider remembers, to count what it
+// accepted twice; a variable so that a test can lower it.
+var maxTrackedKeys = 1_000_000
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Getenv, os.Stdout)

@@ -296,6 +296,30 @@ func TestRecorderKeepsOnlyTheLastRequestsWhenBounded(t *testing.T) {
 	}
 }
 
+// Lean bounds what is kept, not what Respond sees: Respond decides from the whole request, its
+// headers and body included (the mock provider counts acceptances by Idempotency-Key).
+func TestALeanRecorderStillShowsRespondTheWholeRequest(t *testing.T) {
+	var seen Request
+	var mu sync.Mutex
+	s := start(t, Options{Lean: true, Respond: func(r Request) Response {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = r
+		return Response{}
+	}})
+	if _, err := post(t, s.Client(), s.URL, message); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen.Header.Get("Idempotency-Key") != "n-1" || string(seen.Body) != message {
+		t.Errorf("Respond saw header %v and body %q", seen.Header, seen.Body)
+	}
+	if got := s.Requests(); len(got) != 1 || got[0].Header != nil || got[0].Body != nil {
+		t.Errorf("kept %+v; Lean keeps neither header nor body", got)
+	}
+}
+
 func at(ms ...int) []time.Time {
 	base := time.Unix(1_700_000_000, 0)
 	out := make([]time.Time, len(ms))

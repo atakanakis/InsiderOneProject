@@ -114,6 +114,66 @@ func TestMockProviderDelaysInjectedAnswersToo(t *testing.T) {
 	}
 }
 
+// The mock provider counts what it accepted by Idempotency-Key, so that a run can count
+// duplicates where they happen: at the provider (CLAUDE.md, rule 9). A key accepted twice is
+// counted once among acceptedTwice however often it comes back; a refused answer (503, 429) is
+// not an acceptance; a request without a UUID key is accepted and not tracked. Reset forgets.
+func TestMockProviderCountsWhatItAcceptedTwice(t *testing.T) {
+	src := &script{draws: []float64{
+		0.9, 0.9, // a: accepted
+		0.9, 0.9, // a: accepted again
+		0.9, 0.9, // a: a third time
+		0.9, 0.9, // b: accepted
+		0.0,      // b: 503, not an acceptance
+		0.9, 0.9, // no key: accepted, not tracked
+	}}
+	srv := httptest.NewServer(newHandler(settings{failRate: 0.5, throttleRate: 0.5}, src.next))
+	defer srv.Close()
+	a, b := "0b0f8f5e-4a37-4c55-9a1a-7d6f1e2a3b4c", "6e1d2c3b-4a59-4e8f-8a7b-0c1d2e3f4a5b"
+	for i, key := range []string{a, a, a, b, b, ""} {
+		resp := postWithKey(t, srv, "sms", key)
+		_ = resp.Body.Close()
+		if want := map[bool]int{true: http.StatusServiceUnavailable, false: http.StatusAccepted}[i == 4]; resp.StatusCode != want {
+			t.Fatalf("request %d: status %d, want %d", i, resp.StatusCode, want)
+		}
+	}
+	st := getStats(t, srv)
+	if st.Accepted != 5 || st.AcceptedTwice != 1 || st.KeysTracked != 2 || st.Received != 6 {
+		t.Fatalf("stats %+v; want accepted 5, acceptedTwice 1, keysTracked 2, received 6", st)
+	}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/reset", nil)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if st := getStats(t, srv); st.Accepted != 0 || st.AcceptedTwice != 0 || st.KeysTracked != 0 {
+		t.Fatalf("after reset: %+v", st)
+	}
+}
+
+// The keys the mock provider tracks are bounded: past MaxTrackedKeys a new key is accepted and
+// counted in accepted, not tracked, so its memory does not grow with a long run.
+func TestMockProviderTracksABoundedNumberOfKeys(t *testing.T) {
+	h := newHandler(settings{}, func() float64 { return 0.9 })
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	old := maxTrackedKeys
+	maxTrackedKeys = 3
+	defer func() { maxTrackedKeys = old }()
+	for _, key := range []string{
+		"00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002",
+		"00000000-0000-4000-8000-000000000003", "00000000-0000-4000-8000-000000000004",
+		"00000000-0000-4000-8000-000000000004",
+	} {
+		resp := postWithKey(t, srv, "email", key)
+		_ = resp.Body.Close()
+	}
+	if st := getStats(t, srv); st.Accepted != 5 || st.KeysTracked != 3 || st.AcceptedTwice != 0 || st.Untracked != 2 {
+		t.Fatalf("stats %+v; want accepted 5, keysTracked 3, acceptedTwice 0, untracked 2", st)
+	}
+}
+
 func TestMockProviderRefusesARateOutsideZeroToOne(t *testing.T) {
 	cases := []struct {
 		name, value string
@@ -174,8 +234,16 @@ func (s *script) used() int {
 
 func post(t *testing.T, srv *httptest.Server, channel string) *http.Response {
 	t.Helper()
+	return postWithKey(t, srv, channel, "")
+}
+
+func postWithKey(t *testing.T, srv *httptest.Server, channel, key string) *http.Response {
+	t.Helper()
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/some-uuid",
 		strings.NewReader(`{"to":"x","channel":"`+channel+`","content":"c"}`))
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -184,9 +252,13 @@ func post(t *testing.T, srv *httptest.Server, channel string) *http.Response {
 }
 
 type stats struct {
-	Received int            `json:"received"`
-	Peaks    map[string]int `json:"maxInAnyOneSecondWindow"`
-	Injected struct {
+	Received      int            `json:"received"`
+	Accepted      int            `json:"accepted"`
+	AcceptedTwice int            `json:"acceptedTwice"`
+	KeysTracked   int            `json:"keysTracked"`
+	Untracked     int            `json:"acceptedUntracked"`
+	Peaks         map[string]int `json:"maxInAnyOneSecondWindow"`
+	Injected      struct {
 		Failures  int `json:"failures"`
 		Throttles int `json:"throttles"`
 	} `json:"injected"`
