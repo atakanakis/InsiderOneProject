@@ -229,3 +229,16 @@ failed`, the guard on the publisher's drain, above). CI on `d20a4fb`, run 449281
 `334 guards, 334 real, 0 failed`, lint failed on the alignment of the new guard. CI on
 `d54036a`, run 44931660697, the commit the review was given: lint, test, alerts, guards and
 compose succeeded; `334 guards, 334 real, 0 failed` (`gh run view <id> --log`).
+
+After the review: CI on `ff25b25` (the fixes and the records), run 44947935167: test, alerts,
+guards (`336 guards, 336 real, 0 failed`) and compose succeeded, and the lint job failed on
+session 7's check that no build output is tracked: it matched the word "executable", which
+`file` prints for a text script with a shebang too, and session 8 had added the two scripts of
+experiment 03. The check now looks for the formats Go writes, ELF, Mach-O and PE32 (`72544ce`;
+checked locally against fresh builds for darwin and linux). One more check whose reach did not
+match its class, next to an earlier review's fix. CI on `72544ce`, run 44950856081: lint,
+test, alerts, guards and compose succeeded; guards `336 guards, 336 real, 0 failed`; the
+compose job: all 1502 notifications sent in 8.69 s, the workers' counters, `/v1/metrics` and
+the provider each 1502, and the burst of 6,000 drained in 21.5 s, 6,035 received and accepted,
+none twice (`gh run watch 44950856081 --exit-status`, and the logs of the guards and compose
+jobs). The commit that adds this paragraph changes only this file.
