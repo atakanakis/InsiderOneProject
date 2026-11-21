@@ -81,10 +81,12 @@ cleared.
 |---|---|---|---|
 | 1 | `cf9566e` | `git clone ... && cd InsiderOneProject`; `make up` (12.6 s, cached layers); `curl -s localhost:8080/readyz`; every API example in order; `make e2e N=1` (`websocket: notification ...: scheduled, processing, sent`, then `all 5 notifications sent in 3.64s`); `make status`; `/openapi.yaml` and `/docs`; `docker compose run --rm --no-deps -e LEASE=40s worker` (exit 2, the relation named); `API_KEYS=... make up` (401 without a key, 200 with `X-API-Key` and with `Authorization: Bearer`) and `make up` again (200 without); the mock provider made to fail with the README's command, then `make e2e N=100`; `make load` (30,000: accepted in 260 ms, drained in 1 min 46.8 s, 93.6 to 93.7 per second per channel, peak 100 per channel, received and accepted 30,165 of 30,165, none twice, high priority median 421 to 441 ms); `make down`; `docker compose up --build` in the foreground (ready; a notification sent; two workers), then `make down` | Four gaps: the comments gave each answer's HTTP status, which `curl -s` does not print; the idempotent repeat and the conflict were described, not given as commands; nothing said how to make the mock provider well again; `make e2e` against the failing provider exits 1 (its single notification was retried), though the 309 notifications of that run were all sent, 80 after an injected 503 or 429, none twice. Fixed in `2a72f77` |
 | 2 | `2a72f77` | The same, in order, with the README's new commands: the repeat (200, the same id) and the conflict (409); the failing provider with ten creates, `make status`, `/stats`, then `make load LOAD_N=3000` (it reported `created 3054, the provider received 3955 and accepted 3057` and failed, as the README says; every row ended `sent`, none accepted twice, peak 100), and `docker compose up -d mockprovider` (its `MOCK_` variables 0 again); `make down` | Three gaps: the first `make up` printed "pull access denied" for the image before building it; a status read made at once after a create found it still `pending` (an idle worker looks every 200 ms; it was `sent` 0.19 s after creation); `make` exits 2, not 1, when the tool it runs fails. Fixed in the next commit |
-| 3 | see below | | |
+| 3 | `0383347` | The same, in order, from a new clone: `make up` (the three "pull access denied" lines, then `Built` and every container `Healthy`), every API example (the create answered `pending`; read 1 s later, `sent` with attempt 1, status code 202; the repeat 200 with the same id; the conflict 409; the batch, its summary, both pages of the list, the cancel, the retry's 409, `/v1/metrics`, `/stats`), `make e2e N=1` (`scheduled, processing, sent`; `all 5 notifications sent in 3.59s`), `/docs` and `/openapi.yaml`, `LEASE=40s` (exit 2), `API_KEYS` (401, 200, 200) and back (200), the failing provider (ten creates: `retrying` 4 then all `sent`, 17 received for 10 accepted, none twice) and back (its `MOCK_` variables 0), `make down`, `docker compose up --build` in the foreground (ready, two workers), `make down` | Nothing new |
 
 The commands and their answers are those of the README's "Try the API"; its answers are
-rehearsal 1's.
+rehearsal 1's. Rehearsal 3 ran the same commands from a new clone and got the same answers,
+ids and times apart. In the list, two items of one batch share their creation time and come in
+the order of their ids, so which comes first differs from run to run.
 
 ## Measured
 
@@ -93,6 +95,8 @@ rehearsal 1's.
 | Tests | 282 test functions; all pass with the race detector in 1 min 33 s | `time make test`; count: `grep -rh '^func Test' --include='*_test.go' . \| grep -v TestMain \| wc -l` |
 | Guards | 343 in the list | `grep -cE '^\s*Name: "' tools/guards/list.go` |
 | The new guards | `7 guards, 7 real, 0 failed` | `go run ./tools/guards -only docrefs` |
+| Every guard, locally | `343 guards, 343 real, 0 failed` in 40 min, on `2a72f77` with only the README changed; the tree unchanged after the mutations | `time make guards` |
+| Every guard, in CI | `343 guards, 343 real, 0 failed` on `2a72f77` (run 44959944863), and lint, test (check-docs included), alerts and compose green | `gh run view 44959944863 --log` |
 | Lint, documents | 0 issues; every test, link, path and Go name the documents name exists | `make lint`, `make check-docs` |
 | No Turkish in the repository | 0 lines | `LC_ALL=en_US.UTF-8 git grep -nI -E '[ğĞşŞıİçÇöÖüÜ]' -- .` (without a UTF-8 locale, the bracket matches single bytes, and every `§` matches) |
 
