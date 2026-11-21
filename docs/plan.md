@@ -18,8 +18,8 @@ early parts were lost by the time later parts were built.
 | 5 | Dispatcher, breaker, reaper; fault tests | **done** (2026-11-20, [record](sessions/05-dispatcher.md)) |
 | 6 | API: notifications, batches, templates, idempotency | **done** (2026-11-20, [record](sessions/06-api.md)) |
 | 7 | Events, WebSocket, metrics, tracing, alerts | **done** (2026-11-21, [record](sessions/07-events.md)) |
-| 8 | Hardening: full independent review, soak, load test | next |
-| 9 | Walkthrough and final documents | |
+| 8 | Hardening: full independent review, soak, load test | **done** (2026-11-21, [record](sessions/08-hardening.md)) |
+| 9 | Walkthrough and final documents | next |
 
 ## How a session runs
 

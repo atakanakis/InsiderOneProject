@@ -308,9 +308,43 @@ Record: [sessions/07-events.md](sessions/07-events.md).
   fixed until its named test turned red, and a fast test now finds a guard whose text a
   change left behind.
 
-### Session 8 and later
+### Session 8: hardening (2026-11-21)
 
-Recorded here as each session finishes.
+No new feature: the system was measured under a burst and under faults, every guard was run,
+and the whole system was reviewed once more. Record: [sessions/08-hardening.md](sessions/08-hardening.md).
+
+- **The numbers came from the outside.** A load tool posts 30,000 notifications to the running
+  stack and counts at the mock provider, which now remembers what it accepted: the peak stayed
+  at 100 per channel in one second, nothing was lost, nothing was accepted twice, and the
+  backlog drained at 93.5 to 93.9 per second per channel. Two long runs of the randomised fault
+  test, 606 scenarios and 181,800 notifications, lost nothing.
+- **What did not fit was written down as it was.** One fault scenario in 606 passed the limit
+  (47 against 40), with ten requests late after their permits by its own stamps; one burst in
+  thirty saw 130 at the provider and never again. The first fits a case the design names; the
+  second has three possible causes and none is shown. Both are in the record as open, not as
+  passes, and the review found a third possible cause neither the tests nor I had named: the
+  Docker VM's clock, which Redis reads, steps forward by tens of milliseconds.
+- **CI found a guard that proved nothing on a fast machine.** A test of the event publisher's
+  shutdown passed with the code it guarded removed, because the sender had already sent
+  everything; the code had the same dependence on timing. Both were fixed as a class.
+- **The review found two defects next to earlier fixes**, the first version's pattern. Session
+  6 had fixed two problems with two parts: a 5 s deadline for the database, and 4 slots for
+  rendering. The slots were waited for outside the deadline, so with Postgres stalled the
+  deadline stopped holding: answers came at 5, 10, ... 30 s, then not at all, with rows
+  written. Fixed and guarded; on the stack, 40 requests during a 60 s stall now all get a 500
+  in 5 s. The second: an address that answers 400 to everything drains the queue into
+  `failed`, which the design had claimed could not happen. That one is kept, and the claim
+  corrected, because the other choice lets one client's bad messages hold the channel for all;
+  the trade-off is written next to it, and requeueing 1,000 such rows was done and measured.
+- **Questions left open by earlier sessions were answered with measurements:** the dial
+  timeout has a test; the wait at the gate follows the design review's old estimate above 12
+  dispatchers, which gives how many dispatchers a channel can take before refusals start (about
+  40 at the defaults, 8 at a limit of 20); `GET /v1/metrics` over an hour reaches its deadline
+  at about 16 million notifications, because nothing removes old rows.
+
+### Session 9
+
+Recorded here when it finishes.
 
 ## 5. What is honest to say about time
 

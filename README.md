@@ -10,8 +10,10 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 > provider client with its send gate, and the dispatcher with its circuit breaker and reaper
 > are built and tested, the last under random faults. Status changes reach WebSocket clients
 > through Redis; Prometheus metrics, OpenTelemetry traces and ten alert rules, each with a
-> promtool test, watch it. Session 8 hardens and measures it under load. This README says only
-> what exists; the table below is updated at the end of every session.
+> promtool test, watch it. Session 8 measured it under a burst and under faults (below) and had
+> the whole system reviewed once more; the review's two major findings are answered in its
+> [record](docs/reviews/08-session-8-review.md). Session 9 writes the walkthrough. This README
+> says only what exists; the table below is updated at the end of every session.
 
 | # | Session | Status |
 |---|---|---|
@@ -23,8 +25,8 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 | 5 | Dispatcher, breaker, reaper; fault tests | done ([record](docs/sessions/05-dispatcher.md)) |
 | 6 | API | done ([record](docs/sessions/06-api.md)) |
 | 7 | Events, WebSocket, metrics, tracing, alerts | done ([record](docs/sessions/07-events.md)) |
-| 8 | Hardening: independent review, soak, load test | next |
-| 9 | Walkthrough and final documents | |
+| 8 | Hardening: independent review, soak, load test | done ([record](docs/sessions/08-hardening.md)) |
+| 9 | Walkthrough and final documents | next |
 
 ## Running what exists
 
@@ -109,7 +111,7 @@ with two workers and the mock provider. The record of
 **A burst** (`make load`, which runs `go run ./tools/load -n 30000`): 30,000 notifications in
 30 batches of 1000, 4 posted at once, the channels in turn and the priorities mixed (5% high,
 45% normal, 50% low). Three runs by the author, and one by session 8's reviewer where it is
-named:
+named. A fourth run by the author after the review's fixes stayed inside every range below.
 
 | What | Result |
 |---|---|
@@ -122,15 +124,16 @@ named:
 
 Larger batches, 15,000 notifications with content of up to 8,000 bytes (8 MB batches for
 email), posted 8 at once (`go run ./tools/load -n 15000 -concurrency 8 -content-bytes 8000
--probe-every 20ms`), 20 runs by the author and 8 by the reviewer: accepted in 0.43 to 0.51 s
-in 26 runs; in one of the author's runs one batch was answered after 29.6 s and in one of the
-reviewer's after 7.6 s, and what held them is not shown (session 8's record). The API's
-resident memory peaked between 123 and 268 MiB. A single create made every 20 ms during the
-burst was answered within 63 ms in the five of the author's runs that recorded it and within
-91 ms in the reviewer's, which bounds how long the 4 rendering slots held it back. In one of
-the author's runs the mock provider stamped 130, 121 and 125 requests within one second on the
-three channels at once, above the limit of 100; the other 27 runs stayed at 100, twelve of
-them with the requests also captured on the provider's network interface. The excess is not
+-probe-every 20ms`), 22 runs by the author (two of them after the review's fixes) and 8 by
+the reviewer: accepted in 0.43 to 0.57 s in 28 runs; in one of the author's runs one batch was
+answered after 29.6 s and in one of the reviewer's after 7.6 s, and what held them is not shown
+(session 8's record). The API's resident memory peaked between 120 and 268 MiB. A single
+create made every 20 ms during the burst was answered within 63 ms in the seven of the
+author's runs that recorded it and within 91 ms in the reviewer's, which bounds how long the 4
+rendering slots held it back. In one of the author's runs the mock provider stamped 130, 121
+and 125 requests within one second on the three channels at once, above the limit of 100; the
+other 29 runs stayed at 100, twelve of them with the requests also captured on the provider's
+network interface. The excess is not
 explained; three causes fit it, none is shown (architecture §11, I1).
 
 **The randomised fault test, long** (`FAULT_RUNS=300 FAULT_SEED=1000 go test -count=1
@@ -151,14 +154,19 @@ A second run of 300 (`FAULT_SEED=2000`, the same command otherwise; 27 min 39 s)
 passed, 101,411 requests received, 22 notifications in 14 scenarios accepted twice, each after an
 attempt without a response. The one red scenario, seed 2268, failed on the rate limit: the
 provider received 47 email requests within one second against a limit of 40. Its own counters
-show why: 10 email requests arrived more than the 50 ms margin after their permits (the latest
-144 ms), and the excess, 7, is within those 10. That is the frozen-process case of
-architecture §7's limits table: the test runs the workers and the recording server in one
-process, and something on the machine held it for over 100 ms between permits and writes. The
-same seed run alone five more times passed five times, with no request later than 10 ms
-(`FAULT_RUNS=1 FAULT_SEED=2268 go test -count=1 -run 'TestInvariantsHoldUnderRandomFaults/seed-2268'
--v ./internal/dispatch`). In both runs together: 606 scenarios, 605 passed, every notification
-final, and no notification accepted twice except after an attempt without a response.
+show that 10 email requests arrived more than the 50 ms margin after their permits (the latest
+144 ms); the excess, 7, is within those 10. That fits the frozen-process case of architecture
+§7's limits table, but where the process was held is not shown: the test runs the workers and
+the recording server in one process, and "late" is measured from a permit's return to the
+server's stamp, so a stall in the worker before its write and a stall in the server before it
+stamped look the same, and one before the permit returned is not counted at all (session 8's
+review). The same seed run alone five more times passed five times, with no request later than
+10 ms (`FAULT_RUNS=1 FAULT_SEED=2268 go test -count=1 -run
+'TestInvariantsHoldUnderRandomFaults/seed-2268' -v ./internal/dispatch`); session 8's reviewer
+ran it eight more times, three quietly and five with the CPUs oversubscribed twice, and 103 new
+scenarios, all passing. In the author's two runs together: 606 scenarios, 605 passed, every
+notification final, and no notification accepted twice except after an attempt without a
+response.
 
 ## Why this is a second build
 
