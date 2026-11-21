@@ -1029,7 +1029,12 @@ answer waits for it (TestPublishNeverBlocksWhenRedisHangs,
 TestLostEventsDoNotAffectDelivery, TestTheAPIAnswersWhileRedisHangs). The worker publishes
 through its own Redis client, so a publish never holds a connection the rate limiter needs.
 On shutdown the worker gives the publisher 2 s to send what is buffered, after the sends in
-flight have finished.
+flight have finished. Once `Close` is called, the sender sends only through `Close`'s context:
+what is still buffered when that context ends is dropped and counted, never sent later
+(TestThePublisherSendsWhatIsBufferedWhenClosed, TestCloseSendsNothingAfterItsContextEnds).
+Until session 8 the sender chose at random between the buffer and the stop signal, so events
+could go out after `Close` on the sender's own context, and the test of the drain passed in one
+CI run with the drain removed: the sender had sent everything before `Close` was called.
 
 **Order.** One process publishes in the order the events were given, and Redis delivers one
 connection's messages in order, so the events that one process publishes about one
