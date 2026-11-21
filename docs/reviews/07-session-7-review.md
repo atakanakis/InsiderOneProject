@@ -115,4 +115,10 @@ alert with the API stopped, and a page for the idle breaker.
 
 ## The full guard run and CI
 
-To be completed with the final runs.
+The reviewer's own `make guards` on `1d791aa`: `318 guards, 318 real, 0 failed`, 40:33; CI on
+that commit, run 44816376876, green on all five jobs. After the fixes: locally on `bc7ce16`,
+`328 guards, 328 real, 0 failed` (40 min 27 s); CI on `850d1a0`, run 44842146255, green on all
+five jobs, guards `328 guards, 328 real, 0 failed`, the compose job's three counts of sent
+attempts 1502, 1502 and 1502, and alertcheck passing on the live scrapes
+(`gh run watch 44842146255 --exit-status`). The commit that adds this paragraph changes only
+the two records.

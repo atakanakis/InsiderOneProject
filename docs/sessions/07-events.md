@@ -88,7 +88,7 @@ the code they check was already built in the step before.
 
 | What | Result | Command |
 |---|---|---|
-| Tests | 276 test functions (223 at the start of the session, 269 before the review); all pass with the race detector in 1 min 37 s | `time make test`; count: `grep -rh '^func Test' --include='*_test.go' . \| grep -v TestMain \| wc -l` |
+| Tests | 274 test functions (223 at the start of the session, 269 before the review); all pass with the race detector in 1 min 37 s | `time make test`; count: `grep -rh '^func Test' --include='*_test.go' . \| grep -v TestMain \| wc -l` |
 | Lint | 0 issues | `make lint` |
 | Guards | 69 new before the review, 10 after it, 328 in all; before the review 318 of 318 real locally (39 min 52 s) and in CI (run 44816376876) | `go run ./tools/guards -from 'events: Publish never waits'`; `time make guards` |
 | Publish against a Redis that never answers | 12,288 events in under 1 s, none waiting more than 10 ms; at least 7,936 dropped as `buffer_full`; the first pipeline given up within 2 s | `go test -count=1 -v -run TestPublishNeverBlocksWhenRedisHangs ./internal/events` |
@@ -140,4 +140,17 @@ guards the fixes moved, in the fast suite.
 
 ## CI
 
-To be written after the run.
+CI on `1d791aa`, the commit the review was given, run 44816376876: lint, test, alerts, guards
+and compose all succeeded; guards `318 guards, 318 real, 0 failed`; the compose job's
+WebSocket client saw `scheduled, scheduled, processing, sent`, 1502 notifications were sent
+in 8.64 s, and the workers' counters, `/v1/metrics` and the provider all said 1502.
+
+After the review, `make guards` locally on `bc7ce16`: `328 guards, 328 real, 0 failed` in
+40 min 27 s. CI on `850d1a0`, the session's last code and document commit, run 44842146255:
+lint (with the new check that no build output is tracked), test, alerts (10 rules), guards and
+compose all succeeded; guards `328 guards, 328 real, 0 failed`; the fault test's scenarios at
+peak 40, the limit, none accepted twice; the compose job: `all 1502 notifications sent in
+8.65s`, `sent attempts by the workers' counters 1502, by /v1/metrics 1502, received by the
+provider 1502`, and alertcheck passed on the three scrapes
+(`gh run watch 44842146255 --exit-status`, and the logs of the guards, test and compose
+jobs). The commit that adds these paragraphs changes only the two records.
