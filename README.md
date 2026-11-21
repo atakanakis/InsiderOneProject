@@ -32,24 +32,30 @@ mock provider on 9090. `make down` stops the stack and deletes its data.
 
 ## Try the API
 
-Every command below was run on a fresh clone; the line after it is what it answered, cut where
-it says `...`. Ids are random: use the ones your own answers give.
+Every command below was run on a fresh clone, in this order. Under each is what it answered, cut
+where it says `...`; the HTTP status is given first (`curl -i` prints it). Ids are random: use
+the ones your own answers give.
 
 ```sh
 # Create one notification. The idempotency key makes a repeat safe.
 curl -s localhost:8080/v1/notifications -H 'Content-Type: application/json' \
   -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 4242","priority":"high","idempotencyKey":"order-42"}'
-# 201 {"id":"2213a6ff-...","recipient":"+905551234567","channel":"sms","content":"Your code is 4242",
-#      "priority":"high","status":"pending","attempts":0,"maxAttempts":6,...,"correlationId":"916a55ef-...",
-#      "attemptHistory":[],"attemptHistoryTotal":0}
+# 201 {"id":"86538422-9238-46e2-8e2b-d7c0a228ca8d","recipient":"+905551234567","channel":"sms",
+#      "content":"Your code is 4242","priority":"high","status":"pending","attempts":0,"maxAttempts":6,...,
+#      "correlationId":"b3267ee3-...","attemptHistory":[],"attemptHistoryTotal":0}
 
 # Its status, with the attempt history. By now a worker has delivered it.
 curl -s localhost:8080/v1/notifications/<id>
-# 200 {"id":"2213a6ff-...","status":"sent","attempts":1,...,"providerMessageId":"b6a00b88-...",
+# 200 {"id":"86538422-...","status":"sent","attempts":1,...,"sentAt":"...","providerMessageId":"4226e5ea-...",
 #      "attemptHistory":[{"number":1,"startedAt":"...","durationMs":2,"statusCode":202,"outcome":"sent"}],...}
 
-# The same request with the same key: 200 with the same notification. Another request with it: 409.
-# {"error":{"code":"idempotency_conflict","message":"the idempotency key was used with another request"}}
+# The same request again: the same notification, created once. The key with another request: 409.
+curl -s localhost:8080/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 4242","priority":"high","idempotencyKey":"order-42"}'
+# 200 {"id":"86538422-...","status":"sent",...}
+curl -s localhost:8080/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"Another text","idempotencyKey":"order-42"}'
+# 409 {"error":{"code":"idempotency_conflict","message":"the idempotency key was used with another request"}}
 
 # A template, and a batch (up to 1000) that uses it, under one Idempotency-Key for the whole batch.
 curl -s localhost:8080/v1/templates -H 'Content-Type: application/json' \
@@ -59,27 +65,28 @@ curl -s localhost:8080/v1/notifications/batch -H 'Content-Type: application/json
   -d '{"notifications":[
         {"recipient":"ada@example.com","channel":"email","template":"welcome","variables":{"name":"Ada"}},
         {"recipient":"+905551234567","channel":"sms","content":"See you in 2030","scheduledAt":"2030-01-01T09:00:00Z","priority":"low"}]}'
-# 201 {"batchId":"7a30957d-...","ids":["eb6dc6cd-...","bed331ab-..."],"total":2}
+# 201 {"batchId":"ef222110-8d01-498f-a43f-a1321a767dde","ids":["2bd37c46-...","73a09fb6-..."],"total":2}
 curl -s localhost:8080/v1/batches/<batchId>
 # 200 {"counts":{"cancelled":0,"failed":0,"pending":0,"processing":0,"retrying":0,"scheduled":1,"sent":1},...,"total":2}
 
 # List: filters status, channel, batchId, createdFrom, createdTo; limit 1 to 100; newest first.
 curl -s 'localhost:8080/v1/notifications?batchId=<batchId>&limit=1'
-# 200 {"items":[{"id":"bed331ab-...","status":"scheduled",...}],"nextCursor":"AAZg0TssO-S-..."}
-#     the next page: the same query with &cursor=<nextCursor>
+# 200 {"items":[{"id":"2bd37c46-...","channel":"email","status":"sent",...}],"nextCursor":"AAZg0VJAGNwr03xG..."}
+curl -s 'localhost:8080/v1/notifications?batchId=<batchId>&limit=1&cursor=<nextCursor>'
+# 200 {"items":[{"id":"73a09fb6-...","channel":"sms","status":"scheduled",...}],"nextCursor":"..."}
 
 # Cancel works from scheduled, pending or retrying; otherwise 409 with the status found.
 curl -s -X POST localhost:8080/v1/notifications/<id of the scheduled SMS>/cancel
-# 200 {"id":"bed331ab-...","status":"cancelled"}
+# 200 {"id":"73a09fb6-...","status":"cancelled"}
 curl -s -X POST localhost:8080/v1/notifications/<id of the email>/retry      # retry is for failed ones
 # 409 {"error":{"code":"wrong_status","message":"the notification is not in a status that allows this","status":"sent"}}
 
 # Figures for a recent window (1m, 5m, 15m, 1h), per channel; Prometheus at /metrics.
 curl -s 'localhost:8080/v1/metrics?window=15m'
-# 200 {"channels":{"email":{"queue":{"pending":0,...},"attempts":{"total":1,...,"byOutcome":{...,"sent":1}},
-#      "deliveredShare":1,"attemptDurationMs":{"p50":2,...},"deliveryLatencyMs":{...}},...}}
+# 200 {"channels":{"email":{"queue":{"pending":0,...},"oldestDueAgeSeconds":0,"attempts":{"total":1,...,
+#      "byOutcome":{...,"sent":1}},"deliveredShare":1,"attemptDurationMs":{"p50":2,...},"deliveryLatencyMs":{...}},...}}
 curl -s localhost:9090/stats     # what the mock provider received: at most 100 per channel in any second
-# {"accepted":4,"acceptedTwice":0,...,"maxInAnyOneSecondWindow":{"all":1,"email":1,"push":0,"sms":1},"received":4}
+# 200 {"accepted":2,"acceptedTwice":0,...,"maxInAnyOneSecondWindow":{"all":1,"email":1,"push":0,"sms":1},"received":2}
 ```
 
 **Live status.** `GET /v1/ws?notificationId=<id>&batchId=<batchId>` is a WebSocket: up to 100
@@ -254,7 +261,14 @@ use that instead. The mock provider can fail on purpose, to watch retries and th
 
 ```sh
 MOCK_FAIL_RATE=0.2 MOCK_THROTTLE_RATE=0.05 MOCK_LATENCY=30ms docker compose up -d mockprovider
+# create notifications as above, then watch them being retried until they are sent:
+make status
+curl -s localhost:9090/stats        # "injected": the 503 and 429 answers it gave
+docker compose up -d mockprovider   # without the variables: a provider that does not fail again
 ```
+
+`make e2e` and `make load` check a provider that does not fail; against this one they report the
+retries as a failure and exit with status 1.
 
 ## How it was built
 
