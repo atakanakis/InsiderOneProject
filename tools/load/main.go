@@ -218,8 +218,10 @@ func postBurst(ctx context.Context, cl *client, c config) (*burst, error) {
 					Total   int    `json:"total"`
 				}
 				t0 := time.Now()
-				var wrote time.Time // when the client finished writing the body: an upload that
-				// stalls on the way to the API is told apart from an API that answers late
+				var wrote time.Time // when the client finished writing the body to its socket. On
+				// Docker Desktop the host's port forwarder takes the bytes, so this is not when the
+				// API has read them: it tells a slow client from the rest, not the upload into
+				// Docker from the API (session 8's review, F4)
 				tctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 					WroteRequest: func(httptrace.WroteRequestInfo) { wrote = time.Now() },
 				})
@@ -425,7 +427,7 @@ func report(c config, b *burst, d *drain, singles *durations, h *highs, baseline
 		c.n, len(b.batches), float64(b.bodyBytes)/1e6, c.concurrency, c.contentBytes)
 	fmt.Printf("accepted: in %v, %.0f notifications per second; a batch answered in %s\n",
 		acceptFor.Round(time.Millisecond), float64(c.n)/acceptFor.Seconds(), b.latency.summary())
-	fmt.Printf("  of which writing the body: %s; from the body written to the answer: %s\n", b.upload.summary(), b.afterUpload.summary())
+	fmt.Printf("  of which writing the body to the local socket: %s; from then to the answer: %s\n", b.upload.summary(), b.afterUpload.summary())
 	fmt.Printf("single creates during the burst: %d, answered in %s\n", singles.len(), singles.summary())
 	fmt.Printf("API memory (resident / Go heap in use): before %s, peak during the burst %s, peak until drained %s\n",
 		baseline, burstPeak, drainPeak)

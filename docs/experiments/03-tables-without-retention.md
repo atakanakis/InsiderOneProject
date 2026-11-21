@@ -81,10 +81,11 @@ the full rate for more than about half a day without retention.
 
 ## The commands
 
-The scripts start their own Postgres container on a spare port and remove it at the end.
-`exp03.sh` is the first part; `exp03b.sh` the second. Both build the window, then add old rows
-with one `INSERT ... RETURNING` into the attempts, `VACUUM ANALYZE`, and run each query three
-times:
+The scripts start their own Postgres container on a spare port and remove it at the end:
+[`03-part1.sh`](03-part1.sh) is the first part, [`03-part2.sh`](03-part2.sh) the second, each
+run from the repository's root (about 35 and 25 minutes; the notifications table alone is 3.5 GB at 16,000,000 rows). Both build the window,
+then add old rows with one `INSERT ... RETURNING` into the attempts, `VACUUM ANALYZE`, and run
+each query three times. Their core:
 
 ```sh
 #!/bin/bash
