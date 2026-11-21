@@ -197,21 +197,98 @@ func TestEventsReachSubscribersThroughRedis(t *testing.T) {
 
 // §9: the publisher sends what it holds when it is closed, so a worker's last results are
 // not lost on a clean shutdown.
+// holdFirstPipeline is a go-redis hook that holds the first pipeline until release is
+// closed, so that a test can call Close while events are certainly still in the buffer.
+type holdFirstPipeline struct {
+	once    sync.Once
+	entered chan struct{} // closed when the first pipeline is held
+	release chan struct{}
+}
+
+func newHold() *holdFirstPipeline {
+	return &holdFirstPipeline{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (h *holdFirstPipeline) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *holdFirstPipeline) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+
+func (h *holdFirstPipeline) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		first := false
+		h.once.Do(func() { first = true })
+		if first {
+			close(h.entered)
+			<-h.release
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// heldPublisher publishes n events to a publisher whose first pipeline is held, and returns
+// once that pipeline is held: the other events wait in the buffer.
+func heldPublisher(t *testing.T, redisURL string, n int) (*Redis, *holdFirstPipeline) {
+	t.Helper()
+	c := client(t, redisURL)
+	h := newHold()
+	c.AddHook(h)
+	p := NewRedis(c, Options{})
+	for range n {
+		p.Publish(bg(t), Event{ID: uuid.New(), Status: domain.Sent})
+	}
+	select {
+	case <-h.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first pipeline was never sent")
+	}
+	return p, h
+}
+
+// §9: Close sends what is still buffered, through Close's context. The first pipeline is held
+// while Close is called, so that the rest of the events are in the buffer when it is; until
+// session 8 the sender could send everything before the test called Close, and the test passed
+// with the drain removed (CI run 44924691249).
 func TestThePublisherSendsWhatIsBufferedWhenClosed(t *testing.T) {
 	e := testkit.Setup(t)
 	s := subscribe(t, client(t, e.RedisURL), 0)
 	subscribed(t, e.Redis, 1)
-	p := NewRedis(client(t, e.RedisURL), Options{})
 	const n = 1000
-	for range n {
-		p.Publish(bg(t), Event{ID: uuid.New(), Status: domain.Sent})
-	}
+	p, h := heldPublisher(t, e.RedisURL, n)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	p.Close(ctx)
+	closed := make(chan struct{})
+	go func() { defer close(closed); p.Close(ctx) }()
+	<-p.stop // Close has been called
+	close(h.release)
 	for i := range n {
 		if _, ok := s.next(t, 5*time.Second); !ok {
 			t.Fatalf("%d of %d events arrived after Close", i, n)
+		}
+	}
+	<-closed
+}
+
+// §9: once Close is called, nothing is sent after Close's context has ended; what is still
+// buffered then is dropped and counted. The sender's own context must not send it later. Each
+// round holds the first pipeline, calls Close with a context that has ended, and then lets the
+// pipeline go: only that pipeline's events may be published. Until session 8 the sender chose
+// at random between the buffer and the stop signal and went on sending; 20 rounds make a pass
+// by chance about one in a million.
+func TestCloseSendsNothingAfterItsContextEnds(t *testing.T) {
+	e := testkit.Setup(t)
+	const n, rounds = 1000, 20
+	for round := range rounds {
+		p, h := heldPublisher(t, e.RedisURL, n)
+		ended, cancel := context.WithCancel(context.Background())
+		cancel()
+		p.Close(ended) // returns at once: its context has ended
+		close(h.release)
+		<-p.done
+		published := testutil.ToFloat64(p.o.Metrics.Published)
+		dropped := testutil.ToFloat64(p.o.Metrics.Dropped.WithLabelValues("redis_error"))
+		if published > PublishBatch || published+dropped != n {
+			t.Fatalf("round %d: %v published and %v dropped of %d after Close's context ended; at most the held pipeline of %d may be published",
+				round, published, dropped, n, PublishBatch)
 		}
 	}
 }
