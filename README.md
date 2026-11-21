@@ -68,9 +68,11 @@ make down        # stop and delete the data
 ```
 
 The specification is at <http://localhost:8080/openapi.yaml>, with a viewer at
-<http://localhost:8080/docs>. Started with `API_KEYS=key1,key2 make up` (or the variable in a
-`.env` file), the API asks every `/v1` request for one of the keys, in
-`Authorization: Bearer <key>` or `X-API-Key: <key>`.
+<http://localhost:8080/docs>. Started with
+`API_KEYS=first-key-0123456789,second-key-0123456789 make up` (or the variable in a `.env`
+file), the API asks every `/v1` request for one of the keys, in `Authorization: Bearer <key>`
+or `X-API-Key: <key>`. A key has at least 16 characters; the API refuses to start with a
+shorter one.
 
 `make up-observability` adds Prometheus (<http://localhost:9091>, scraping the API and every
 worker, with the alert rules of [`deploy/prometheus`](deploy/prometheus/alerts.yml)) and
@@ -106,27 +108,30 @@ with two workers and the mock provider. The record of
 
 **A burst** (`make load`, which runs `go run ./tools/load -n 30000`): 30,000 notifications in
 30 batches of 1000, 4 posted at once, the channels in turn and the priorities mixed (5% high,
-45% normal, 50% low), three runs:
+45% normal, 50% low). Three runs by the author, and one by session 8's reviewer where it is
+named:
 
 | What | Result |
 |---|---|
-| Accepted by the API | in 0.24 to 0.34 s, 87,000 to 124,000 per second; a batch answered in 29 to 41 ms (median), 97 ms at most |
-| The API's memory | resident 37 to 50 MiB, Go heap 16 to 17 MiB at the peak |
-| Drained | 30,000 in 1 min 46.7 s to 1 min 46.9 s, 93.5 to 93.7 per second per channel (the top speed is 100 per 1.05 s, 95.2) |
+| Accepted by the API | in 0.23 to 0.34 s (the reviewer's run 0.232 s), 87,000 to 124,000 per second in the author's runs; a batch answered in 29 to 41 ms (median), 97 ms at most |
+| The API's memory | resident 37 to 50 MiB, Go heap 16 to 17 MiB at the peak (the author's runs) |
+| Drained | 30,000 in 1 min 46.5 s to 1 min 46.9 s, 93.5 to 93.9 per second per channel (the top speed is 100 per 1.05 s, 95.2) |
 | The mock provider's peak | 100 per channel within one second in every run |
 | Lost, sent twice | none: the provider received and accepted exactly what was created (30,164 to 30,165 with the probes), none twice |
-| A high-priority notification created during the drain | created to sent: median 0.42 to 0.46 s, p95 1.14 to 1.19 s (54 per channel per run); the longest 5.1 to 5.2 s, the first ones, which queue behind the burst's own 500 high-priority rows per channel (500 / 95 per second = 5.3 s) |
+| A high-priority notification created during the drain | created to sent: median 0.42 to 0.46 s in the author's runs (54 per channel per run), p95 1.14 to 1.36 s; the longest 5.1 to 5.4 s, the first ones, which queue behind the burst's own 500 high-priority rows per channel (500 / 95 per second = 5.3 s) |
 
 Larger batches, 15,000 notifications with content of up to 8,000 bytes (8 MB batches for
 email), posted 8 at once (`go run ./tools/load -n 15000 -concurrency 8 -content-bytes 8000
--probe-every 20ms`), 20 runs: accepted in 0.43 to 0.51 s in 19 runs (the twentieth below);
-the API's resident memory at most 245 MiB; a single create made every 20 ms during the burst
-was answered within 63 ms in the five runs that recorded it, so the 4 rendering slots held it
-back at most that long. In one run the mock provider stamped 130, 121 and 125 requests within one
-second on the three channels at once, above the limit of 100; twelve later runs with the
-requests captured on the provider's network interface stayed at 100 there and at the stamps,
-and the excess is not explained (architecture §11, I1). In another run one batch was answered
-after 29.6 s, and the cause is not shown either (session 8's record).
+-probe-every 20ms`), 20 runs by the author and 8 by the reviewer: accepted in 0.43 to 0.51 s
+in 26 runs; in one of the author's runs one batch was answered after 29.6 s and in one of the
+reviewer's after 7.6 s, and what held them is not shown (session 8's record). The API's
+resident memory peaked between 123 and 268 MiB. A single create made every 20 ms during the
+burst was answered within 63 ms in the five of the author's runs that recorded it and within
+91 ms in the reviewer's, which bounds how long the 4 rendering slots held it back. In one of
+the author's runs the mock provider stamped 130, 121 and 125 requests within one second on the
+three channels at once, above the limit of 100; the other 27 runs stayed at 100, twelve of
+them with the requests also captured on the provider's network interface. The excess is not
+explained; three causes fit it, none is shown (architecture §11, I1).
 
 **The randomised fault test, long** (`FAULT_RUNS=300 FAULT_SEED=1000 go test -count=1
 -timeout 0 -run TestInvariantsHoldUnderRandomFaults -v ./internal/dispatch`): 303 scenarios (the
@@ -171,9 +176,10 @@ tests before the code. The full account is in [the journey](docs/journey.md).
 
 | Document | What it answers |
 |---|---|
+| [docs/architecture.md](docs/architecture.md), sections 2 to 7 | The design: parts, life of a notification, queue, dispatcher, rate limit. The rest of it is the API, observability, invariants, assumptions and timing |
+| [`internal/dispatch/dispatch.go`](internal/dispatch/dispatch.go) | The dispatcher's loop (one screen) and `handle`, where every claimed row ends |
 | [docs/journey.md](docs/journey.md) | What happened in the first version, why it was rebuilt, how the work is divided between me and the agents |
 | [docs/lessons.md](docs/lessons.md) | The classes of mistakes in the first version, and what each one changed here |
-| [docs/architecture.md](docs/architecture.md) | The design: parts, queue, dispatcher, rate limit, invariants, assumptions, timing |
 | [docs/reviews/00-design-review.md](docs/reviews/00-design-review.md) | Two independent reviews of the design before any code, and what they changed |
 | [docs/experiments/01-gate-refusal.md](docs/experiments/01-gate-refusal.md) | A measurement the design depends on |
 | [docs/plan.md](docs/plan.md) | The sessions, each with its brief and its definition of done |
@@ -186,7 +192,9 @@ tests before the code. The full account is in [the journey](docs/journey.md).
 2. Postgres is both the record and the queue: a worker claims due rows with
    `FOR UPDATE SKIP LOCKED`, one priority at a time, highest first.
 3. The worker takes a rate-limit permit from Redis at the last moment, when the HTTP
-   connection is ready, so that nothing slow can happen between the permit and the request.
+   connection is ready, so that nothing slow is left between the permit and the request but
+   writing it. A process or machine that stalls there, or a step of Redis's clock, is what
+   the window's margin may not absorb (architecture §7).
 4. Every claimed row ends in exactly one place, where the result is classified from what was
    observed and written back; a worker that dies loses nothing, because its rows return when
    their lease expires.
