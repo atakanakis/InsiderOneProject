@@ -358,10 +358,37 @@ the time. The real loop does not: `Available` reports no room while the window i
 no dispatcher claims; when the window's permits come free, every dispatcher reads the same
 free count and claims up to its batch, the claims add up to more than the free permits, and
 the rest wait for the next window. The longest wait is therefore about one window, whatever
-the number of dispatchers up to 12. Above 12 it was not measured.
+the number of dispatchers up to 12. Session 8 measured past that (section 12, A5): the wait
+grows with the dispatchers from there, 3.1 s at 24 and 4.2 s at 36, still with no refusal,
+close to the design review's estimate of one window plus `10 × W / 100` seconds (3.4 s and
+4.6 s), which the gate budget of 5 s reaches at about 40 dispatchers per channel. The same
+estimate at a low limit: with `RATE_LIMIT=20`, one window plus `10 × 12 / 20` is 7 s for 12
+dispatchers, and the measurement refused 50 sends for no permit in time; 2 dispatchers waited
+at most 1.02 s. So the number of dispatchers a channel can have before refusals start is
+about `(GATE_BUDGET − window) × RATE_LIMIT ÷ CLAIM_BATCH`: 40 at the defaults, 8 at a limit
+of 20 (section 13). A slower provider changes none of this: at 200 ms the waits were those
+of 20 ms.
 The same wait is how long a high-priority row that has just become due can wait behind rows
 claimed before it: the gate has no priority order, and I9 holds at claim time. The batch
 rule is what keeps that wait short.
+
+**A low limit.** Session 7's reviewer ran two workers with `RATE_LIMIT=20` and read 8.1 and
+then 12.6 attempts per second from Prometheus (`rate(notifications_attempts_total[1m])`),
+about 1.5 and 3 minutes after the stack started, while a full `make guards` ran on the same
+machine (session 7's review, hard question 7). Session 8 did not reproduce it. In nine runs
+of 600 to 3,220 rows on the Compose stack with two workers and `RATE_LIMIT=20`, the attempts
+per second, counted from `delivery_attempts` by second, were 20 in almost every second and
+18.6 to 19.1 over each run, the top speed being 20 per 1.05 s, 19.05. The runs covered the
+defaults on one channel; three channels with mixed priorities; the reviewer's settings
+(`GATE_BUDGET=300ms`, a provider of the reviewer's own with a keep-alive of 200 ms and of
+500 ms, 80% failures on another channel, the observability profile); 16 busy processes in
+Docker; and the guards of the dispatcher and of the queue running beside it (session 8's
+record has the commands). What held the reviewer's run below the limit is not known. A
+possible reading, not shown: a sliding window frees each permit one window after it was
+taken, so the dispatchers can at best send `limit` per `window + d`, where `d` is the time
+from a permit's leaving the window to the next row's reaching the gate (the pause, the
+`Available` read, the claim). The measured runs fit a `d` of a few to 30 ms; the reviewer's
+figures would need 0.5 to 1.3 s, which a machine starved of CPU and disk could give.
 
 **One exit.** Every claimed row ends in `handle`, and `handle` ends in `Finish`. A claimed row
 has no other path, so there is no path on which a row, a slot, a waiting mark or a breaker
@@ -802,6 +829,19 @@ and it counts towards the breaker.
   TestAListPageReadsTheIndexFromItsCursor). `nextCursor` is
   present only when the page is full. A cursor the API could not have given (malformed, or a
   time after the year 9999) is a 400 (TestACursorOutsideTheTimeRangeIsRefused).
+  The filters other than the batch have no index of their own (session 8,
+  [experiment 03](experiments/03-tables-without-retention.md)). The list reads the list index
+  in its order and filters, so a filter that most rows match fills its page at once
+  (`status=sent`: 0.04 ms at 16,000,000 rows), and one that few rows match reads further:
+  `status=failed` with 1,000 such rows took 6 to 7 ms at 2,000,000 rows and 38 to 112 ms at
+  16,000,000. A filter that no row matches reads the whole index: `status=cancelled` took 50
+  to 55 ms at 2,000,000 rows and 1.6 to 3.2 s at 16,000,000. The request's 5 s deadline bounds
+  it; past it the answer is a 500. No index was added for these filters: each would be
+  written on every status change of every row, on the queue's path, to speed a read that the
+  deadline already bounds, and a page that matches nothing reaches the deadline at about 25 to
+  50 million rows (extrapolated from the two sizes, not measured), past the size at which the
+  1-hour window of `GET /v1/metrics` does (section 10). Both costs come from the missing
+  retention (section 16).
 - **Cancel** and **retry** answer 200 with the new status, 404 for an unknown id, and 409
   with the status found when the row is not in a status that allows it. Cancel is allowed
   from `scheduled`, `pending` and `retrying`; retry from `failed` only, and it calls Requeue
@@ -1166,7 +1206,15 @@ The attempts are found through the index, but Postgres joins them to their notif
 reading the whole notifications table, so the cost grows with the table, not only with the
 window; a join by primary key, bounded by the window, measured slower (0.22 to 0.27 s and 1.6
 to 2.2 s). Nothing removes old rows (section 16), so at some size the 1-hour window reaches the
-5 s deadline and answers 500; nothing else is affected ([experiment 02](experiments/02-metrics-at-scale.md)). Session 8 measures where.
+5 s deadline and answers 500; nothing else is affected ([experiment 02](experiments/02-metrics-at-scale.md)).
+Session 8 measured where ([experiment 03](experiments/03-tables-without-retention.md)): at
+16,000,000 notifications the two statements of the 1-hour window take 3.8 to 5.3 s together,
+at the deadline, those of the 15-minute window 2.4 to 3.6 s, and those of the default 5-minute
+window 0.37 to 0.51 s. At the full rate of three channels, 16,000,000 rows are about 15 hours
+of traffic. The same figures read from attempt rows that carry their notification's channel
+and creation time, with no join, cost what the window holds whatever the table's size (at most
+0.93 s for the hour); that change was measured and not made, because the class is the missing
+retention, which also slows the list's filters (section 8) and grows the disk (section 16).
 
 ### Tracing
 
@@ -1236,7 +1284,7 @@ the session that builds the part.
 
 | # | Invariant | Enforced in | Tests so far |
 |---|---|---|---|
-| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | The limiter's part (A6): TestNoWindowHoldsMoreThanTheLimit, TestAPermitIsRefusedAtTheLimit, TestChannelsHaveSeparateWindows. At the provider's side, through the real client and limiter: TestTheProviderReceivesAtMostTheLimitInAnyWindow (3 workers with their own Redis client, limiter and provider client, 150 senders, limit 100, 3.3 s: peak 100 within one second by the provider's arrival stamps in 8 local runs, 6 of them from `go test -race -count=6 -v -run TestTheProviderReceivesAtMostTheLimitInAnyWindow ./internal/provider`). I1 at the provider holds only while A4 holds: under `-race` on the CI runner the provider saw 106 within one second (CI run 44730514192), because requests arrived more than the margin after their permit, the case of section 7's limits table. Session 4 made the test check the guarantee as that table states it: the peak exceeds the limit by at most the number of requests that arrived later than the margin (session 4's review, F1). Session 5's CI showed that form cannot be checked under the race detector either: "late" is measured from when `Wait` returned on a worker that is itself starved, so a request late by its grant can be on time by its stamp (CI run 44750111098: peak 47, limit 40, 6 counted late, in the fault test). So every I1 test checks the peak against the limit without the race detector, which is how `make guards` and CI's measurement step run them, and only logs it with the detector. Through the dispatchers (session 5): TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers, three workers each with a dispatcher per channel, all three channels at the limit at once: peak 100 per channel, none later than the margin, without and with `-race` (A4); and TestInvariantsHoldUnderRandomFaults, under random faults (I5 row). The Compose stack with two workers: peak 100 per channel at the mock provider (CI's compose job). |
+| I1 | The provider does not receive more than the limit for a channel in any one-second window (within the limits listed in section 7) | Send gate + limiter window | The limiter's part (A6): TestNoWindowHoldsMoreThanTheLimit, TestAPermitIsRefusedAtTheLimit, TestChannelsHaveSeparateWindows. At the provider's side, through the real client and limiter: TestTheProviderReceivesAtMostTheLimitInAnyWindow (3 workers with their own Redis client, limiter and provider client, 150 senders, limit 100, 3.3 s: peak 100 within one second by the provider's arrival stamps in 8 local runs, 6 of them from `go test -race -count=6 -v -run TestTheProviderReceivesAtMostTheLimitInAnyWindow ./internal/provider`). I1 at the provider holds only while A4 holds: under `-race` on the CI runner the provider saw 106 within one second (CI run 44730514192), because requests arrived more than the margin after their permit, the case of section 7's limits table. Session 4 made the test check the guarantee as that table states it: the peak exceeds the limit by at most the number of requests that arrived later than the margin (session 4's review, F1). Session 5's CI showed that form cannot be checked under the race detector either: "late" is measured from when `Wait` returned on a worker that is itself starved, so a request late by its grant can be on time by its stamp (CI run 44750111098: peak 47, limit 40, 6 counted late, in the fault test). So every I1 test checks the peak against the limit without the race detector, which is how `make guards` and CI's measurement step run them, and only logs it with the detector. Through the dispatchers (session 5): TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers, three workers each with a dispatcher per channel, all three channels at the limit at once: peak 100 per channel, none later than the margin, without and with `-race` (A4); and TestInvariantsHoldUnderRandomFaults, under random faults (I5 row). The Compose stack with two workers: peak 100 per channel at the mock provider (CI's compose job). Under a burst (session 8, `tools/load`): 30,000 notifications, three runs, and 15,000 with 8 MB batches posted 8 at once, 20 runs: peak 100 per channel in every run but one, in which the mock provider stamped 130, 121 and 125 within one second on the three channels at once. Twelve later runs of the same burst captured the requests on the provider's network interface (tcpdump, kernel time): at most 100 per channel there and at the stamps. The one excess was not captured on the wire, so it is not shown whether the requests arrived late after their permits (the frozen-process row of section 7's limits, which all three channels at once would fit: a stall of the Docker VM that runs workers, Redis and provider) or only the mock provider's own stamps were late. It is recorded as unexplained, with its commands, in session 8's record. |
 | I2 | A row is never claimed by a second worker while its lease is valid | The row lock and the status filter in Claim; `SKIP LOCKED` so that claims do not wait | TestConcurrentClaimsNeverTakeTheSameRow (32 claimers, 2,000 rows), TestClaimTakesExactlyTheClaimableStatuses, TestClaimSkipsRowsLockedByAnotherTransaction |
 | I3 | A result changes a row only if it carries the row's current attempt number and the row is still `processing` | The `WHERE` of Finish | The database part: TestAnAttemptNumberIsRecordedOnce. The `WHERE` of Finish: TestFinishFromAStaleAttemptChangesNothing, TestFinishOnARowThatIsNoLongerProcessingChangesNothing, TestRepeatedFinishAddsNoSecondAttemptRow |
 | I4 | Every claimed row reaches Finish, or its lease expires and the reaper returns it | Single exit in `handle`; Reap | Reap: TestReapReturnsExpiredRowsToPendingOrFailed, TestTwoReapersAtOnceReturnEachRowOnce, TestReapSkipsRowsLockedByAnotherTransaction. The single exit (session 5): every claim of every scenario of TestInvariantsHoldUnderRandomFaults has its attempt row, which only Finish writes, and no lease expires; TestShutdownWaitsForSendsInFlightAndDoesNotCancelThem; a worker killed mid-send: TestAKilledWorkersRowComesBackThroughTheReaper; the reaper's batches: TestTheReaperReturnsExpiredRowsAndPublishesTheirStatus. |
@@ -1262,7 +1310,7 @@ client. The test kit does not contain a fake provider that could skip the send g
 | A2 | With `GetBody = nil` the transport never replays a request, so one send is one `GotConn` and at most one write | **Measured** by the design reviewer (one hook call, one request received). **Permanent test** (session 4): TestADeadReusedConnectionIsNotReplayed. The provider closes the kept-alive connection while the send waits at the gate: one gate call, nothing received, an error. With `GetBody` left as Go sets it, the gate ran twice in one send (two permits) and the client saw a 202 for a request whose first write was lost (`go test -count=1 -v -run TestADeadReusedConnectionIsNotReplayed ./internal/provider`, mutation by hand; `make guards` checks it). |
 | A3 | The claim reads the index in order with no sort and no full scan, under a custom plan and under a generic plan, also with many tied `ready_at` values and many rows that are not due yet | **Measured** by the second design reviewer on the final query: 2.8 million rows, 1 million of them future high-priority rows; 0.15 to 0.59 ms under both plans; a claim that finds nothing due reads 3 index pages. **Permanent test** (session 2): TestClaimPlanReadsTheIndexInOrder, on 300,000 rows (50,000 due with one `ready_at`, 200,000 not due, 50,000 finished). Under both plans: one ordered index scan, no sort, no sequential or bitmap scan of the claim index; a claim of 10 reads 4 index pages in 0.13 to 0.31 ms, a claim that finds nothing reads 3 pages in 0.03 ms (`go test -count=1 -v -run TestClaimPlanReadsTheIndexInOrder ./internal/store`). With the rejected `IN (SELECT ...)` form the generic plan is a sequential scan with a hash join, 32.5 ms (the same test, mutation applied by `make guards`). |
 | A4 | The time from permit to arrival at the provider varies by less than the 50 ms margin, on new and on reused connections | **Measured** (session 4) at the recording server on one machine, with the real limiter: TestPermitToArrivalStaysWithinTheMargin. 40 senders for 2 s at the limit of 100 per second over TLS; half use a fresh client per send, whose handshake the server holds back 100 ms, half share one client. The time is from `Wait` returning to the arrival stamp, both on the worker's monotonic clock; Redis's reply to the take script is not inside it. Four runs without the race detector: new connections median 0.15 to 0.42 ms, maximum 2.3 to 9.9 ms; reused, median 0.06 to 0.16 ms, maximum 3.0 to 6.6 ms (`go test -count=4 -v -run TestPermitToArrivalStaysWithinTheMargin ./internal/provider`). With `-race`, six runs: maxima 14 to 41 ms on new and 10 to 29 ms on reused connections (the same with `-race -count=6`): the race detector slows the client and the server on the same CPUs. So the test asserts the margin only without the race detector, which is how `make guards` runs it, in CI too. Session 4's reviewer, with 14 busy processes on 8 CPUs and `-race`, measured 71.7 ms on reused connections: under CPU starvation A4 does not hold, which is the "frozen worker" case of section 7's limits table. Not measured: the network between a worker and a real provider. **Through the dispatchers** (session 5), with a worker's real load (three workers, nine loops, three channels at the limit at once, 1,200 requests): TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers. Without the race detector: median 60 to 70 µs, p99 under 1.1 ms, maximum 0.97 to 2.27 ms (`go test -count=1 -v -run TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers ./internal/dispatch`). With `-race`, three runs: maximum 10.5 to 28.6 ms, none past the margin (the same with `-race -count=3`). CI runs the measurement without the race detector on every push (the test job's last step). **The margin stays 50 ms**: through the dispatchers the program as it ships uses under 5% of it on this machine. The cases that exceed it are a starved CPU (the race detector with other packages' tests on the same CPUs in CI, the reviewer's 71.7 ms), which a larger margin would not bound either; they are the "frozen worker" row of section 7's limits table, and every I1 test checks the guarantee as that row states it. A margin of 100 ms would cost 4.5% of the throughput for no case that was measured. |
-| A5 | With the claim batch rule, the wait at the gate stays near one window plus `10 × W / 100` seconds and nothing is refused, for up to 12 workers; throughput stays near the top speed | Simulated in the design review (93 to 96 sends per second, no refusals, worst wait 2.04 s at 12 workers), with waiters served in order. Session 3's reviewer modelled it with the real limiter, which serves waiters in no order, and every worker keeping 10 rows waiting: worst waits of 3.16 s and 2.12 s at 12 workers, no refusals; refusals from 24 workers (section 6). **Measured** (session 5) on the real dispatchers: TestGateWaitAndThroughputWithManyDispatchers, 1, 3, 6 and 12 dispatchers on one channel, each in its own worker, a provider answering in 20 ms, 12 s each. The provider client has the defaults of section 13 (send timeout 15 s, gate budget 5 s); the dispatcher has the tests' shorter pauses and open time (`testOptions`: idle pause 50 ms, lease 20 s, open time 3.5 s), which do not change the wait at the gate or the rate (session 5's review, a nit). Without the race detector: 94.1, 94.9, 94.9 and 94.9 sends per second (top speed 95.2); longest wait at the gate 6 ms, 0.98 s, 1.03 s and 1.05 s; median 2 to 10 ms; no refusal (`A5_FULL=1 go test -count=1 -v -run TestGateWaitAndThroughputWithManyDispatchers ./internal/dispatch`). With `-race`: 94.1 to 95.0 sends per second, longest wait 1.09 s, no refusal. The wait is about one window, not `10 × W / 100` seconds, because `Available` stops the claims while the window is full (section 6). Not measured above 12 dispatchers per channel, and not with a provider slower than 20 ms. By default the test runs 1 and 12 dispatchers for 6 s; CI runs all four without the race detector. |
+| A5 | With the claim batch rule, the wait at the gate stays near one window plus `10 × W / 100` seconds and nothing is refused, for up to 12 workers; throughput stays near the top speed | Simulated in the design review (93 to 96 sends per second, no refusals, worst wait 2.04 s at 12 workers), with waiters served in order. Session 3's reviewer modelled it with the real limiter, which serves waiters in no order, and every worker keeping 10 rows waiting: worst waits of 3.16 s and 2.12 s at 12 workers, no refusals; refusals from 24 workers (section 6). **Measured** (session 5) on the real dispatchers: TestGateWaitAndThroughputWithManyDispatchers, 1, 3, 6 and 12 dispatchers on one channel, each in its own worker, a provider answering in 20 ms, 12 s each. The provider client has the defaults of section 13 (send timeout 15 s, gate budget 5 s); the dispatcher has the tests' shorter pauses and open time (`testOptions`: idle pause 50 ms, lease 20 s, open time 3.5 s), which do not change the wait at the gate or the rate (session 5's review, a nit). Without the race detector: 94.1, 94.9, 94.9 and 94.9 sends per second (top speed 95.2); longest wait at the gate 6 ms, 0.98 s, 1.03 s and 1.05 s; median 2 to 10 ms; no refusal (`A5_FULL=1 go test -count=1 -v -run TestGateWaitAndThroughputWithManyDispatchers ./internal/dispatch`). With `-race`: 94.1 to 95.0 sends per second, longest wait 1.09 s, no refusal. The wait is about one window, not `10 × W / 100` seconds, because `Available` stops the claims while the window is full (section 6). By default the test runs 1 and 12 dispatchers for 6 s; CI runs all four without the race detector. **Past these settings** (session 8, with the test's knobs, one run each, without the race detector): with 12, 24 and 36 dispatchers, 94.9, 94.8 and 94.4 sends per second, longest wait 1.07 s, 3.13 s and 4.21 s, median 11 ms, 1.01 s and 1.05 s, no refusal (`A5_COUNTS=12,24,36,48 A5_RUN=12s go test -count=1 -timeout 0 -run TestGateWaitAndThroughputWithManyDispatchers -v ./internal/dispatch`); 48 could not be measured, because 48 workers' connection pools passed the test Postgres's 100 connections (section 13). With a provider that answers in 200 ms, 1, 6 and 12 dispatchers: 93.5, 94.7 and 94.9 per second, longest wait 8 ms, 1.03 s and 1.06 s, no refusal (`A5_COUNTS=1,6,12 A5_LATENCY=200ms A5_RUN=12s ...`). At a limit of 20: 2 dispatchers 18.9 per second (top speed 19.0), longest wait 1.02 s, no refusal; 12 dispatchers 18.9 per second, median wait 2.1 s, longest 5.0 s (the gate budget), and 50 sends refused for no permit in time (`A5_LIMIT=20 A5_COUNTS=2,12 A5_RUN=12s ...`). Above about 12 dispatchers the wait follows the design review's estimate, one window plus `CLAIM_BATCH × W ÷ RATE_LIMIT`, and the refusals begin where that passes the gate budget (section 6, section 13). |
 | A6 | The sliding-window script grants at most the limit per window under concurrent callers | **Permanent test** (session 3): TestNoWindowHoldsMoreThanTheLimit. 200 callers on 4 Redis clients, half waiting in `Wait`, half asking once at random moments, limit 100, margin 50 ms, for 3.3 s: 400 permits, at most 100 in any window of 1,050,000 µs on the permits' own Redis times (`go test -count=1 -v -run TestNoWindowHoldsMoreThanTheLimit ./internal/ratelimit`). With the window's lower bound moved 2 ms early, it fails in 3 of 3 runs. |
 
 ## 13. Timing budget
@@ -1304,19 +1352,31 @@ other (TestComposeGivesTheWorkerItsStopGracePeriod). Until session 1's review th
 was checked only against the Compose file, and a `.env` that raised the shutdown timeout
 broke it silently.
 
-Two relations cannot be checked by a single worker. They are stated here and watched by
+These relations cannot be checked by a single worker. They are stated here and watched by
 metrics:
 
 - One worker can run at most `slots ÷ provider latency` sends per second. With 50 slots that
   is the full rate up to a provider latency of about 500 ms; a slower provider needs more
   slots or more workers.
 - The wait at the gate must stay under the gate budget. The design review estimated
-  `window + claim batch × workers ÷ rate`, which would hold up to about 35 workers per
-  channel; session 3's review measured refusals from 24 workers with the real limiter
-  (section 6). Session 5 measured about one window (1.05 s) up to 12 dispatchers per channel,
-  with no refusal (A5); above that it is not measured, and the refusals at the gate
+  `window + claim batch × workers ÷ rate`; session 3's review measured refusals from 24
+  workers with a model that kept every worker's batch waiting (section 6). Session 5 measured
+  about one window (1.05 s) up to 12 dispatchers per channel, and session 8 found the
+  estimate close above that: 3.1 s at 24 and 4.2 s at 36 dispatchers with no refusal, and at
+  `RATE_LIMIT=20`, 12 dispatchers reached the budget and had refusals (A5). So, per channel,
+  `dispatchers ≤ (GATE_BUDGET − window) × RATE_LIMIT ÷ CLAIM_BATCH`: about 40 at the
+  defaults, 8 at a limit of 20. A worker cannot check it, because it does not know how many
+  others there are; the refusals at the gate
   (`notifications_attempts_total{outcome="no_permit_in_time"}`, alert
-  `NotificationsGateRefusals`) show when it is crossed.
+  `NotificationsGateRefusals`) show when it is crossed. Each refusal costs an attempt
+  (section 6), so a channel that stays past the relation can use up rows' attempts.
+- Every worker and API instance has its own Postgres connection pool, of pgx's default size
+  (the larger of 4 and the number of CPUs), and the total must stay under Postgres's
+  `max_connections` (100 by default). Session 8 found it when 48 workers of the A5 test could
+  not connect (`FATAL: sorry, too many clients already`); 36 could. A deployment with many
+  workers sets `pool_max_conns` in `DATABASE_URL` or raises `max_connections`. A worker whose
+  claims fail counts them (`notifications_worker_errors_total{operation="claim"}`, alert
+  `NotificationsDatabaseFailing`).
 - `IDLE_CONN_TIMEOUT + GATE_BUDGET` should stay under the provider's keep-alive timeout;
   otherwise some sends find their connection closed by the provider while they wait at the
   gate (section 7, the connection pool). The worker does not know the provider's timeout.
@@ -1345,6 +1405,9 @@ tools/alertcheck       every alert rule has a firing promtool test, and names on
                        and label values that the binaries export (section 10)
 tools/e2e              notifications through the API of the Compose stack, and a WebSocket
                        client that follows one of them
+tools/load             a burst against the Compose stack, measured from outside: acceptance,
+                       the API's memory, the drain, high-priority latency, the provider's peak
+                       and duplicates (`make load`, session 8)
 internal/systemtest    tests across the API, Redis and the worker: one correlation id,
                        one trace, a WebSocket event from a real delivery
 deploy/prometheus      alert rules, their promtool tests, the scrape configuration
@@ -1403,4 +1466,4 @@ Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on
 | A WebSocket stream of every event | Each client names what it follows (section 9). A stream of everything would send 300 events per second to each client, and is a job for a consumer of the Redis channel, not for a public endpoint. |
 | An API key in the WebSocket's query string | Browsers cannot set headers on a WebSocket, but a key in a URL is written to proxy and access logs. The key is a header, as on every `/v1` path; a browser client needs a server of its own in between. |
 | `traceparent` sent to the provider | The provider is outside; the trace ends at the worker's delivery span. The provider receives the correlation id (section 7). |
-| Removing old notifications and attempts | Needs a retention policy (how long a client may ask for a status) that the requirements do not give. Without it the tables grow without end; the one read whose cost grows with them is `GET /v1/metrics` over 1 hour (section 10). |
+| Removing old notifications and attempts | Needs a retention policy (how long a client may ask for a status) that the requirements do not give. Without it the tables grow without end, and two reads grow with them (session 8, [experiment 03](experiments/03-tables-without-retention.md)): `GET /v1/metrics` reaches its 5 s deadline over 1 hour at about 16,000,000 notifications, about 15 hours at the full rate, and over 15 minutes later; a list filter that matches no row reads the whole list index, 1.6 to 3.2 s at 16,000,000. A deployment at that rate needs a retention job. If it must run without one, storing each attempt's channel and creation time on its row (a migration and a change to Finish's insert) bounds the metrics by the window, measured at 0.93 s at most for the hour. |
