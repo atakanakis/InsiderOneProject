@@ -25,9 +25,11 @@ jobs:
         with:
           version: v2.15.0
       - name: No build output is tracked
-        # Two binaries of 23 MB each were committed once (session 7's review, F1).
+        # Two binaries of 23 MB each were committed once (session 7's review, F1). It looks for
+        # the formats Go writes (ELF, Mach-O, PE); `file` calls a shell script with a shebang
+        # "executable" too, which matched session 8's experiment scripts.
         run: |
-          found=$(git ls-files -z | xargs -0 file | grep -E 'executable|ELF|Mach-O' || true)
+          found=$(git ls-files -z | xargs -0 file | grep -E 'ELF|Mach-O|PE32' || true)
           if [ -n "$found" ]; then echo "$found"; exit 1; fi
 
   test:
