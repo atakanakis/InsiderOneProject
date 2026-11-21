@@ -443,7 +443,26 @@ probe can be forgotten.
 - The second and third rows separate two questions. "Is something wrong with this message?"
   ends the message. "Is something wrong with the channel?" (a provider that is down, a wrong
   URL, an expired credential) is retried and counts against the breaker, so a broken
-  configuration stops the channel and does not drain the whole queue into `failed`.
+  configuration that answers anything but 400, 413 and 422 stops the channel and does not
+  drain the whole queue into `failed`.
+- **A broken configuration that answers 400 does drain it** (session 8's review, F2). The
+  provider's answer is all the client has to tell the two questions apart, and 400, 413 and
+  422 are read as the message's fault. So an address that answers 400 to every message (the
+  reviewer pointed the workers at the API's own `/v1/notifications`; an HTTPS port spoken to
+  in plain HTTP, or a gateway that wants a header, answer the same way) ends every row it is
+  sent `failed` after one attempt, at the rate limit: 1,000 rows in about 15 s, with the
+  breaker closed. Nothing is lost: `failed` is the dead-letter state, and `POST /retry`
+  requeues each row once the configuration is fixed (the list endpoint finds them with
+  `status=failed`). The other reading was considered and not taken: if a rejection taught the
+  breaker a failure, five rejected messages in a row would open it, and a run of messages the
+  provider refuses on their content (a client's batch of numbers that do not exist) would hold
+  the channel, for every client, to one probe per open period per worker, the rejected rows
+  going out one by one. A misconfiguration is the operator's, seen at a deployment, and its
+  rows can be requeued; a run of bad messages is any client's, at any time. The alert
+  `NotificationsFailedShareHigh` (section 10) fires when more than 10% of a channel's
+  finished attempts fail for 15 minutes: a misconfiguration that lasts is shown after about
+  15 minutes, by when it may have drained a queue of up to about 85,000 rows per channel at the
+  rate limit. Section 16 lists the breaker that would learn from rejections as left out.
 - "Retry" becomes `failed` when the attempt was the last one allowed.
 - Every row of the table is one attempt. A refused request costs an attempt too. That is the
   price of never giving attempts back; it is paid rarely, because the hint and the batch rule
@@ -1467,6 +1486,7 @@ Dependencies point one way: `api` depends on `store` and `domain`; `dispatch` on
 |---|---|
 | Priority aging (a low-priority row can wait as long as higher ones keep arriving) | Strict priority is what the requirement asks for and is easy to reason about. Aging needs real traffic to tune. |
 | A circuit breaker shared by all workers | It needs state in Redis and a second protocol between workers. The per-worker breaker bounds what a broken channel costs per worker; with little traffic rows can still reach `failed`, the dead-letter state, and `/retry` requeues them (section 6, "What the breaker protects"). |
+| A breaker that learns a failure from a rejection (400, 413, 422) | Session 8's review (F2) showed the cost of not doing it: an address that answers 400 to everything ends every row `failed`, 1,000 in about 15 s, with the breaker closed; the rows are requeued by `POST /retry`. Doing it would let any client's run of messages that the provider refuses on their content hold the channel for every client, to one probe per open period per worker (section 6). A provider whose 400 means "wrong endpoint" rather than "wrong message" would need its own rule. |
 | A breaker that counts a failure rate | Five failures in a row is simple to reason about; a rate needs a window and a threshold tuned on real traffic. A provider that fails half its requests opens it often, which is the intended reading (section 6). |
 | Pausing the whole channel on one 429 | A provider that throttles a few requests at random would halve throughput. A run of 429s opens the breaker, which covers the sustained case. |
 | Not counting an attempt when nothing was sent | It needs a second counter, or attempts that go down. Both were sources of defects on paper (design review, F2). The rare lost attempt is cheaper. |
