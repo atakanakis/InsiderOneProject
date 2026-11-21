@@ -22,6 +22,24 @@ Only what the measurements needed.
 | A5's knobs | `A5_COUNTS`, `A5_LATENCY`, `A5_LIMIT`, `A5_RUN` on TestGateWaitAndThroughputWithManyDispatchers; the defaults unchanged | the runs below |
 | [Experiment 03](../experiments/03-tables-without-retention.md) | The API's reads as the tables grow without retention: `GET /v1/metrics` and the list's filters up to 16,000,000 notifications | the experiment's commands |
 
+## Found by CI before the review
+
+CI on `d6fa19d` (run 44924691249) failed one guard: `333 guards, 332 real, 1 failed`. With the
+drain of `events.Redis.Close` removed, TestThePublisherSendsWhatIsBufferedWhenClosed passed on
+the runner. The guard had been real in every earlier run, locally (the same day, 333 of 333)
+and in CI. The test published 1000 events and then called `Close`; on a fast runner the sender
+had sent them all before `Close`, so the drain had nothing to do. The code had the same
+dependence on timing: the sender's loop chose at random between a waiting event and the stop
+signal, so after `Close` it could go on sending on its own context, past the end of `Close`'s.
+
+The class is a test whose guard depends on goroutine timing. Fixed as the design asks: section
+9 first (`3d0091d`), then the tests red (`dbb6234`: the drain's test now holds the first
+pipeline with a go-redis hook while `Close` is called, so events are certainly buffered;
+TestCloseSendsNothingAfterItsContextEnds calls `Close` with an ended context in 20 rounds and
+found all 1000 published after it), then the code (`5cd31ed`: the stop signal is looked at
+before the buffer) and a guard that restores the old loop. The guard on the drain was then real
+in 5 of 5 runs and the new guard in 3 of 3 (`go run ./tools/guards -only ...`).
+
 ## Measured
 
 All on the author's machine (Apple silicon, 16 GB, 8 CPUs and 8 GB for Docker), one heavy run
