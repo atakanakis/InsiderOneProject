@@ -1315,8 +1315,8 @@ var guards = []Guard{
 	},
 	{
 		Name: "events: after Close only Close's context sends (session 8)", File: "internal/events/redis.go",
-		Old: "\t\tselect {\n\t\tcase <-p.stop:\n\t\t\tp.drain(batch)\n\t\t\treturn\n\t\tdefault:\n\t\t}\n\t\tselect {\n\t\tcase e := <-p.buf:\n\t\t\tbatch = p.fill(append(batch[:0], e))\n\t\t\tp.send(context.Background(), batch)\n\t\tcase <-p.stop: // the select above drains\n\t\t}",
-		New: "\t\tselect {\n\t\tcase e := <-p.buf:\n\t\t\tbatch = p.fill(append(batch[:0], e))\n\t\t\tp.send(context.Background(), batch)\n\t\tcase <-p.stop:\n\t\t\tp.drain(batch)\n\t\t\treturn\n\t\t}",
+		Old:     "\t\tselect {\n\t\tcase <-p.stop:\n\t\t\tp.drain(batch)\n\t\t\treturn\n\t\tdefault:\n\t\t}\n\t\tselect {\n\t\tcase e := <-p.buf:\n\t\t\tbatch = p.fill(append(batch[:0], e))\n\t\t\tp.send(context.Background(), batch)\n\t\tcase <-p.stop: // the select above drains\n\t\t}",
+		New:     "\t\tselect {\n\t\tcase e := <-p.buf:\n\t\t\tbatch = p.fill(append(batch[:0], e))\n\t\t\tp.send(context.Background(), batch)\n\t\tcase <-p.stop:\n\t\t\tp.drain(batch)\n\t\t\treturn\n\t\t}",
 		Package: "./internal/events", Test: "TestCloseSendsNothingAfterItsContextEnds",
 	},
 	{
