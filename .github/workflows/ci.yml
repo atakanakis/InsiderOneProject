@@ -122,6 +122,12 @@ jobs:
           sys.exit(0 if ok else 1)
           PY
           go run ./tools/alertcheck api.prom worker1.prom worker2.prom
+      - name: A burst of 6000 through the API, within the limit at the provider
+        # tools/load (make load): 6000 in batches of 1000, mixed channels and priorities, single
+        # creates while it is posted and high-priority notifications while it drains. It fails
+        # when the provider saw more than 100 of a channel in one second, or received or
+        # accepted another number than was created. The README's numbers are from longer runs.
+        run: go run ./tools/load -n 6000 -timeout 5m
       - name: The workers stop cleanly
         run: |
           docker compose stop worker

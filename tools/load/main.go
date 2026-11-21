@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"slices"
 	"strconv"
@@ -168,6 +169,8 @@ type burst struct {
 	began, accepted time.Time // the first request; the last 201
 	batches         []batchRef
 	latency         durations // one per batch, request to answer
+	upload          durations // one per batch, request to the end of writing its body
+	afterUpload     durations // one per batch, the end of writing its body to the answer
 	bodyBytes       int
 }
 
@@ -215,8 +218,13 @@ func postBurst(ctx context.Context, cl *client, c config) (*burst, error) {
 					Total   int    `json:"total"`
 				}
 				t0 := time.Now()
+				var wrote time.Time // when the client finished writing the body: an upload that
+				// stalls on the way to the API is told apart from an API that answers late
+				tctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+					WroteRequest: func(httptrace.WroteRequestInfo) { wrote = time.Now() },
+				})
 				header := http.Header{"Idempotency-Key": {"load-" + randomHex()}}
-				if err := cl.callRaw(ctx, "POST", c.api+"/v1/notifications/batch", bodies[i], header, http.StatusCreated, &created); err != nil {
+				if err := cl.callRaw(tctx, "POST", c.api+"/v1/notifications/batch", bodies[i], header, http.StatusCreated, &created); err != nil {
 					errs <- fmt.Errorf("batch %d: %w", i, err)
 					return
 				}
@@ -224,6 +232,8 @@ func postBurst(ctx context.Context, cl *client, c config) (*burst, error) {
 				mu.Lock()
 				b.batches[i].id = created.BatchID
 				b.latency.add(took)
+				b.upload.add(wrote.Sub(t0))
+				b.afterUpload.add(t0.Add(took).Sub(wrote))
 				b.accepted = time.Now()
 				mu.Unlock()
 			}
@@ -415,6 +425,7 @@ func report(c config, b *burst, d *drain, singles *durations, h *highs, baseline
 		c.n, len(b.batches), float64(b.bodyBytes)/1e6, c.concurrency, c.contentBytes)
 	fmt.Printf("accepted: in %v, %.0f notifications per second; a batch answered in %s\n",
 		acceptFor.Round(time.Millisecond), float64(c.n)/acceptFor.Seconds(), b.latency.summary())
+	fmt.Printf("  of which writing the body: %s; from the body written to the answer: %s\n", b.upload.summary(), b.afterUpload.summary())
 	fmt.Printf("single creates during the burst: %d, answered in %s\n", singles.len(), singles.summary())
 	fmt.Printf("API memory (resident / Go heap in use): before %s, peak during the burst %s, peak until drained %s\n",
 		baseline, burstPeak, drainPeak)
