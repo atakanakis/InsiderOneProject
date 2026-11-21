@@ -17,8 +17,8 @@ early parts were lost by the time later parts were built.
 | 4 | Provider client and the send gate | **done** (2026-11-20, [record](sessions/04-provider.md)) |
 | 5 | Dispatcher, breaker, reaper; fault tests | **done** (2026-11-20, [record](sessions/05-dispatcher.md)) |
 | 6 | API: notifications, batches, templates, idempotency | **done** (2026-11-20, [record](sessions/06-api.md)) |
-| 7 | Events, WebSocket, metrics, tracing, alerts | next |
-| 8 | Hardening: full independent review, soak, load test | |
+| 7 | Events, WebSocket, metrics, tracing, alerts | **done** (2026-11-21, [record](sessions/07-events.md)) |
+| 8 | Hardening: full independent review, soak, load test | next |
 | 9 | Walkthrough and final documents | |
 
 ## How a session runs

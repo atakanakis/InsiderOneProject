@@ -268,7 +268,47 @@ Record: [sessions/06-api.md](sessions/06-api.md).
   URL dropped where an error leaves the provider client, and one redundant condition that
   turned 14 ms into 0.02 ms.
 
-### Session 7 and later
+### Session 7: events and observability (2026-11-20 to 2026-11-21)
+
+Live status over a WebSocket, Prometheus metrics, OpenTelemetry traces, alert rules.
+Record: [sessions/07-events.md](sessions/07-events.md).
+
+- **The first version's two alert rules that could never fire were the starting point.**
+  Here every rule has a promtool case in which it fires and one in which it does not, and a
+  test builds the real API and worker, reads their `/metrics` and fails when a rule names a
+  metric, a label value or a grouping label that neither exports. CI runs the same check on
+  the running stack. Stopping Redis on that stack fired the rate-limit alert after 150 s.
+- **The review showed what those checks do not cover.** A rule can fire on the input its test
+  gives it and never on the input its failure produces: a read-only Postgres fails result
+  writes for one lease and then claims, so the rule on result writes went pending and
+  resolved without firing for 10.5 minutes; a stopped API took its own figures with it; an
+  idle half-open breaker paged. The rules were rewritten on the shapes seen on the stack and
+  run there until each fired: the database rule at 135 s, the API rule at 150 s, the worker
+  rule at 165 s. Two binaries had also been committed by `git add -A`; CI now refuses tracked
+  build output.
+- **A lost event must never cost a delivery, and that was tested before it was built.**
+  Against a Redis that accepts connections and never answers, a publisher that waited let 30
+  of 300 rows through in 15 s. The publisher now puts the event in a bounded buffer and
+  returns; one goroutine sends it. The same 300 rows went at the limit. It became invariant
+  I13.
+- **Every bound of the WebSocket has a test, and building one found a defect in the
+  library's use.** A frame that announced 1 GiB and sent 100 bytes held its handler, because
+  the close handshake reads the rest of the message first. A data message now closes the
+  connection at once. A client that does not read is let go when 256 messages wait, and
+  1,000,000 events to it did not grow the heap.
+- **The figures were checked against reality.** After 1502 notifications on the Compose
+  stack, the workers' counters, `GET /v1/metrics` and the mock provider all said 1502; CI
+  checks it on every push. One trace shows an API request and the worker's deliveries
+  minutes later.
+- **"A line per try" was a class, not one place.** Session 5's open item, 3,200 warnings in
+  75 s from a read-only Postgres, became a counter and one line per 10 s. Stopping Redis then
+  showed the same class in go-redis's own output and in readiness probes, fixed the same way.
+- **The guards found ten that proved nothing.** Nine mutations did not compile; one removed a
+  write deadline and no test failed, because the test never made the write block. Each was
+  fixed until its named test turned red, and a fast test now finds a guard whose text a
+  change left behind.
+
+### Session 8 and later
 
 Recorded here as each session finishes.
 

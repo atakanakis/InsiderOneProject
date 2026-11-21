@@ -8,9 +8,10 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 > notification sent to the API is delivered: the API (validation, idempotency, templates,
 > bounds on every input and output), the queue (Postgres), the rate limiter (Redis), the
 > provider client with its send gate, and the dispatcher with its circuit breaker and reaper
-> are built and tested, the last under random faults. Status events, WebSocket, metrics and
-> tracing come in session 7. This README says only what exists; the table below is updated at
-> the end of every session.
+> are built and tested, the last under random faults. Status changes reach WebSocket clients
+> through Redis; Prometheus metrics, OpenTelemetry traces and ten alert rules, each with a
+> promtool test, watch it. Session 8 hardens and measures it under load. This README says only
+> what exists; the table below is updated at the end of every session.
 
 | # | Session | Status |
 |---|---|---|
@@ -21,8 +22,8 @@ priorities, retries and live status tracking. Written in Go, with PostgreSQL and
 | 4 | Provider client and the send gate | done ([record](docs/sessions/04-provider.md)) |
 | 5 | Dispatcher, breaker, reaper; fault tests | done ([record](docs/sessions/05-dispatcher.md)) |
 | 6 | API | done ([record](docs/sessions/06-api.md)) |
-| 7 | Events, WebSocket, metrics, tracing, alerts | next |
-| 8 | Hardening: independent review, soak, load test | |
+| 7 | Events, WebSocket, metrics, tracing, alerts | done ([record](docs/sessions/07-events.md)) |
+| 8 | Hardening: independent review, soak, load test | next |
 | 9 | Walkthrough and final documents | |
 
 ## Running what exists
@@ -49,7 +50,18 @@ curl -s 'localhost:8080/v1/notifications?status=sent&channel=email&limit=100'   
 curl -s -X POST localhost:8080/v1/notifications/<id>/cancel   # only scheduled, pending, retrying
 curl -s -X POST localhost:8080/v1/notifications/<id>/retry    # only failed; MAX_ATTEMPTS more attempts
 
-make e2e N=1000                # 1000 per channel through the API; waits until every one is sent
+# Live status over a WebSocket: the current state first, then every change. Up to 100
+# notificationId and 10 batchId; the client sends nothing. Any WebSocket client works, e.g.
+# websocat 'ws://localhost:8080/v1/ws?notificationId=<id>&batchId=<batchId>'
+#   {"type":"status","id":"...","status":"scheduled"}
+#   {"type":"batch","batchId":"...","total":2,"counts":{"pending":1,"scheduled":1,...}}
+#   {"type":"status","id":"...","batchId":"...","status":"processing"}
+#   {"type":"status","id":"...","batchId":"...","status":"sent"}
+
+curl -s 'localhost:8080/v1/metrics?window=15m'  # per channel: queue, attempts by outcome, share delivered, p50/p95/p99
+curl -s localhost:8080/metrics | grep '^notifications_'   # Prometheus; each worker serves its own on :9100
+
+make e2e N=1000                # follows one over the WebSocket, then 1000 per channel through the API
 make status                    # notifications by status, straight from Postgres
 curl localhost:9090/stats      # what the mock provider received; at most 100 per channel in any second
 make down        # stop and delete the data
@@ -59,6 +71,12 @@ The specification is at <http://localhost:8080/openapi.yaml>, with a viewer at
 <http://localhost:8080/docs>. Started with `API_KEYS=key1,key2 make up` (or the variable in a
 `.env` file), the API asks every `/v1` request for one of the keys, in
 `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+
+`make up-observability` adds Prometheus (<http://localhost:9091>, scraping the API and every
+worker, with the alert rules of [`deploy/prometheus`](deploy/prometheus/alerts.yml)) and
+Jaeger (<http://localhost:16686>), and turns tracing on: one trace shows an API request and
+the worker's deliveries of the notifications it created. Without it tracing is off and costs
+nothing.
 
 The mock provider can fail on purpose, to watch retries and the circuit breaker:
 
@@ -73,6 +91,7 @@ MOCK_FAIL_RATE=0.2 MOCK_THROTTLE_RATE=0.05 MOCK_LATENCY=30ms docker compose up -
 | `make lint` | golangci-lint v2.15.0, in Docker |
 | `make guards` | Disables each guard in turn and checks that its named test fails ([`tools/guards`](tools/guards/list.go)) |
 | `make check-docs` | Checks that every test named in `docs/` and this README exists |
+| `make alerts` | `promtool check rules` and `promtool test rules` on the alert rules, and a firing test for every rule ([`tools/alertcheck`](tools/alertcheck/main.go)) |
 
 Settings are environment variables, listed with their defaults and relations in
 [architecture §13](docs/architecture.md#13-timing-budget). The worker refuses to start when a
