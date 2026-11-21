@@ -73,7 +73,7 @@ status events, one for the subscription. It starts the events subscription
 The client sends:
 
 ```sh
-curl -s localhost:8080/v1/notifications -H 'X-Correlation-ID: order-42' \
+curl -s localhost:8080/v1/notifications -H 'Content-Type: application/json' -H 'X-Correlation-ID: order-42' \
   -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 4242","priority":"high","idempotencyKey":"order-42"}'
 ```
 
@@ -266,7 +266,8 @@ read cheapest first:
 1. free slots: at most 50 sends in flight per dispatcher;
 2. the claim batch, 10, and 0 while any row this dispatcher claimed before still waits for
    its permit;
-3. `(*Breaker).Allow`: no limit when the breaker is closed, 0 when it is open;
+3. `(*Breaker).Allow`: no limit when the breaker is closed, 0 when it is open, 1 when it is
+   half-open and no probe is out;
 4. `ratelimit.(*Limiter).Available`: the free permits of the channel's window now, read by
    `readScript`, which changes nothing. An error (Redis unreachable or refusing writes) is 0.
 
@@ -471,8 +472,8 @@ transaction:
 2. `finishRowSQL` sets `sent`, `sent_at` and the provider's message id, only
    `WHERE id = $1 AND attempts = 1 AND status = 'processing'`.
 
-If the update matches nothing, the result is stale (the reaper took the row back, or it was
-cancelled), and nothing but the history changes. Text from the provider is cut and cleaned
+If the update matches nothing, the result is stale: the lease ended and the reaper took the
+row back, and another worker may hold it now. Then nothing but the history changes. Text from the provider is cut and cleaned
 first (`bounded`), so a result write cannot fail on it every time. If the write fails, it is
 retried from 100 ms, doubling up to 5 s, for at most one lease after the send. When the
 status changed, `finish` publishes `sent`, counts the result, and writes one info line,
@@ -507,11 +508,13 @@ A client follows a notification with `GET /v1/ws?notificationId=<id>`. `(*server
 checks the filters (`followed`), the origin and the upgrade, adds the client to the hub
 (`(*Hub).follow`), and only then reads the current state (`(*server).currentState`), so no
 change is missed between the two. `(*server).stream` writes the current state first, then
-every event:
+every event. Followed from its creation, a notification scheduled 3 s ahead gave, on the
+Compose stack:
 
 ```
-{"type":"status","id":"...","status":"processing"}
-{"type":"status","id":"...","status":"sent"}
+{"type":"status","id":"97da9252-...","status":"scheduled"}
+{"type":"status","id":"97da9252-...","status":"processing"}
+{"type":"status","id":"97da9252-...","status":"sent"}
 ```
 
 A client that asks instead with `GET /v1/notifications/{id}` gets `(*server).get`, which reads

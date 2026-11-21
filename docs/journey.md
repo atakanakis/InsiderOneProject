@@ -59,8 +59,8 @@ So the first version was renamed as the trial, its lessons were written down
 - **I** decide scope and trade-offs and read every session's record. The sessions are started
   one after another by a coordinating agent, each in a new conversation, and each reports back
   when it is done. Being able to explain the core without the agent is a requirement of this
-  rebuild, because the first version failed it; the session records and the walkthrough of
-  session 9 exist for that.
+  rebuild, because the first version failed it; the session records and the
+  [walkthrough](walkthrough.md) exist for that.
 - **The lead agent** of a session holds to the architecture, writes or directs the code, and
   checks claims against the repository. The design session (session 0) was led on Claude
   Fable. The build sessions are led on Claude Opus, each in a new conversation.
@@ -342,11 +342,51 @@ and the whole system was reviewed once more. Record: [sessions/08-hardening.md](
   40 at the defaults, 8 at a limit of 20); `GET /v1/metrics` over an hour reaches its deadline
   at about 16 million notifications, because nothing removes old rows.
 
-### Session 9
+### Session 9: walkthrough and final documents (2026-11-22)
 
-Recorded here when it finishes.
+No new feature. A reader can now follow one notification through the code, and the README
+says only what the repository shows. Record: [sessions/09-walkthrough.md](sessions/09-walkthrough.md).
 
-## 5. What is honest to say about time
+- **The walkthrough was written from the code, then held to it by a check.**
+  [walkthrough.md](walkthrough.md) follows one SMS through 20 steps and six branches, each
+  with its file, its functions, the invariant it keeps and the tests that prove it. Two of the
+  first draft's figures were wrong against their tests: they were taken from the documents
+  instead of read from the test. A new check, `tools/docrefs`, now fails `make check-docs`
+  when a link, a path or a function name of the documents does not exist, so the walkthrough
+  cannot drift from the code unnoticed. Lesson 9 again: a document is a claim, and a claim
+  needs a check.
+- **The README became a way in.** What it is, one command, where to read, the API examples with
+  their real answers, and a map from every requirement of the assignment to the code and the
+  tests that meet it. The long account of the measurements moved to its own page, and one of
+  its figures turned out to be wrong against its source (7.6 s for 7.5 s).
+- **A rehearsal from a clean clone found seven gaps in a README that had been read many
+  times.** Answers whose status the command did not print, a repeat that was described but not
+  given, a failing provider with no way back, a check that cannot pass against a failing
+  provider, a warning on the first start, a status read too soon, an exit code. Every command
+  worked; what was missing was what a reader needs to know and the author no longer sees. Each
+  was fixed and the rehearsal run again from a new clone.
+
+## 5. Where it ended
+
+The system meets the assignment, its bonuses included; the README maps each requirement to its
+code and tests. What held under the measurements: the rate limit at the provider, with two
+exceptions, one burst of 30 and one fault scenario of 606, both recorded with their possible
+causes; no notification lost; no notification accepted twice except in the at-least-once cases
+the design names.
+
+What did not end clean, and is written down as such: three events of session 8 that did not
+repeat and are not explained; a provider address that answers 400 to everything drains the
+queue into `failed`, kept as a trade-off and measured; tables that grow without a retention
+policy; and the parts that were never measured here: a real provider, more than one API
+instance, a server whose clock does not step. Two binaries committed in session 7 remain in the
+public history.
+
+The process made mistakes too, and they are part of the story: guards that proved nothing
+until they were made to fail, a fix that broke an earlier fix (session 8), checks whose reach
+did not match their class. Each was found by a test that failed, a guard run, CI, a reviewer
+or a rehearsal, not by rereading.
+
+## 6. What is honest to say about time
 
 The assignment suggests about 12 hours. The review rounds on the first version and this
 rebuild are work beyond that, which I chose to do. The history of both repositories shows the
