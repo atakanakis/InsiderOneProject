@@ -1717,4 +1717,18 @@ var guards = []Guard{
 		Old: "\t\t\tacc.add(r.Header.Get(\"Idempotency-Key\"))\n", New: "",
 		Package: "./cmd/mockprovider", Test: "TestMockProviderCountsWhatItAcceptedTwice",
 	},
+
+	// Session 8's review.
+	{
+		Name: "api: a create's deadline covers its wait for a slot (session 8's review, F1)", File: "internal/api/notifications.go",
+		Old:     "ctx, cancel := s.database(r) // the deadline covers the wait for a slot (architecture §8)\n\tdefer cancel()\n\trelease, err := s.render(ctx)\n\tif err != nil {\n\t\ts.internal(w, r, err)\n\t\treturn\n\t}\n\tdefer release()\n\tlookup, err := s.lookup(ctx, []domain.Input{in})",
+		New:     "release, err := s.render(r.Context())\n\tif err != nil {\n\t\ts.internal(w, r, err)\n\t\treturn\n\t}\n\tdefer release()\n\tctx, cancel := s.database(r)\n\tdefer cancel()\n\tlookup, err := s.lookup(ctx, []domain.Input{in})",
+		Package: "./internal/api", Test: "TestARequestWaitingForASlotEndsAtItsDeadline",
+	},
+	{
+		Name: "api: a batch's deadline covers its wait for a slot (session 8's review, F1)", File: "internal/api/notifications.go",
+		Old:     "ctx, cancel := s.database(r) // the deadline covers the wait for a slot (architecture §8)\n\tdefer cancel()\n\trelease, err := s.render(ctx)\n\tif err != nil {\n\t\ts.internal(w, r, err)\n\t\treturn\n\t}\n\tdefer release()\n\tlookup, err := s.lookup(ctx, items)",
+		New:     "release, err := s.render(r.Context())\n\tif err != nil {\n\t\ts.internal(w, r, err)\n\t\treturn\n\t}\n\tdefer release()\n\tctx, cancel := s.database(r)\n\tdefer cancel()\n\tlookup, err := s.lookup(ctx, items)",
+		Package: "./internal/api", Test: "TestARequestWaitingForASlotEndsAtItsDeadline",
+	},
 }

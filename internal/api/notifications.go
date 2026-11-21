@@ -239,14 +239,14 @@ func (s *server) reply(w http.ResponseWriter, r *http.Request, code int, v any) 
 	}
 }
 
-// render waits for one of the MaxRenderingRequests slots. It returns false when the request
-// ended while it waited.
-func (s *server) render(r *http.Request) (release func(), ok bool) {
+// render waits for one of the MaxRenderingRequests slots, within ctx: the request's database
+// deadline, which covers the wait (architecture §8). It returns the error when ctx ended first.
+func (s *server) render(ctx context.Context) (release func(), err error) {
 	select {
 	case s.rendering <- struct{}{}:
-		return func() { <-s.rendering }, true
-	case <-r.Context().Done():
-		return nil, false
+		return func() { <-s.rendering }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("waiting for a rendering slot: %w", ctx.Err())
 	}
 }
 
@@ -447,13 +447,14 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, f.code, f.err)
 		return
 	}
-	release, ok := s.render(r)
-	if !ok {
+	ctx, cancel := s.database(r) // the deadline covers the wait for a slot (architecture §8)
+	defer cancel()
+	release, err := s.render(ctx)
+	if err != nil {
+		s.internal(w, r, err)
 		return
 	}
 	defer release()
-	ctx, cancel := s.database(r)
-	defer cancel()
 	lookup, err := s.lookup(ctx, []domain.Input{in})
 	if err != nil {
 		s.internal(w, r, err)
@@ -507,13 +508,14 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fieldError("notifications", "a batch has at least one notification"))
 		return
 	}
-	release, ok := s.render(r)
-	if !ok {
+	ctx, cancel := s.database(r) // the deadline covers the wait for a slot (architecture §8)
+	defer cancel()
+	release, err := s.render(ctx)
+	if err != nil {
+		s.internal(w, r, err)
 		return
 	}
 	defer release()
-	ctx, cancel := s.database(r)
-	defer cancel()
 	lookup, err := s.lookup(ctx, items)
 	if err != nil {
 		s.internal(w, r, err)
