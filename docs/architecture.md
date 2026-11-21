@@ -11,6 +11,27 @@ on paper, before any of them became code. What changed and why is in
 Where a statement below is an assumption that has not been measured yet, it says so. The list
 is in [section 12](#12-assumptions-and-how-each-is-proven).
 
+## How to read this document
+
+It is a contract and a record at once, and it is long.
+
+- **The contract** is written in the present tense: what the system does, and the test that
+  proves it. **The record** is every sentence that names a session or a review ("until session
+  5's review ...", "(review F2)"): it says why a rule is the way it is and what was measured
+  before it was settled. On a first reading, skip the record; the rule around it stands alone.
+- **The core** is sections 2 to 7: the parts, the life of a notification, the data model, the
+  queue, the dispatcher and the rate limit. Section 8 is the API and the bound of every input
+  and output; 9 and 10 are status events and observability; 11 to 13 are the invariants, the
+  assumptions and the timing budget; 14 is the code layout, 15 the requirements, 16 what was
+  left out.
+- **The long cells** of the tables in sections 11 and 12 hold the tests and the measurements,
+  run by run. The invariant or the assumption itself is the short cell of the same row.
+- **The code** behind each section, in the order a notification meets it, is in
+  [the walkthrough](walkthrough.md).
+
+The record stays next to the rule it explains, so that a claim keeps its evidence beside it
+(CLAUDE.md, rule 12).
+
 ## 1. What the system does
 
 A client sends a notification request (SMS, email or push) to the API. The system stores it,
