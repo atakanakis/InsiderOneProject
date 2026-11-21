@@ -79,17 +79,23 @@ func (p *Redis) Close(ctx context.Context) {
 }
 
 // run is the sender: one pipeline at a time, as many events as wait, up to PublishBatch.
+// Once Close is called, only drain sends, through Close's context: the stop signal is looked
+// at before the buffer, because a select between the two picks either at random (§9).
 func (p *Redis) run() {
 	defer close(p.done)
 	batch := make([]Event, 0, PublishBatch)
 	for {
 		select {
-		case e := <-p.buf:
-			batch = p.fill(append(batch[:0], e))
-			p.send(context.Background(), batch)
 		case <-p.stop:
 			p.drain(batch)
 			return
+		default:
+		}
+		select {
+		case e := <-p.buf:
+			batch = p.fill(append(batch[:0], e))
+			p.send(context.Background(), batch)
+		case <-p.stop: // the select above drains
 		}
 	}
 }
