@@ -653,6 +653,11 @@ var guards = []Guard{
 		Package: "./internal/provider", Test: "TestTheTLSHandshakeHasItsOwnTimeout",
 	},
 	{
+		Name: "provider: the dial has its own timeout", File: "internal/provider/provider.go",
+		Old: "(&net.Dialer{Timeout: o.DialTimeout, KeepAlive: 30 * time.Second})", New: "(&net.Dialer{KeepAlive: 30 * time.Second})",
+		Package: "./internal/provider", Test: "TestTheDialHasItsOwnTimeout",
+	},
+	{
 		Name: "provider: an idle connection for every slot", File: "internal/provider/provider.go",
 		Old: "MaxIdleConnsPerHost:    o.IdleConns,", New: "MaxIdleConnsPerHost:    0,",
 		Package: "./internal/provider", Test: "TestTheClientKeepsAnIdleConnectionForEverySlot",

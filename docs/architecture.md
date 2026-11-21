@@ -604,8 +604,12 @@ the gate, the write, the response's headers and its body
 (`transport.go` line 2732), and the request's context no longer closes it, so reading that
 body waited as long as the provider kept the connection open (session 4's review, F2). The
 client reads a body only from a final response (status 200 or more); a 101 is closed unread
-and is "any other response". The TLS handshake timeout ends a slow handshake first (TestTheTLSHandshakeHasItsOwnTimeout). The dial timeout has no test: a dial
-that hangs needs an address that drops packets, which a test on one machine cannot rely on.
+and is "any other response". The TLS handshake timeout ends a slow handshake first (TestTheTLSHandshakeHasItsOwnTimeout),
+and the dial timeout a connection attempt that is never answered (TestTheDialHasItsOwnTimeout:
+300 ms, not the send's 5 s). Such a dial needs an address that drops packets; the test makes
+one on the machine itself, a listener whose accept queue of one is full and never accepted
+from, which Linux and the BSDs answer by dropping the SYN. Until session 8 the dial timeout
+had no test.
 
 **The provider client in detail** (`internal/provider`, session 4).
 
