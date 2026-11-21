@@ -1148,6 +1148,66 @@ func TestARequestEndsAtItsDeadlineWhenPostgresStalls(t *testing.T) {
 	}
 }
 
+// The deadline covers the wait for a rendering slot (session 8's review, F1). With Postgres
+// stalled, the four slots are held by requests that wait for the database until their
+// deadline; every other create and batch waits for a slot. Each must still be answered 500
+// within its own deadline, not one deadline after the request before it got its slot.
+func TestARequestWaitingForASlotEndsAtItsDeadline(t *testing.T) {
+	e := testkit.Setup(t)
+	u, err := url.Parse(e.DatabaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, stall := stallingProxy(t, u.Host)
+	u.Host = proxy
+	pool, err := store.Connect(context.Background(), u.String(), DatabaseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	const deadline = 500 * time.Millisecond
+	srv := httptest.NewServer(NewHandler(observability.NewLogger(io.Discard, "api", "error"), Options{
+		Health: Health{Postgres: pool.Ping, Redis: ok}, Pool: pool, MaxAttempts: 6, DatabaseDeadline: deadline,
+	}))
+	t.Cleanup(srv.Close)
+	stall()
+	const requests = 5 * MaxRenderingRequests
+	client := &http.Client{Timeout: 30 * time.Second}
+	type answer struct {
+		code int
+		took time.Duration
+		err  error
+	}
+	answers := make(chan answer, requests)
+	for i := range requests {
+		path, body := "/v1/notifications", `{"recipient":"+905551234567","channel":"sms","content":"y"}`
+		if i%2 == 1 {
+			path, body = "/v1/notifications/batch", `{"notifications":[{"recipient":"+905551234567","channel":"sms","content":"y"}]}`
+		}
+		go func() {
+			req, _ := http.NewRequestWithContext(context.Background(), "POST", srv.URL+path, strings.NewReader(body))
+			began := time.Now()
+			resp, err := client.Do(req)
+			a := answer{took: time.Since(began), err: err}
+			if err == nil {
+				a.code = resp.StatusCode
+				_ = resp.Body.Close()
+			}
+			answers <- a
+		}()
+	}
+	var longest time.Duration
+	for range requests {
+		a := <-answers
+		longest = max(longest, a.took)
+		if a.err != nil || a.code != http.StatusInternalServerError || a.took > deadline+500*time.Millisecond {
+			t.Errorf("an answer %d after %s (%v); want 500 within the deadline of %s", a.code, a.took.Round(time.Millisecond), a.err, deadline)
+		}
+	}
+	t.Logf("%d creates and batches at once with Postgres stalled and %d slots: the last answered after %s",
+		requests, MaxRenderingRequests, longest.Round(time.Millisecond))
+}
+
 // An answer is encoded before its status is written: one that cannot be encoded is a 500,
 // never a 2xx without a body (session 6's review, F4).
 func TestAnAnswerThatCannotBeEncodedIsA500(t *testing.T) {
