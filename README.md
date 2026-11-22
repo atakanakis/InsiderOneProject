@@ -185,7 +185,7 @@ code in the order a notification meets it; architecture §15 maps the requiremen
 | Metrics: queue depth, success and failure rates, latency | [`internal/api/metrics.go`](internal/api/metrics.go) (`GET /v1/metrics`); [`internal/observability/metrics.go`](internal/observability/metrics.go) (`GET /metrics`) | TestTheMetricsEndpointReportsTheRecentWindow, TestQueueGaugesComeFromTheDatabase |
 | Structured logs with correlation ids | [`internal/observability/logging.go`](internal/observability/logging.go); `api.correlate` | TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider, TestLogLinesCarryTheCorrelationIDFromTheContext |
 | Health check | [`internal/api/health.go`](internal/api/health.go) (`/healthz`, `/readyz`) | TestReadyzIsReadyWhenBothDependenciesAnswer, TestReadyzStaysReadyWhenOnlyRedisIsUnreachable |
-| The provider's request and its 202 answer (the mock provider stands in for webhook.site; see [Not done](#not-done-and-why)) | `provider.(*Client).send`; the mock provider, [`cmd/mockprovider/main.go`](cmd/mockprovider/main.go) | TestTheRequestHasTheAssignmentsFormat, TestRecorderAnswersWithTheProviderContract |
+| The provider's request and its 202 answer (the mock provider stands in for webhook.site in the tests and the default stack; webhook.site itself was tried once, see [Not done](#not-done-and-why)) | `provider.(*Client).send`; the mock provider, [`cmd/mockprovider/main.go`](cmd/mockprovider/main.go) | TestTheRequestHasTheAssignmentsFormat, TestRecorderAnswersWithTheProviderContract |
 | Bonus: failure handling | [`internal/dispatch/breaker.go`](internal/dispatch/breaker.go); `failed` as the dead-letter state; `(*server).retry` | TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue, TestRetryRequeuesOnlyAFailedNotification |
 | Bonus: scheduled notifications | `store.createSQL`, `store.claimSQL` | TestAScheduledNotificationWaitsUntilItsTime (stored `scheduled` with its time), TestClaimReturnsOnlyDueRows (not claimed before it), TestAWebSocketClientReceivesTheSentEventOfARealDelivery (scheduled 2 s ahead, then sent by a real worker) |
 | Bonus: templates | `domain.CompileTemplate`, `(*server).createTemplate` | TestTemplatesAreCreatedOnceAndRendered, TestTheRenderedLengthIsMeasuredBeforeRendering |
@@ -215,8 +215,9 @@ workers and the mock provider, in session 8. Every figure, its range and its com
 | The randomised fault test, 606 scenarios | 181,800 notifications, every one final; 605 passed, one exceeded the limit (47 against 40) with 10 requests late after their permits; 42 accepted twice, each after an attempt that got no response (at-least-once case 3) | `FAULT_RUNS=300 FAULT_SEED=1000 go test -count=1 -timeout 0 -run TestInvariantsHoldUnderRandomFaults -v ./internal/dispatch`, and `FAULT_SEED=2000` |
 | The wait at the gate, 1 to 36 dispatchers on one channel (A5) | 94.1 to 94.9 sends per second; longest wait 6 ms with 1 dispatcher, 0.98 to 1.07 s with 3 to 12, 3.13 s with 24, 4.21 s with 36; no refusal | `A5_FULL=1 go test -count=1 -v -run TestGateWaitAndThroughputWithManyDispatchers ./internal/dispatch` (1, 3, 6, 12); `A5_COUNTS=12,24,36 A5_RUN=12s` with the same test (12 to 36) |
 
-Not measured: a real provider (webhook.site included; the mock provider answers its contract),
-more than one API instance, and a server whose clock does not step.
+Not measured: a real provider under load (webhook.site was tried once with nine notifications,
+[below](#not-done-and-why); every other figure is against the mock provider, which answers the
+same contract), more than one API instance, and a server whose clock does not step.
 
 ## Not done, and why
 
@@ -229,12 +230,17 @@ Each item, with what it costs, is in [architecture §16](docs/architecture.md#16
 - **A breaker shared by all workers, or one that learns from a 400:** each worker has its own; a
   provider that answers 400 to everything ends rows `failed` (they come back with `POST /retry`),
   because the other choice lets one client's bad messages stop a channel for everyone.
-- **webhook.site was not used.** The assignment's provider is a webhook.site URL that answers
-  202; sending to it publishes the test data on an outside service. The mock provider answers
-  the same contract and the client sends the assignment's request, so
-  `PROVIDER_URL=https://webhook.site/<uuid> make up` is the only change. Configure the URL to
-  answer 202 with `{"messageId", "status", "timestamp"}`: with its default answer, a 200 in
-  plain text, every notification ends `sent` with no provider message id.
+- **webhook.site is not the default provider, and no load was sent to it.** The assignment's
+  provider is a webhook.site URL that answers 202; sending to it publishes the test data on an
+  outside service, so the tests and the default stack use the mock provider, which answers the
+  same contract. `PROVIDER_URL=https://webhook.site/<uuid> make up` is the only change. It was
+  tried once, after session 9, with a URL set to answer 202 with
+  `{"messageId", "status", "timestamp"}`: nine notifications (three single and a batch of six,
+  over sms, email and push) each ended `sent` on the first attempt with the URL's message id,
+  in 416 to 443 ms per attempt, and webhook.site's own list showed nine requests in the
+  assignment's format, each with its notification id as `Idempotency-Key`. With webhook.site's
+  default answer, a 200 in plain text, every notification ends `sent` with no provider message
+  id; that case was not tried.
 - **Priority aging, tenants, per-client quotas, expiry of idempotency keys, durable status
   events, a bulk requeue endpoint:** not asked for, and each needs a policy or a second source
   of truth.

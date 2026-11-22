@@ -379,7 +379,9 @@ says only what the repository shows. Record: [sessions/09-walkthrough.md](sessio
 
 The system meets the assignment, its bonuses included, with one substitution: the provider is a
 mock that answers webhook.site's contract, because sending to webhook.site publishes the data;
-pointing `PROVIDER_URL` at a webhook.site URL is the only change, and it was not tried. The
+pointing `PROVIDER_URL` at a webhook.site URL is the only change. It was not tried during the
+sessions; after the last one I tried it once, with nine notifications, and each was accepted
+with a 202 and ended `sent` (README, "Not done, and why"). The
 README maps each requirement to its code and tests. What held under the measurements: the rate limit at the provider, with two
 exceptions, one burst of 30 and one fault scenario of 606, both recorded with their possible
 causes; no notification lost; no notification accepted twice except in the at-least-once cases
@@ -388,7 +390,7 @@ the design names.
 What did not end clean, and is written down as such: three events of session 8 that did not
 repeat and are not explained; a provider address that answers 400 to everything drains the
 queue into `failed`, kept as a trade-off and measured; tables that grow without a retention
-policy; and the parts that were never measured here: a real provider, more than one API
+policy; and the parts that were never measured here: a real provider under load, more than one API
 instance, a server whose clock does not step. Two binaries committed in session 7 remain in the
 public history.
 

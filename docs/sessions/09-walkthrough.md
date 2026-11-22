@@ -147,7 +147,9 @@ session 8's CI check for binaries: a check whose reach included its own text.
   [session 8's record](08-hardening.md#what-is-still-open).
 - **Not measured against webhook.site** (decisions, above; the review's F5): the README says
   what to change and what webhook.site's default answer would do. Trying it is the owner's
-  decision, because it sends the test data to an outside service.
+  decision, because it sends the test data to an outside service. (After the session the owner
+  decided to try it: nine notifications, each accepted with a 202 and ended `sent`; the README
+  has the figures.)
 - **The order of a WebSocket's first message and the events queued before it** has no test
   (from session 8); the README and the walkthrough now say what a client can see (the review's
   F10).
