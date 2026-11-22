@@ -549,9 +549,9 @@ After attempt `k`, `(RetryPolicy).DelayAfter` draws the delay between half and a
 `min(2 min, 2 s × 2^(k−1))`, so rows that failed together come back apart; a `Retry-After`
 that asks for longer is honoured up to the same cap. `finishRowSQL` stores `retrying` with
 `ready_at = now() + delay`, and the row waits in the claim index until then. The next claim
-makes it attempt `k + 1`. When the attempt was the last one allowed (`attempts >=
-max_attempts`, 6 by default), the same statement stores `failed` instead, from the row's own
-counters. `failed` is the dead-letter state: `POST /v1/notifications/{id}/retry`
+makes it attempt `k + 1`. When the attempt was the last one allowed
+(`attempts >= max_attempts`, 6 by default), the same statement stores `failed` instead, from
+the row's own counters. `failed` is the dead-letter state: `POST /v1/notifications/{id}/retry`
 (`(*server).retry`) calls `store.(*Queue).Requeue`, which makes the row `pending`, due now,
 with `max_attempts = attempts + 6`. It never lowers `attempts`, so no attempt number is
 used twice.

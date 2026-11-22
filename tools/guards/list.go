@@ -288,7 +288,8 @@ var guards = []Guard{
 		Package: "./tools/testnames", Test: "TestTestNamesCheckReportsATestThatDoesNotExist",
 	},
 
-	// Session 9: the check that the documents' links, paths and Go names exist.
+	// Session 9: the check that the documents' links, paths and Go names exist; session 9's
+	// review (F1, F2) widened it.
 	{
 		Name: "docrefs: a link to a missing file is reported", File: "tools/docrefs/main.go",
 		Old: "if _, err := os.Stat(filepath.Join(root, rel)); err != nil {", New: "if _, err := os.Stat(filepath.Join(root, rel)); false && err != nil {",
@@ -300,23 +301,78 @@ var guards = []Guard{
 		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
 	},
 	{
-		Name: "docrefs: a missing path is reported", File: "tools/docrefs/main.go",
-		Old: "if _, err := os.Stat(filepath.Join(root, ref)); err != nil {", New: "if _, err := os.Stat(filepath.Join(root, ref)); false && err != nil {",
+		Name: "docrefs: a link with a title is read", File: "tools/docrefs/main.go",
+		Old: "(?:\\s+\"[^\"]*\")?\\)`)", New: "\\)`)",
 		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
 	},
 	{
-		Name: "docrefs: a name of a step is declared in the file the step links", File: "tools/docrefs/main.go",
+		Name: "docrefs: a reference-style link's target is read", File: "tools/docrefs/main.go",
+		Old: "if m := refDef.FindStringSubmatch(stripped); m != nil {", New: "if m := refDef.FindStringSubmatch(stripped); false && m != nil {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: an HTML link is read", File: "tools/docrefs/main.go",
+		Old: "range href.FindAllStringSubmatch(stripped, -1)", New: "range href.FindAllStringSubmatch(\"\", -1)",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a ~~~ fence is a code block", File: "tools/docrefs/main.go",
+		Old: " || strings.HasPrefix(t, \"~~~\")", New: "",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a missing path is reported", File: "tools/docrefs/main.go",
+		Old: "if _, err := os.Stat(filepath.Join(root, file)); err != nil {", New: "if _, err := os.Stat(filepath.Join(root, file)); false && err != nil {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a path written with ./ is a path", File: "tools/docrefs/main.go",
+		Old: "^(?:\\./)?(?:cmd|", New: "^(?:cmd|",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a path with a line number is a path", File: "tools/docrefs/main.go",
+		Old: "/?(?::\\d+(?::\\d+)?)?$`)", New: "/?$`)",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a code span split across lines is reported", File: "tools/docrefs/main.go",
+		Old: "if strings.Count(line, \"`\")%2 == 1 {", New: "if false && strings.Count(line, \"`\")%2 == 1 {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a name of a step is declared in a file the step links", File: "tools/docrefs/main.go",
 		Old: "if !declaredIn(d, linked, name) {", New: "if false && !declaredIn(d, linked, name) {",
 		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
 	},
 	{
+		Name: "docrefs: a name of a step is looked for only in the files the step links", File: "tools/docrefs/main.go",
+		Old: "for _, f := range files {\n\t\tif d.byFile[f][name] {", New: "for f := range d.byFile {\n\t\tif d.byFile[f][name] {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
 		Name: "docrefs: a method is declared on its type", File: "tools/docrefs/main.go",
-		Old: "if !d.methods[mm[1]+\".\"+mm[2]] {", New: "if false && !d.methods[mm[1]+\".\"+mm[2]] {",
+		Old: "if !d.all[key(mm[1], mm[2], mm[3])] {", New: "if false && !d.all[key(mm[1], mm[2], mm[3])] {",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: (T).m needs a value receiver", File: "tools/docrefs/main.go",
+		Old: "if !star { // a value receiver's", New: "if !star || star { // a value receiver's",
 		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
 	},
 	{
 		Name: "docrefs: a qualified name is declared in its package", File: "tools/docrefs/main.go",
-		Old: "if !names[name] {", New: "if false && !names[name] {",
+		Old: "case ours && !names[name]:", New: "case false && ours && !names[name]:",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a qualified name is looked for only in its own package", File: "tools/docrefs/main.go",
+		Old: "names, ours := d.byPkg[pkg]", New: "names, ours := d.all, d.byPkg[pkg] != nil",
+		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
+	},
+	{
+		Name: "docrefs: a qualifier that is no package is reported", File: "tools/docrefs/main.go",
+		Old: "case !ours && !d.imports[pkg]:", New: "case false && !ours && !d.imports[pkg]:",
 		Package: "./tools/docrefs", Test: "TestDocRefsReportsWhatDoesNotResolve",
 	},
 	{

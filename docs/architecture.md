@@ -1462,9 +1462,12 @@ internal/testkit       test database and test Redis (testcontainers, or servers 
                        make guards starts once); starts the recorder
 tools/guards           `make guards`: disables each guard and expects a named test to fail
 tools/testnames        checks that every test named in docs/ exists in the code
-tools/docrefs          checks that every relative link of the documents resolves, to a heading
-                       where it names one, and that every path and Go name the README and the
-                       walkthrough write in backticks exists (session 9)
+tools/docrefs          checks that every relative link of the documents resolves (inline, with
+                       a title, reference-style or HTML), to a heading where it names one, and
+                       that every path and Go name the README and the walkthrough write in
+                       backticks exists; a qualifier must be a package of the repository or
+                       one its code imports. It checks that names exist, not that what is said
+                       about them is true (session 9)
 tools/alertcheck       every alert rule has a firing promtool test, and names only metrics
                        and label values that the binaries export (section 10)
 tools/e2e              notifications through the API of the Compose stack, and a WebSocket

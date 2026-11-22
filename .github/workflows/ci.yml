@@ -43,7 +43,7 @@ jobs:
           go-version-file: go.mod
       - name: Test (race detector)
         run: make test
-      - name: Every test, link, path and Go name the documents name exists
+      - name: Every test the documents name exists; every link, and every path and Go name of the README and the walkthrough
         run: make check-docs
       - name: I1, A4 and A5 through the dispatchers, and the fault test, without the race detector
         # The race detector slows the client and the recording server on the same CPUs

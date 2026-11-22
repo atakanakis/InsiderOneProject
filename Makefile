@@ -38,7 +38,7 @@ lint:
 guards: ## Disable each guard in turn and check that its named test fails (tools/guards)
 	go run ./tools/guards
 
-check-docs: ## Every test named in docs/ and README.md exists in the code; every link, path and Go name the documents point at exists
+check-docs: ## Every test the documents name exists; every link of the documents, and every path and Go name of the README and the walkthrough, exists
 	go run ./tools/testnames
 	go run ./tools/docrefs
 
