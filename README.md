@@ -283,6 +283,13 @@ Each item, with what it costs, is in [architecture §16](docs/architecture.md#16
 - **A breaker shared by all workers, or one that learns from a 400:** each worker has its own; a
   provider that answers 400 to everything ends rows `failed` (they come back with `POST /retry`),
   because the other choice lets one client's bad messages stop a channel for everyone.
+- **A breaker that counts a failure rate:** this one counts five failures in a row, which are
+  common among 50 sends at once when a provider fails a quarter of its requests. With the
+  failing mock provider of [Commands and settings](#commands-and-settings) (20% 503, 5% 429),
+  an outside run after session 9 saw a batch of 1,000 sent in about 85 s, against about 11 s
+  with a healthy provider: the breakers opened for 30 s at a time. Nothing was lost. A breaker
+  on the rate over a window, with 429 read as "slower" and not as "broken", is the change I
+  would make next.
 - **webhook.site is not the default provider, and no load was sent to it.** The assignment's
   provider is a webhook.site URL that answers 202; sending to it publishes the test data on an
   outside service, so the tests and the default stack use the mock provider, which answers the
@@ -311,7 +318,9 @@ From [session 8's record](docs/sessions/08-hardening.md#what-is-still-open) and
   separate them in the record. For the first, the leading candidate is the clock step of the
   next item: the session's reviewer stepped the clock forward by 300 ms on purpose and the
   provider counted 200 per channel on all three channels at once, the same signature
-  ([review 8](docs/reviews/08-session-8-review.md), F3).
+  ([review 8](docs/reviews/08-session-8-review.md), F3). After session 9, an outside run of
+  `make load` on a machine busy with other work counted 101 in one second on all three
+  channels, and `make load` reported it as a failure; the run after it counted 100.
 - **Docker's clock.** Redis reads the wall clock of Docker's VM, which stepped forward by 28 to
   35 ms under load on the author's machine; that is inside the 50 ms margin, and a larger step
   would let more than the limit through for one window (architecture §7).
