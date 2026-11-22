@@ -25,7 +25,7 @@ early parts were lost by the time later parts were built.
 
 Roles:
 
-- **The candidate** decides scope and trade-offs and reads the record of every session.
+- **I** (the candidate) decide scope and trade-offs and read the record of every session.
 - **A coordinating agent** (the conversation that wrote the design) starts each session in a
   new conversation when the previous one has finished, and checks that its result is pushed
   and green before starting the next.

@@ -58,9 +58,9 @@ So the first version was renamed as the trial, its lessons were written down
 
 - **I** decide scope and trade-offs and read every session's record. The sessions are started
   one after another by a coordinating agent, each in a new conversation, and each reports back
-  when it is done. Being able to explain the core without the agent is a requirement of this
-  rebuild, because the first version failed it; the session records and the
-  [walkthrough](walkthrough.md) exist for that.
+  when it is done. Being able to explain the core without an agent is a requirement of this
+  rebuild: the first version's dispatcher had grown until it no longer fit in a few sentences.
+  The one-screen loop, the session records and the [walkthrough](walkthrough.md) exist for that.
 - **The lead agent** of a session holds to the architecture, writes or directs the code, and
   checks claims against the repository. The design session (session 0) was led on Claude
   Fable. The build sessions are led on Claude Opus, each in a new conversation.
@@ -372,8 +372,8 @@ says only what the repository shows. Record: [sessions/09-walkthrough.md](sessio
   the first half of it; two figures mixed whose runs they were; webhook.site, the provider the
   assignment names, was never used, and the README had not said so plainly. Each was fixed as a
   class, the check with a case and a guard per kind. The lead then found one more of the same
-  kind in its own record: the command that proves the repository has no Turkish text held the
-  Turkish letters it looks for, so it found itself.
+  kind in its own record: the command that checks that the repository's text is English only held
+  the non-English letters it looks for, so it found itself.
 
 ## 5. Where it ended
 

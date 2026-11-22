@@ -19,8 +19,8 @@ code. Each review finding was fixed where it was found. Three patterns followed:
 2. **Fixes broke other guarantees.** Two of the three major findings in the second review were
    inside the commits that fixed the first review.
 3. **The core grew by one guard per round.** The dispatcher ended with seven separate paths
-   that give back a rate-limit permit or a breaker reservation. It passed its tests, and the
-   author could no longer explain it in a few sentences.
+   that give back a rate-limit permit or a breaker reservation. It passed its tests, and it
+   could no longer be explained in a few sentences.
 
 ## The lessons
 
@@ -54,7 +54,7 @@ code. Each review finding was fixed where it was found. Three patterns followed:
 | 14 | One long session held the whole system. Details of early parts were lost by the time later parts were built. | Too much in one context | One session builds one part, from a written brief, with a fresh context and a definition of done. ([Plan](plan.md)) |
 | 15 | The invariants were discovered by reviewers, one failure at a time. | Guarantees found by accident | The invariants are written first. The randomised fault test that checks them is written before the dispatcher. |
 | 16 | The commits arrived in clusters, which says little about how the work went. | History that does not tell the story | One commit per finished step, made when the step is finished. |
-| 17 | The core became hard for its owner to explain without the agent's help. | Code the owner cannot defend | The dispatcher has to fit on one screen. A [walkthrough](walkthrough.md) follows one message through the code. The candidate reviews every session's result before the next one starts. |
+| 17 | The core could no longer be explained in a few sentences. | Code that cannot be defended in a review | The dispatcher has to fit on one screen. A [walkthrough](walkthrough.md) follows one message through the code. I review every session's result before the next one starts. |
 
 ## What the first version got right, and is kept
 

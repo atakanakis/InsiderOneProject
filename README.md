@@ -1,5 +1,7 @@
 # Event-Driven Notification System
 
+[![CI](https://github.com/atakanakis/InsiderOneProject/actions/workflows/ci.yml/badge.svg)](https://github.com/atakanakis/InsiderOneProject/actions/workflows/ci.yml)
+
 A Go service that accepts notifications (SMS, email, push) over an HTTP API and delivers them
 to an external provider: at most 100 messages per second per channel, high, normal and low
 priority, retries, scheduling, templates, and live status over a WebSocket. PostgreSQL holds the
@@ -40,7 +42,9 @@ where it says `...`, with the HTTP status first; add `-i` to a command to see th
 are random: use the ones your own answers give.
 
 ```sh
-# Create one notification. The idempotency key makes a repeat safe.
+# Create one notification. The idempotency key makes a repeat safe. A single notification takes
+# it in the body, as here; a batch takes it in the Idempotency-Key header (the header on a
+# single create is answered 400, with a message that says so).
 curl -s localhost:8080/v1/notifications -H 'Content-Type: application/json' \
   -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 4242","priority":"high","idempotencyKey":"order-42"}'
 # 201 {"id":"86538422-9238-46e2-8e2b-d7c0a228ca8d","recipient":"+905551234567","channel":"sms",
@@ -139,7 +143,9 @@ it too: `make e2e KEY=first-key-0123456789`.
    second build and what the first one taught (10 min).
 
 The records of each session are in [docs/sessions/](docs/sessions/), each independent review in
-[docs/reviews/](docs/reviews/), and the plan in [docs/plan.md](docs/plan.md).
+[docs/reviews/](docs/reviews/), and the plan in [docs/plan.md](docs/plan.md). They are the
+process log, written by each session's lead agent and its reviewer; none of them is needed to
+evaluate the system.
 
 ## The design in brief
 
@@ -163,6 +169,53 @@ The records of each session are in [docs/sessions/](docs/sessions/), each indepe
    their lease expires.
 5. Delivery is at-least-once, and the three cases in which a message can reach the provider
    twice are listed in [architecture §6](docs/architecture.md#6-the-dispatcher).
+
+## Delivery and retry design
+
+The assignment leaves this part to the candidate. The whole of it is in
+[architecture §6](docs/architecture.md#6-the-dispatcher); this is the short form.
+
+**One place decides what an attempt means:** `dispatch.Classify`
+([`internal/dispatch/classify.go`](internal/dispatch/classify.go)), read top to bottom. A
+response always wins over anything else that happened to the request.
+
+| What was observed | The notification | The circuit breaker learns |
+|---|---|---|
+| A 2xx response | `sent` | success |
+| 400, 413 or 422: the provider rejected this message | `failed`, no retry | success: the provider answered |
+| Any other response (5xx, 429, 408, 401, 403, 404, ...) | retry with backoff; `Retry-After` honoured | failure |
+| The rate limiter returned an error | retry in 1 to 2 s | failure |
+| No permit came free in time | retry in 1 to 2 s | nothing |
+| The provider closed an idle connection before the request was written | retry in 1 to 2 s | nothing |
+| No response (could not connect, timeout, reset) | retry with backoff | failure |
+
+- **Why 401, 403 and 404 are retried and 400 is not.** "Something is wrong with this message"
+  ends the message; "something is wrong with the channel" (a wrong URL, an expired credential,
+  a provider that is down) must not, or one bad setting would end every notification in the
+  queue. The price: an address that answers 400 to everything does end them `failed`
+  ([Not done](#not-done-and-why)); they come back with `POST /v1/notifications/{id}/retry`.
+- **Backoff:** 6 attempts by default. After attempt k the delay is drawn between half of and
+  the whole of min(2 min, 2 s × 2^(k−1)), so rows that failed together do not come back
+  together. A `Retry-After` that asks for longer is honoured, up to the same 2 minutes.
+- **Every attempt counts, also one that was refused before it was sent.** Nothing is ever
+  given back. The first version handed permits and breaker reservations back on seven separate
+  paths; this one has none, and its loop has a single exit.
+- **Circuit breaker, one per channel per worker:** five failures in a row open it for 30 s, in
+  which that dispatcher claims nothing; then exactly one notification is let through as a
+  probe, and its result closes the breaker or opens it again.
+- **A worker that dies loses nothing.** A claimed row has a lease of 60 s. The reaper, every
+  5 s, returns rows whose lease has expired to the queue, or ends them `failed` if that was
+  their last attempt. A result that arrives from a worker that no longer holds the row changes
+  nothing.
+- **At-least-once.** A notification can reach the provider twice in three named cases: a
+  worker killed between the provider's answer and the stored result; a result write that
+  fails until the reaper has taken the row back; an attempt that got no response although the
+  provider processed it. Each repeat carries the same `Idempotency-Key`, the notification id.
+
+Proven by, among others: TestClassifyDecidesEveryRowOfTheVerdictTable,
+TestRetryDelaysDoubleWithJitterUpToTheCap, TestRetryAfterIsHonouredUpToTheCap,
+TestTheHalfOpenBreakerLetsExactlyOneRowThrough, TestAKilledWorkersRowComesBackThroughTheReaper,
+TestAFailedResultWriteIsRetriedAndNotSentAgain.
 
 ## Requirements and where they are met
 
@@ -255,7 +308,10 @@ From [session 8's record](docs/sessions/08-hardening.md#what-is-still-open) and
   scenarios requests arrived up to 144 ms after their permits; in one of the author's 30 heavy
   runs two batches were answered after 15.8 s and 29.6 s, and in one of the reviewer's one batch
   after 7.5 s. Each has its candidate causes, its commands and what would
-  separate them in the record.
+  separate them in the record. For the first, the leading candidate is the clock step of the
+  next item: the session's reviewer stepped the clock forward by 300 ms on purpose and the
+  provider counted 200 per channel on all three channels at once, the same signature
+  ([review 8](docs/reviews/08-session-8-review.md), F3).
 - **Docker's clock.** Redis reads the wall clock of Docker's VM, which stepped forward by 28 to
   35 ms under load on the author's machine; that is inside the 50 ms margin, and a larger step
   would let more than the limit through for one window (architecture §7).
@@ -263,7 +319,8 @@ From [session 8's record](docs/sessions/08-hardening.md#what-is-still-open) and
   refusals at the gate (about 40 at the defaults), and the sum of the connection pools against
   Postgres's `max_connections`. Counters and alerts show when either is crossed.
 - **Two binaries in the history of `main`** (47 MB, from session 7): removing them means
-  rewriting a public branch, which is the owner's decision.
+  rewriting a public branch, and every commit id the records cite would change. I left the
+  history as it happened.
 
 ## Commands and settings
 
@@ -303,7 +360,8 @@ retries as a failure, and `make` stops with an error.
 
 This is the second build of the assignment; the first is public and unchanged at
 [InsiderOneProjectDeneme](https://github.com/atakanakis/InsiderOneProjectDeneme). Five rounds of
-independent review found real defects in it, several inside the fixes of the round before,
+independent review (four recorded in that repository, the fifth summarised in the journey)
+found real defects in it, several inside the fixes of the round before,
 because its design had never been written down and checked as a whole. Here the design was
 written and reviewed first, then built in sessions, one part each, by Claude Opus agents with a
 fresh context. Each session had one review, run once after its code was green, by a fresh
