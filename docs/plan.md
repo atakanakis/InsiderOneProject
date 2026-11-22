@@ -19,7 +19,7 @@ early parts were lost by the time later parts were built.
 | 6 | API: notifications, batches, templates, idempotency | **done** (2026-11-20, [record](sessions/06-api.md)) |
 | 7 | Events, WebSocket, metrics, tracing, alerts | **done** (2026-11-21, [record](sessions/07-events.md)) |
 | 8 | Hardening: full independent review, soak, load test | **done** (2026-11-21, [record](sessions/08-hardening.md)) |
-| 9 | Walkthrough and final documents | next |
+| 9 | Walkthrough and final documents | **done** (2026-11-22, [record](sessions/09-walkthrough.md)) |
 
 ## How a session runs
 

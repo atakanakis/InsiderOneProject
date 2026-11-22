@@ -14,8 +14,8 @@ make up      # Postgres, Redis, migrations, the API, two workers and a mock prov
 through the code, file by file. The design is [docs/architecture.md](docs/architecture.md).
 [Reading paths](#reading-paths) below has a 10-minute and a 1-hour route.
 
-**Status:** built and tested. Session 9 of 9, which writes the walkthrough and these documents
-and adds no feature, is in progress (the table is at the end).
+**Status:** complete. All nine build sessions are done (the table is at the end); the last one
+wrote the walkthrough and these documents and added no feature.
 
 ## Run it
 
@@ -241,7 +241,8 @@ Each item, with what it costs, is in [architecture §16](docs/architecture.md#16
 
 ## Known open issues
 
-From [session 8's record](docs/sessions/08-hardening.md#what-is-still-open):
+From [session 8's record](docs/sessions/08-hardening.md#what-is-still-open) and
+[session 9's](docs/sessions/09-walkthrough.md#what-is-still-open):
 
 - **Three events that did not repeat, unexplained.** Once in 30 heavy bursts the mock provider
   counted 130, 121 and 125 in one second on the three channels at once; once in 606 fault
@@ -318,6 +319,6 @@ fail: 354 guards, all real (`make guards`; counted with
 | 6 | API | done ([record](docs/sessions/06-api.md)) |
 | 7 | Events, WebSocket, metrics, tracing, alerts | done ([record](docs/sessions/07-events.md)) |
 | 8 | Hardening: independent review, soak, load test | done ([record](docs/sessions/08-hardening.md)) |
-| 9 | Walkthrough and final documents | in progress |
+| 9 | Walkthrough and final documents | done ([record](docs/sessions/09-walkthrough.md)) |
 
 The agents' definitions are in [`.claude/agents/`](.claude/agents/).

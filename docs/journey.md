@@ -366,6 +366,14 @@ says only what the repository shows. Record: [sessions/09-walkthrough.md](sessio
   provider, a warning on the first start, a status read too soon, an exit code. Every command
   worked; what was missing was what a reader needs to know and the author no longer sees. Each
   was fixed and the rehearsal run again from a new clone.
+- **The review found no defect in the system, and eleven places where the documents said more
+  than their evidence.** The new check's test could not tell its promise from a weaker one, and
+  several kinds of reference slipped past it; a bonus was "proven" by a test that checks only
+  the first half of it; two figures mixed whose runs they were; webhook.site, the provider the
+  assignment names, was never used, and the README had not said so plainly. Each was fixed as a
+  class, the check with a case and a guard per kind. The lead then found one more of the same
+  kind in its own record: the command that proves the repository has no Turkish text held the
+  Turkish letters it looks for, so it found itself.
 
 ## 5. Where it ended
 

@@ -3,8 +3,7 @@
 - **Date:** 2026-11-22.
 - **Lead:** Claude Opus. **Builders:** none; the lead wrote the documents and the one tool.
   **Reviewer:** one fresh Claude Opus instance, run once after the documents, `make check-docs`
-  and the clean-clone rehearsal had passed (its record, `docs/reviews/09-session-9-review.md`,
-  is written after it).
+  and the clean-clone rehearsal had passed ([review record](../reviews/09-session-9-review.md)).
 - **Brief:** [plan.md, "9. Walkthrough and final documents"](../plan.md#9-walkthrough-and-final-documents).
   No new feature: a reader can follow one message through the code, and the README states only
   what the repository proves. The measure of the documents is the assignment: for every
@@ -97,16 +96,42 @@ the order of their ids, so which comes first differs from run to run.
 | What | Result | Command |
 |---|---|---|
 | Tests | 282 test functions; all pass with the race detector in 1 min 33 s | `time make test`; count: `grep -rh '^func Test' --include='*_test.go' . \| grep -v TestMain \| wc -l` |
-| Guards | 343 in the list | `grep -cE '^\s*Name: "' tools/guards/list.go` |
-| The new guards | `7 guards, 7 real, 0 failed` | `go run ./tools/guards -only docrefs` |
+| Guards | 343 in the list before the review, 354 after its fixes | `grep -cE '^\s*Name: "' tools/guards/list.go` |
+| The new guards | `7 guards, 7 real, 0 failed` before the review; `18 guards, 18 real, 0 failed` after its fixes | `go run ./tools/guards -only docrefs` |
 | Every guard, locally | `343 guards, 343 real, 0 failed` in 40 min, on `2a72f77` with only the README changed; the tree unchanged after the mutations | `time make guards` |
 | Every guard, in CI | `343 guards, 343 real, 0 failed` on `2a72f77` (run 44959944863), and lint, test (check-docs included), alerts and compose green | `gh run view 44959944863 --log` |
 | Lint, documents | 0 issues; every test, link, path and Go name the documents name exists | `make lint`, `make check-docs` |
-| No Turkish in the repository | 0 lines | `LC_ALL=en_US.UTF-8 git grep -nI -E '[ğĞşŞıİçÇöÖüÜ]' -- .` (without a UTF-8 locale, the bracket matches single bytes, and every `§` matches) |
+| No Turkish in the repository | 0 lines | `LC_ALL=en_US.UTF-8 git grep -nIP '[\x{11E}\x{11F}\x{15E}\x{15F}\x{130}\x{131}\x{C7}\x{E7}\x{D6}\x{F6}\x{DC}\x{FC}]' -- .`: the twelve letters of Turkish that ASCII lacks, written as code points, so that the command does not find itself. With a bracket of the letters themselves and no UTF-8 locale, git grep matches single bytes, and every `§` matches |
 
 ## The review
 
-To be written after the review.
+One fresh Claude Opus reviewer, run once at `2b04f36` after the documents, `make check-docs` and
+three rehearsals had passed, with no time limit (about 43 minutes;
+[review record](../reviews/09-session-9-review.md)). It ran the README from a fresh clone,
+every command in order, the observability profile and a plain `docker compose up` without an
+image included; read every step of the walkthrough against the code; looked for every
+requirement of the assignment; and mutated copies of `tools/docrefs`. Its verdict: the README
+works as written and the walkthrough matches the code; no critical or major defect; six minor
+findings and five nits, each a place where the wording said more than the evidence.
+
+| # | Severity | What | Resolution |
+|---|---|---|---|
+| F1 | minor | `tools/docrefs`'s test could not tell "declared in the linked file" or "in its own package" from "declared somewhere" | Fixed: red `f68403c`, fix `411d32c`; two guards with exactly the reviewer's mutations |
+| F2 | minor | References that slipped past `tools/docrefs` (unknown qualifiers, titled, reference-style and HTML links, `./` and `:line` paths, value and pointer receivers, split code spans, `~~~` fences); descriptions wider than the check | Fixed in `411d32c`, a case and a guard each; descriptions narrowed |
+| F3 | minor | The scheduled bonus cited a test that does not wait | The README, the walkthrough and §15 cite what each test shows (`69b7b74`) |
+| F4 | minor | `make test` (`-race`) only logs the peak at the provider | The README gives the command that asserts it (`69b7b74`) |
+| F5 | minor | webhook.site never used, listed only as "not measured" | Under "Not done", with the one change and its default answer's effect (`69b7b74`); open below |
+| F6 | minor | Two figures shortened or mixed their sources | Corrected from session 8's records (`69b7b74`) |
+| F7 to F11 | nits | The list's order; `curl -i`; the A5 command's 48; §14's dependencies; step 20's order, a test under the wrong step, process counts, per worker or per dispatcher; commands that need Go, `KEY=`, the guard count's command, "the brief" | All done (`69b7b74`) |
+
+`go run ./tools/guards -only docrefs` after the fixes: `18 guards, 18 real, 0 failed`; with
+them the list holds 354 guards.
+
+**Found by the lead after the review.** The command this record gave for "no Turkish in the
+repository" held the Turkish letters it looks for, so in the commits from `0383347` to
+`69b7b74` the check found this record itself, the one line in the repository with those
+letters. The command now writes them as code points, and finds nothing. The same class as
+session 8's CI check for binaries: a check whose reach included its own text.
 
 ## What is still open
 
@@ -118,7 +143,14 @@ To be written after the review.
   `RATE_LIMIT=20`; the two binaries in the history of `main`; the order of events from two
   processes; the WebSocket's "follow before reading the current state" has no test. Each is in
   [session 8's record](08-hardening.md#what-is-still-open).
-- **Not measured against webhook.site** (decisions, above).
+- **Not measured against webhook.site** (decisions, above; the review's F5): the README says
+  what to change and what webhook.site's default answer would do. Trying it is the owner's
+  decision, because it sends the test data to an outside service.
+- **The order of a WebSocket's first message and the events queued before it** has no test
+  (from session 8); the README and the walkthrough now say what a client can see (the review's
+  F10).
+- **"About 40 dispatchers per channel before refusals"** is derived from runs up to 36; no run
+  reached the boundary (the review's hard question 4).
 - **The "pull access denied" lines of the first `make up`** are documented, not removed.
 
 ## CI
