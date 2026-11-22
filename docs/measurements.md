@@ -27,16 +27,16 @@ named. A fourth run by the author after the review's fixes stayed inside every r
 |---|---|
 | Accepted by the API | in 0.23 to 0.34 s (the reviewer's run 0.232 s), 87,000 to 124,000 per second in the author's runs; a batch answered in 29 to 41 ms (median), 97 ms at most |
 | The API's memory | resident 37 to 50 MiB, Go heap 16 to 17 MiB at the peak (the author's runs) |
-| Drained | 30,000 in 1 min 46.5 s to 1 min 46.9 s, 93.5 to 93.9 per second per channel (the top speed is 100 per 1.05 s, 95.2) |
+| Drained | 30,000 in 1 min 46.7 s to 1 min 46.9 s, 93.5 to 93.7 per second per channel in the author's runs; 1 min 46.5 s and 93.9 per second in the reviewer's (the top speed is 100 per 1.05 s, 95.2) |
 | The mock provider's peak | 100 per channel within one second in every run |
-| Lost, sent twice | none: the provider received and accepted exactly what was created (30,164 to 30,165 with the probes), none twice |
-| A high-priority notification created during the drain | created to sent: median 0.42 to 0.46 s in the author's runs (54 per channel per run), p95 1.14 to 1.36 s; the longest 5.1 to 5.4 s, the first ones, which queue behind the burst's own 500 high-priority rows per channel (500 / 95 per second = 5.3 s) |
+| Lost, sent twice | none: the provider received and accepted exactly what was created (30,164 to 30,165 with the probes; 30,164 in the reviewer's run), none twice |
+| A high-priority notification created during the drain | created to sent: median 0.42 to 0.46 s in the author's runs (54 per channel per run), p95 1.14 to 1.36 s (1.35 to 1.36 s in the reviewer's run); the longest 5.1 to 5.4 s (5.35 to 5.36 s in the reviewer's), the first ones, which queue behind the burst's own 500 high-priority rows per channel (500 / 95 per second = 5.3 s) |
 
 Larger batches, 15,000 notifications with content of up to 8,000 bytes (8 MB batches for
 email), posted 8 at once (`go run ./tools/load -n 15000 -concurrency 8 -content-bytes 8000
 -probe-every 20ms`), 22 runs by the author (two of them after the review's fixes) and 8 by
-the reviewer: accepted in 0.43 to 0.57 s in 28 runs; in one of the author's runs one batch was
-answered after 29.6 s and in one of the reviewer's after 7.5 s, and what held them is not shown
+the reviewer: accepted in 0.43 to 0.57 s in 28 runs; in one of the author's runs two batches were
+answered after 15.8 s and 29.6 s, and in one of the reviewer's one after 7.5 s, and what held them is not shown
 (session 8's record). The API's resident memory peaked between 120 and 268 MiB. A single
 create made every 20 ms during the burst was answered within 63 ms in the seven of the
 author's runs that recorded it and within 91 ms in the reviewer's, which bounds how long the 4

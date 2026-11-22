@@ -19,8 +19,9 @@ and adds no feature, is in progress (the table is at the end).
 
 ## Run it
 
-Needs Docker with the Compose plugin, `make` and `curl`. Go 1.27 is needed only for the tests and the
-tools (`make test`, `make e2e`, `make load`).
+Needs Docker with the Compose plugin, `make` and `curl`. Go 1.27.4 (the version in `go.mod`) is
+needed only for the tests and the tools: `make test`, `make check-docs`, `make guards`,
+`make alerts`, `make e2e`, `make load`.
 
 ```sh
 make up                          # builds the image once, starts the stack, waits until healthy
@@ -35,8 +36,8 @@ and prints "pull access denied" for it; that is expected, and the build follows.
 ## Try the API
 
 Every command below was run on a fresh clone, in this order. Under each is what it answered, cut
-where it says `...`; the HTTP status is given first (`curl -i` prints it). Ids are random: use
-the ones your own answers give.
+where it says `...`, with the HTTP status first; add `-i` to a command to see the status. Ids
+are random: use the ones your own answers give.
 
 ```sh
 # Create one notification. The idempotency key makes a repeat safe.
@@ -73,6 +74,8 @@ curl -s localhost:8080/v1/batches/<batchId>
 # 200 {"counts":{"cancelled":0,"failed":0,"pending":0,"processing":0,"retrying":0,"scheduled":1,"sent":1},...,"total":2}
 
 # List: filters status, channel, batchId, createdFrom, createdTo; limit 1 to 100; newest first.
+# The two items of one batch share their creation time and come in the order of their ids, so
+# which one is on the first page differs from batch to batch.
 curl -s 'localhost:8080/v1/notifications?batchId=<batchId>&limit=1'
 # 200 {"items":[{"id":"2bd37c46-...","channel":"email","status":"sent",...}],"nextCursor":"AAZg0VJAGNwr03xG..."}
 curl -s 'localhost:8080/v1/notifications?batchId=<batchId>&limit=1&cursor=<nextCursor>'
@@ -94,7 +97,10 @@ curl -s localhost:9090/stats     # what the mock provider received: at most 100 
 
 **Live status.** `GET /v1/ws?notificationId=<id>&batchId=<batchId>` is a WebSocket: up to 100
 notification ids and 10 batch ids; the client sends nothing. It receives the current state
-first, then every change. Followed from creation, a notification scheduled 3 s ahead gave:
+first, then every change. Events are best-effort and come from more than one process, so one
+can arrive late, after a state that already includes it; `sent`, `failed` and `cancelled` say
+the notification is done, and `GET /v1/notifications/{id}` is the truth. Followed from
+creation, a notification scheduled 3 s ahead gave:
 
 ```
 {"type":"status","id":"97da9252-...","status":"scheduled"}
@@ -110,7 +116,8 @@ per channel through the API and waits until all are sent.
 <http://localhost:8080/docs> ([`internal/api/openapi.yaml`](internal/api/openapi.yaml)).
 **API keys** are off by default; with `API_KEYS=first-key-0123456789,second-key-0123456789 make up`
 every `/v1` request needs one, in `Authorization: Bearer <key>` or `X-API-Key: <key>` (a key
-has at least 16 characters, or the API does not start).
+has at least 16 characters, or the API does not start). `make e2e` and `make load` then need
+it too: `make e2e KEY=first-key-0123456789`.
 
 ## Reading paths
 
@@ -178,9 +185,9 @@ code in the order a notification meets it; architecture §15 maps the requiremen
 | Metrics: queue depth, success and failure rates, latency | [`internal/api/metrics.go`](internal/api/metrics.go) (`GET /v1/metrics`); [`internal/observability/metrics.go`](internal/observability/metrics.go) (`GET /metrics`) | TestTheMetricsEndpointReportsTheRecentWindow, TestQueueGaugesComeFromTheDatabase |
 | Structured logs with correlation ids | [`internal/observability/logging.go`](internal/observability/logging.go); `api.correlate` | TestOneCorrelationIDFollowsAMessageFromTheRequestToTheProvider, TestLogLinesCarryTheCorrelationIDFromTheContext |
 | Health check | [`internal/api/health.go`](internal/api/health.go) (`/healthz`, `/readyz`) | TestReadyzIsReadyWhenBothDependenciesAnswer, TestReadyzStaysReadyWhenOnlyRedisIsUnreachable |
-| The provider's request and its 202 answer | `provider.(*Client).send`; the mock provider, [`cmd/mockprovider/main.go`](cmd/mockprovider/main.go) | TestTheRequestHasTheAssignmentsFormat, TestRecorderAnswersWithTheProviderContract |
+| The provider's request and its 202 answer (the mock provider stands in for webhook.site; see [Not done](#not-done-and-why)) | `provider.(*Client).send`; the mock provider, [`cmd/mockprovider/main.go`](cmd/mockprovider/main.go) | TestTheRequestHasTheAssignmentsFormat, TestRecorderAnswersWithTheProviderContract |
 | Bonus: failure handling | [`internal/dispatch/breaker.go`](internal/dispatch/breaker.go); `failed` as the dead-letter state; `(*server).retry` | TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue, TestRetryRequeuesOnlyAFailedNotification |
-| Bonus: scheduled notifications | `store.createSQL`, `store.claimSQL` | TestAScheduledNotificationWaitsUntilItsTime |
+| Bonus: scheduled notifications | `store.createSQL`, `store.claimSQL` | TestAScheduledNotificationWaitsUntilItsTime (stored `scheduled` with its time), TestClaimReturnsOnlyDueRows (not claimed before it), TestAWebSocketClientReceivesTheSentEventOfARealDelivery (scheduled 2 s ahead, then sent by a real worker) |
 | Bonus: templates | `domain.CompileTemplate`, `(*server).createTemplate` | TestTemplatesAreCreatedOnceAndRendered, TestTheRenderedLengthIsMeasuredBeforeRendering |
 | Bonus: WebSocket updates | [`internal/api/ws.go`](internal/api/ws.go); [`internal/events/redis.go`](internal/events/redis.go) | TestAWebSocketClientGetsTheCurrentStateThenEveryChange, TestAWebSocketClientReceivesTheSentEventOfARealDelivery |
 | Bonus: distributed tracing | [`internal/observability/tracing.go`](internal/observability/tracing.go) | TestTheDeliverySpanJoinsTheAPIRequestsTrace, TestTracingIsOffWithoutAnEndpoint |
@@ -190,6 +197,11 @@ code in the order a notification meets it; architecture §15 maps the requiremen
 | Versioned migrations | [`internal/store/migrations/`](internal/store/migrations/), [`cmd/migrate/main.go`](cmd/migrate/main.go) | TestMigrationsAreAppendOnly, TestMigrateBuildsAnEmptyDatabaseAndIsRepeatable |
 | Tests with one command | `make test` ([`Makefile`](Makefile)) | CI's test job |
 
+`make test` runs with the race detector, which slows the client and the recording server on the
+same CPUs; there the tests of the limit at the provider only log their peak (architecture §11,
+I1). They assert it without the race detector, as CI's test job and `make guards` run them:
+`A5_FULL=1 go test -count=1 -v -run 'TestTheProviderReceivesAtMostTheLimitThroughTheDispatchers|TestGateWaitAndThroughputWithManyDispatchers|TestInvariantsHoldUnderRandomFaults' ./internal/dispatch`.
+
 ## Measured
 
 On the author's machine (Apple silicon, 8 CPUs and 8 GB for Docker), the Compose stack with two
@@ -198,10 +210,10 @@ workers and the mock provider, in session 8. Every figure, its range and its com
 
 | What | Result | Command |
 |---|---|---|
-| A burst of 30,000 in batches of 1000 | accepted in 0.23 to 0.34 s; drained at 93.5 to 93.9 per second per channel (top speed 95.2); the provider's peak 100 per channel in one second; nothing lost, nothing accepted twice; a high-priority notification created during the drain sent in a median of 0.42 to 0.46 s | `make load` |
+| A burst of 30,000 in batches of 1000 | accepted in 0.23 to 0.34 s; drained at 93.5 to 93.7 per second per channel in the author's three runs and 93.9 in the reviewer's one (top speed 95.2); the provider's peak 100 per channel in one second; nothing lost, nothing accepted twice; a high-priority notification created during the drain sent in a median of 0.42 to 0.46 s | `make load` |
 | 15,000 in 8 MB batches, 8 at once, 30 runs | accepted in 0.43 to 0.57 s in 28 runs; the API's memory at most 268 MiB; peak 100 in 29 runs, and 130, 121, 125 once (open, below) | `go run ./tools/load -n 15000 -concurrency 8 -content-bytes 8000 -probe-every 20ms` |
 | The randomised fault test, 606 scenarios | 181,800 notifications, every one final; 605 passed, one exceeded the limit (47 against 40) with 10 requests late after their permits; 42 accepted twice, each after an attempt that got no response (at-least-once case 3) | `FAULT_RUNS=300 FAULT_SEED=1000 go test -count=1 -timeout 0 -run TestInvariantsHoldUnderRandomFaults -v ./internal/dispatch`, and `FAULT_SEED=2000` |
-| The wait at the gate, 1 to 36 dispatchers on one channel (A5) | 94.1 to 94.9 sends per second; longest wait 6 ms with 1 dispatcher, 0.98 to 1.07 s with 3 to 12, 3.13 s with 24, 4.21 s with 36; no refusal | `A5_FULL=1 go test -count=1 -v -run TestGateWaitAndThroughputWithManyDispatchers ./internal/dispatch` (1, 3, 6, 12); `A5_COUNTS=12,24,36,48 A5_RUN=12s` with the same test (12 to 36) |
+| The wait at the gate, 1 to 36 dispatchers on one channel (A5) | 94.1 to 94.9 sends per second; longest wait 6 ms with 1 dispatcher, 0.98 to 1.07 s with 3 to 12, 3.13 s with 24, 4.21 s with 36; no refusal | `A5_FULL=1 go test -count=1 -v -run TestGateWaitAndThroughputWithManyDispatchers ./internal/dispatch` (1, 3, 6, 12); `A5_COUNTS=12,24,36 A5_RUN=12s` with the same test (12 to 36) |
 
 Not measured: a real provider (webhook.site included; the mock provider answers its contract),
 more than one API instance, and a server whose clock does not step.
@@ -217,6 +229,12 @@ Each item, with what it costs, is in [architecture §16](docs/architecture.md#16
 - **A breaker shared by all workers, or one that learns from a 400:** each worker has its own; a
   provider that answers 400 to everything ends rows `failed` (they come back with `POST /retry`),
   because the other choice lets one client's bad messages stop a channel for everyone.
+- **webhook.site was not used.** The assignment's provider is a webhook.site URL that answers
+  202; sending to it publishes the test data on an outside service. The mock provider answers
+  the same contract and the client sends the assignment's request, so
+  `PROVIDER_URL=https://webhook.site/<uuid> make up` is the only change. Configure the URL to
+  answer 202 with `{"messageId", "status", "timestamp"}`: with its default answer, a 200 in
+  plain text, every notification ends `sent` with no provider message id.
 - **Priority aging, tenants, per-client quotas, expiry of idempotency keys, durable status
   events, a bulk requeue endpoint:** not asked for, and each needs a policy or a second source
   of truth.
@@ -227,8 +245,9 @@ From [session 8's record](docs/sessions/08-hardening.md#what-is-still-open):
 
 - **Three events that did not repeat, unexplained.** Once in 30 heavy bursts the mock provider
   counted 130, 121 and 125 in one second on the three channels at once; once in 606 fault
-  scenarios requests arrived up to 144 ms after their permits; in two of 30 heavy runs one batch
-  was answered after 29.6 s and 7.5 s. Each has its candidate causes, its commands and what would
+  scenarios requests arrived up to 144 ms after their permits; in one of the author's 30 heavy
+  runs two batches were answered after 15.8 s and 29.6 s, and in one of the reviewer's one batch
+  after 7.5 s. Each has its candidate causes, its commands and what would
   separate them in the record.
 - **Docker's clock.** Redis reads the wall clock of Docker's VM, which stepped forward by 28 to
   35 ms under load on the author's machine; that is inside the 50 ms margin, and a larger step
@@ -260,7 +279,7 @@ with their defaults and relations in [architecture §13](docs/architecture.md#13
 The worker refuses to start when a relation does not hold: for example,
 `docker compose run --rm --no-deps -e LEASE=40s worker` exits with status 2. The workers send to
 `PROVIDER_URL`, by default the mock provider; set it to a webhook.site URL that answers 202 to
-use that instead. The mock provider can fail on purpose, to watch retries and the breaker:
+use that instead (see [Not done](#not-done-and-why)). The mock provider can fail on purpose, to watch retries and the breaker:
 
 ```sh
 MOCK_FAIL_RATE=0.2 MOCK_THROTTLE_RATE=0.05 MOCK_LATENCY=30ms docker compose up -d mockprovider
@@ -283,7 +302,8 @@ written and reviewed first, then built in sessions, one part each, by Claude Opu
 fresh context. Each session had one review, run once after its code was green, by a fresh
 reviewer agent that had not seen the author's reasoning, could not edit, and had to reproduce
 what it reported. `make guards` disables every guard on purpose and expects a named test to
-fail: 343 guards, all real. [docs/journey.md](docs/journey.md) tells the story,
+fail: 354 guards, all real (`make guards`; counted with
+`grep -cE '^\s*Name: "' tools/guards/list.go`). [docs/journey.md](docs/journey.md) tells the story,
 [docs/lessons.md](docs/lessons.md) lists what the first version taught, and
 [`CLAUDE.md`](CLAUDE.md) holds the rules every session followed.
 

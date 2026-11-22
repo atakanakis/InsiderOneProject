@@ -38,8 +38,8 @@ worker (cmd/worker), dispatcher of channel sms           │
 client ── GET /v1/notifications/{id} ──► "sent", with its attempt history
 ```
 
-Four processes run in the Compose stack: the API, two workers, the mock provider, and a
-one-shot migration. They share nothing but Postgres and Redis.
+Five processes run in the Compose stack, of four kinds: the API, two workers, the mock
+provider, and a one-shot migration. They share nothing but Postgres and Redis.
 
 | Process | Entry | What it runs |
 |---|---|---|
@@ -274,11 +274,14 @@ read cheapest first:
 None of these takes or reserves anything. When the room is 0, the loop pauses 20 ms and asks
 again.
 
-- **Keeps:** I9's second half (a worker has at most one claim batch waiting for permits);
+- **Keeps:** I9's second half (a dispatcher, so a worker for each channel, has at most one
+  claim batch waiting for permits);
   CLAUDE.md rule 3 (the loop never takes a permit).
 - **Proven by:** TestAWorkerHasAtMostOneClaimBatchWaitingForPermits,
   TestNoRowIsClaimedWhileTheWindowIsFull, TestAnUnavailableRateLimitClaimsNothing,
-  TestAvailableChangesNothing, TestAvailableFailsWhenTheTakeScriptWould, TestBreakerAllowOnlyReads.
+  TestAvailableChangesNothing, TestAvailableFailsWhenTheTakeScriptWould, TestBreakerAllowOnlyReads,
+  TestARedisThatRefusesWritesClaimsNothing (a Redis that refuses writes makes `Available` fail,
+  so nothing is claimed and no attempt is spent).
 
 ### 11. The claim: one statement per priority, highest first
 
@@ -506,9 +509,16 @@ it never waits for a client.
 
 A client follows a notification with `GET /v1/ws?notificationId=<id>`. `(*server).websocket`
 checks the filters (`followed`), the origin and the upgrade, adds the client to the hub
-(`(*Hub).follow`), and only then reads the current state (`(*server).currentState`), so no
-change is missed between the two. `(*server).stream` writes the current state first, then
-every event. Followed from its creation, a notification scheduled 3 s ahead gave, on the
+(`(*Hub).follow`), and only then reads the current state (`(*server).currentState`), so an
+event of a change made after the client joined is not missed. `(*server).stream` writes the
+current state first, then every event queued for the client. An event queued between the
+two can be older than the state it follows, and events from two processes have no order
+([architecture §9](architecture.md#9-status-events-and-websocket)): a client can see `sent`
+and then `processing`, and if the later `sent` event is lost, it is left with `processing`
+(reasoned in session 9's review, not reproduced).
+`sent`, `failed` and `cancelled` are final, and `GET /v1/notifications/{id}` is the truth. No
+test checks the order of `follow` before `currentState` (session 8's record lists it as
+open). Followed from its creation, a notification scheduled 3 s ahead gave, on the
 Compose stack:
 
 ```
@@ -594,7 +604,10 @@ the time comes, the row is claimed like any other. There is no separate schedule
 scheduled row is a row that is not due yet.
 
 - **Keeps:** I12 (Postgres decides "is it due?"), A3.
-- **Proven by:** TestAScheduledNotificationWaitsUntilItsTime, TestClaimReturnsOnlyDueRows,
+- **Proven by:** TestAScheduledNotificationWaitsUntilItsTime (the create stores it `scheduled`
+  with its time; it does not wait), TestClaimReturnsOnlyDueRows (a claim does not take it
+  before its time), TestAWebSocketClientReceivesTheSentEventOfARealDelivery (scheduled 2 s
+  ahead, it is followed to `processing` and `sent` by a real worker),
   TestClaimPlanReadsTheIndexInOrder, TestAScheduledAtFromTheYear10000IsRefused.
 
 ### A worker dies in the middle of a send
@@ -666,7 +679,7 @@ Each dispatcher has its own breaker, in one of three states:
 
 `Allow` only reads; nothing is reserved. A claim that finds no row marks no probe, and every
 started row reaches `Report` through `handle`'s single exit, so a probe cannot be lost. While
-open, an outage costs one attempt per open period per worker. A provider that answers 404 or
+open, an outage costs one attempt per open period per worker and channel. A provider that answers 404 or
 401 to everything (a wrong URL, an expired key) opens the breaker instead of draining the queue
 into `failed`. One that answers 400 to everything does drain it, because 400 means "this
 message is wrong"; why that trade-off was kept is in
@@ -679,7 +692,7 @@ message is wrong"; why that trade-off was kept is in
 - **Proven by:** TestBreakerOpensAfterFiveFailuresInARow, TestBreakerHalfOpenLetsOneProbeThrough,
   TestTheHalfOpenBreakerLetsExactlyOneRowThrough, TestARefusedProbeLeavesTheBreakerHalfOpen,
   TestReportsWhileOpenChangeNothing, TestBreakerAllowOnlyReads, TestAClaimThatFindsNothingLeavesNoProbe,
-  TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue, TestARedisThatRefusesWritesClaimsNothing,
+  TestNotFoundAndUnauthorizedOpenTheBreakerAndDoNotDrainTheQueue,
   TestTheBreakerStateIsExportedWhenScraped.
 
 ## Where each invariant is kept

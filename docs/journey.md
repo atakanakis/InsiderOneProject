@@ -352,9 +352,10 @@ says only what the repository shows. Record: [sessions/09-walkthrough.md](sessio
   with its file, its functions, the invariant it keeps and the tests that prove it. Two of the
   first draft's figures were wrong against their tests: they were taken from the documents
   instead of read from the test. A new check, `tools/docrefs`, now fails `make check-docs`
-  when a link, a path or a function name of the documents does not exist, so the walkthrough
-  cannot drift from the code unnoticed. Lesson 9 again: a document is a claim, and a claim
-  needs a check.
+  when a link of the documents, or a path or a function name of the README and the
+  walkthrough, does not exist. It checks that names exist, not that what is said about them is
+  true; that took reading, and the review still found steps that said more than their tests.
+  Lesson 9 again: a document is a claim, and a claim needs a check.
 - **The README became a way in.** What it is, one command, where to read, the API examples with
   their real answers, and a map from every requirement of the assignment to the code and the
   tests that meet it. The long account of the measurements moved to its own page, and one of
@@ -368,8 +369,10 @@ says only what the repository shows. Record: [sessions/09-walkthrough.md](sessio
 
 ## 5. Where it ended
 
-The system meets the assignment, its bonuses included; the README maps each requirement to its
-code and tests. What held under the measurements: the rate limit at the provider, with two
+The system meets the assignment, its bonuses included, with one substitution: the provider is a
+mock that answers webhook.site's contract, because sending to webhook.site publishes the data;
+pointing `PROVIDER_URL` at a webhook.site URL is the only change, and it was not tried. The
+README maps each requirement to its code and tests. What held under the measurements: the rate limit at the provider, with two
 exceptions, one burst of 30 and one fault scenario of 606, both recorded with their possible
 causes; no notification lost; no notification accepted twice except in the at-least-once cases
 the design names.

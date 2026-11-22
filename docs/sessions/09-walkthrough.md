@@ -8,7 +8,11 @@
 - **Brief:** [plan.md, "9. Walkthrough and final documents"](../plan.md#9-walkthrough-and-final-documents).
   No new feature: a reader can follow one message through the code, and the README states only
   what the repository proves. The measure of the documents is the assignment: for every
-  requirement, a reader can find where it is met.
+  requirement, a reader can find where it is met. The session was started with a longer brief
+  than plan.md's: it also asked that every path and function name of the walkthrough be
+  verified by a command, for a map from each requirement to its file and test, a short list of
+  what was not done, the open issues, reading paths through the architecture, a sweep of every
+  number, and a rehearsal from a clean clone. "The brief" below is that one.
 
 ## What was built
 
